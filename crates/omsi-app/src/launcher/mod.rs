@@ -199,9 +199,17 @@ impl Launcher {
     };
     // no original installation found anywhere: the launcher still opens, on Setup, and says
     // what it needs (only starting a session needs the game)
-    if omsi_cfg::missing_original_essentials(std::path::Path::new(&app.state.config.root)).len() > 0 {
+    let missing = omsi_cfg::missing_original_essentials(std::path::Path::new(&app.state.config.root));
+    if !missing.is_empty() {
         app.page = Page::Setup;
-        app.state.set_status("The original OMSI 2 was not found automatically. Choose its folder (the one with Omsi.exe, maps and Vehicles) and press Save.", true);
+        if app.state.config.root.trim().is_empty() {
+            app.state.set_status("The original OMSI 2 was not found automatically. Choose its folder (the one with Omsi.exe, maps and Vehicles) and press Save.", true);
+        } else {
+            app.state.set_status(
+                format!("OMSI 2 folder is incomplete: missing {}. Check the folder selected in Setup.", missing.join(", ")),
+                true,
+            );
+        }
     }
     if let Ok(p) = omsi_cfg::env::var("OMSI_LAUNCHER_PAGE") {
         if let Some((pg, _, _)) = PAGES.iter().find(|(_, n, _)| n.eq_ignore_ascii_case(p.split(':').next().unwrap_or(""))) {
