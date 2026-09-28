@@ -60,6 +60,8 @@ pub struct MaterialDef {
     pub index: i32,
     /// 0 = opaque, 1 = alpha test, 2 = alpha blend (OMSI `[matl_alpha]` modes).
     pub alpha: i32,
+    /// Whether `[matl_alpha]` was specified, so a material item can inherit its base mode.
+    pub alpha_explicit: bool,
     pub no_z_write: bool,
     pub no_z_check: bool,
     pub z_bias: i32,
@@ -784,6 +786,7 @@ impl Model {
                 let v = r.i32();
                 if let Some(m) = self.cur_matl() {
                     m.alpha = v;
+                    m.alpha_explicit = true;
                 }
             }
             "matl_nozwrite" => {
