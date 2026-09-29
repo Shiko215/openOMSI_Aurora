@@ -1465,7 +1465,14 @@ pub const LANGUAGES: &[(&str, &str, &str, &[&str])] = &[
     ("NLD", "Nederlands", "nl", &["nl", "dutch", "nederlands"]),
     ("TUR", "Türkçe", "tr", &["tr", "turkish", "türkçe"]),
     ("JPN", "日本語", "ja", &["ja", "jp", "japanese", "日本語"]),
-    ("CHS", "中文 (简体)", "zh", &["zh", "cn", "chinese", "中文"]),
+    ("ZHT", "繁體中文", "zh-tw", &["zh-tw", "zh-hant", "zh-hk", "zh-mo", "cht", "traditional chinese", "繁體中文", "繁体中文"]),
+    ("KOR", "한국어", "ko", &["ko", "kr", "korean", "한국어"]),
+    ("THA", "ไทย", "th", &["th", "thai", "ไทย"]),
+    ("VIE", "Tiếng Việt", "vi", &["vi", "vietnamese", "tiếng việt"]),
+    ("IND", "Bahasa Indonesia", "id", &["id", "indonesian", "bahasa indonesia"]),
+    ("MSA", "Bahasa Melayu", "ms", &["ms", "malay", "bahasa melayu"]),
+    ("TGL", "Filipino", "tl", &["tl", "fil", "filipino", "tagalog"]),
+    ("CHS", "中文 (简体)", "zh", &["zh", "zh-cn", "zh-sg", "zh-hans", "zhs", "chs", "cn", "chinese", "simplified chinese", "简体中文", "簡體中文", "中文"]),
     ("HIN", "हिन्दी", "hi", &["hi", "hindi", "हिन्दी"]),
 ];
 
