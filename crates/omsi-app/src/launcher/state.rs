@@ -415,8 +415,9 @@ impl State {
     }
 
     pub fn launch(&mut self) {
-        if !omsi_cfg::missing_original_essentials(std::path::Path::new(&self.config.root)).is_empty() {
-            self.set_status("A session needs the original OMSI 2: choose its folder under Setup first.", true);
+        let missing = omsi_cfg::missing_original_essentials(std::path::Path::new(&self.config.root));
+        if !missing.is_empty() {
+            self.set_status(format!("Cannot start: OMSI 2 folder is missing {}. Check Setup.", missing.join(", ")), true);
             return;
         }
         let d = self.duty();
@@ -575,10 +576,13 @@ impl State {
             }
             Msg::Content(Err(e)) => {
                 self.loading_content = false;
-                if omsi_cfg::missing_original_essentials(std::path::Path::new(&self.config.root)).is_empty() {
-                    self.set_status(format!("{e}\nSet the OMSI 2 folder under Setup."), true);
-                } else {
+                let missing = omsi_cfg::missing_original_essentials(std::path::Path::new(&self.config.root));
+                if missing.is_empty() {
+                    self.set_status(format!("{e}\nCheck the OMSI 2 content under Setup."), true);
+                } else if self.config.root.trim().is_empty() {
                     self.set_status("The original OMSI 2 was not found automatically: choose its folder (the one with Omsi.exe, maps and Vehicles) and press Save.", true);
+                } else {
+                    self.set_status(format!("OMSI 2 folder is incomplete: missing {}. Check Setup.", missing.join(", ")), true);
                 }
             }
             Msg::Lines { map, date, lines } => {

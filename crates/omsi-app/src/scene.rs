@@ -4678,7 +4678,7 @@ impl World {
                             .or(slot_ov.iter().find_map(|o| o.allcolor)),
                         tex.is_some(),
                     );
-                    let it_alpha = items.first().map(|o| alpha_mode(o.alpha)).unwrap_or(alpha);
+                    let it_alpha = items.iter().find(|o| o.alpha_explicit).map(|o| alpha_mode(o.alpha)).unwrap_or(alpha);
                     let mut it_extra = material_extra(&items, env_mask, bump, is);
                     it_extra.night_switched = items.iter().any(|o| o.nightmap.is_some());
                     it_extra.no_z_write |= extra.no_z_write;
@@ -7376,6 +7376,9 @@ fn sync_materials(
             let name = name.trim().to_string();
             let key = name.to_ascii_lowercase();
             if f.current.as_deref() != Some(key.as_str()) {
+                if omsi_cfg::env::var_os("OMSI_DEBUG_FREETEX").is_some() {
+                    log::info!("freetex slot {} variable {:?} = {:?}", v.slot, f.var, name);
+                }
                 f.current = Some(key.clone());
                 let pair = match f.cache.get(&key) {
                     Some(p) => *p,
@@ -7384,7 +7387,14 @@ fn sync_materials(
                         let tex = if name.is_empty() {
                             None
                         } else {
-                            omsi_texture::find_texture(&name, &dirs).and_then(|path| {
+                            let path = omsi_texture::find_texture(&name, &dirs);
+                            if omsi_cfg::env::var_os("OMSI_DEBUG_FREETEX").is_some() {
+                                match &path {
+                                    Some(p) => log::info!("freetex {:?} resolved to {}", name, p.display()),
+                                    None => log::warn!("freetex {:?} not found in {:?}", name, f.dirs),
+                                }
+                            }
+                            path.and_then(|path| {
                                 let mut shared = f.shared.lock();
                                 if let Some(e) = shared.get_mut(&path) {
                                     e.1 += 1;
@@ -8050,17 +8060,31 @@ pub struct FreeTex {
     pub wants_upgrade: Arc<Mutex<Vec<PathBuf>>>,
 }
 
+/// A script-named texture takes precedence over the fixed `[texchanges]` list
+/// when both target the same material slot.
+fn texture_pair(
+    base: (MaterialId, MaterialId),
+    entries: &[(MaterialId, MaterialId)],
+    free: bool,
+    value: f32,
+) -> (MaterialId, MaterialId) {
+    if free || entries.is_empty() {
+        return base;
+    }
+    let i = if value.is_finite() { value.trunc() as i64 } else { 0 };
+    entries[i.clamp(0, entries.len() as i64 - 1) as usize]
+}
+
 impl VariantSlot {
-    /// The material the slot shows now: `[texchanges]` picks the texture, `[matl_change]`
-    /// then picks between the plain material and the `[matl_item]` variant.
+    /// The material the slot shows now: `[matl_freetex]` takes the script-named picture,
+    /// otherwise `[texchanges]` picks a fixed one; `[matl_change]` selects its variant.
     pub fn material(&self, var: impl Fn(&str) -> Option<f32>) -> MaterialId {
-        let (base, item) = if self.entries.is_empty() {
-            (self.base, self.item)
-        } else {
-            let v = var(&self.tex_var).unwrap_or(0.0);
-            let i = if v.is_finite() { v.trunc() as i64 } else { 0 };
-            self.entries[i.clamp(0, self.entries.len() as i64 - 1) as usize]
-        };
+        let (base, item) = texture_pair(
+            (self.base, self.item),
+            &self.entries,
+            self.free.is_some(),
+            var(&self.tex_var).unwrap_or(0.0),
+        );
         let x = self
             .var
             .trim()
@@ -9329,7 +9353,8 @@ impl World {
                     let body_hint = named_body
                         || ov.iter().any(|o| o.bumpmap.is_some())
                         || (!mesh_has_overlay && material_has_vehicle_volume(&vm.data, slot));
-                    let repair_body_depth = is_vehicle_body_material(&def.file, &m.texture, tex.is_some(), transmap.is_some(), ov.iter().any(|o| o.no_z_write), body_hint);
+                    let repair_body_depth = omsi_cfg::env::var_os("OMSI_NO_BODY_DEPTH_REPAIR").is_none()
+                        && is_vehicle_body_material(&def.file, &m.texture, tex.is_some(), transmap.is_some(), ov.iter().any(|o| o.no_z_write), body_hint);
                     if repair_body_depth && !dirt_overlay && !transparent_layer_hint {
                         alpha = AlphaMode::Opaque;
                     }
@@ -9436,7 +9461,7 @@ impl World {
                         // `[matl_item]` inherits the base alpha mode. A transmap only supplies
                         // the mask; it must not turn an otherwise opaque body variant into a
                         // blended mesh (which makes the whole shared slot look like glass).
-                        let it_alpha = if repair_body_depth { AlphaMode::Opaque } else { ov_item.first().map(|o| alpha_mode(o.alpha)).unwrap_or(alpha) };
+                        let it_alpha = if repair_body_depth { AlphaMode::Opaque } else { ov_item.iter().find(|o| o.alpha_explicit).map(|o| alpha_mode(o.alpha)).unwrap_or(alpha) };
                         let (it_color, it_emissive, it_specular) = d3d_material(m, ov_item.iter().find_map(|o| o.allcolor).or(ov.iter().find_map(|o| o.allcolor)), textured);
                         let mut it_extra = material_extra(&ov_item, env_mask, bump, it_specular);
                         it_extra.night_switched = ov_item.iter().any(|o| o.nightmap.is_some());
@@ -9841,6 +9866,15 @@ mod tests {
 #[cfg(test)]
 mod material_tests {
     use super::*;
+
+    #[test]
+    fn freetex_overrides_a_fixed_texchanges_entry() {
+        let base = (10, 11); // material IDs rebuilt from the string variable
+        let fixed = [(20, 21), (30, 31)];
+        assert_eq!(texture_pair(base, &fixed, true, 1.0), base);
+        assert_eq!(texture_pair(base, &fixed, false, 1.0), fixed[1]);
+        assert_eq!(texture_pair(base, &fixed, false, 99.0), fixed[1]);
+    }
 
     #[test]
     fn null_texture_names() {
