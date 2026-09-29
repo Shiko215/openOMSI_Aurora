@@ -7376,6 +7376,9 @@ fn sync_materials(
             let name = name.trim().to_string();
             let key = name.to_ascii_lowercase();
             if f.current.as_deref() != Some(key.as_str()) {
+                if omsi_cfg::env::var_os("OMSI_DEBUG_FREETEX").is_some() {
+                    log::info!("freetex slot {} variable {:?} = {:?}", v.slot, f.var, name);
+                }
                 f.current = Some(key.clone());
                 let pair = match f.cache.get(&key) {
                     Some(p) => *p,
@@ -7384,7 +7387,14 @@ fn sync_materials(
                         let tex = if name.is_empty() {
                             None
                         } else {
-                            omsi_texture::find_texture(&name, &dirs).and_then(|path| {
+                            let path = omsi_texture::find_texture(&name, &dirs);
+                            if omsi_cfg::env::var_os("OMSI_DEBUG_FREETEX").is_some() {
+                                match &path {
+                                    Some(p) => log::info!("freetex {:?} resolved to {}", name, p.display()),
+                                    None => log::warn!("freetex {:?} not found in {:?}", name, f.dirs),
+                                }
+                            }
+                            path.and_then(|path| {
                                 let mut shared = f.shared.lock();
                                 if let Some(e) = shared.get_mut(&path) {
                                     e.1 += 1;
@@ -9329,7 +9339,8 @@ impl World {
                     let body_hint = named_body
                         || ov.iter().any(|o| o.bumpmap.is_some())
                         || (!mesh_has_overlay && material_has_vehicle_volume(&vm.data, slot));
-                    let repair_body_depth = is_vehicle_body_material(&def.file, &m.texture, tex.is_some(), transmap.is_some(), ov.iter().any(|o| o.no_z_write), body_hint);
+                    let repair_body_depth = omsi_cfg::env::var_os("OMSI_NO_BODY_DEPTH_REPAIR").is_none()
+                        && is_vehicle_body_material(&def.file, &m.texture, tex.is_some(), transmap.is_some(), ov.iter().any(|o| o.no_z_write), body_hint);
                     if repair_body_depth && !dirt_overlay && !transparent_layer_hint {
                         alpha = AlphaMode::Opaque;
                     }
