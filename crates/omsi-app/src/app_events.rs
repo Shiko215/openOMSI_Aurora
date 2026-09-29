@@ -681,6 +681,7 @@ impl ApplicationHandler for App {
                 if let (Some(d), Some(p), false) = (self.duty.as_mut(), self.player.as_mut(), self.paused) {
                     if let Some((arrival, departure)) = d.update(&mut p.vehicle, self.clock.time) {
                         self.career.stop_served(arrival, departure);
+                        self.service_msg = Some((crate::career::Career::stop_feedback(arrival, departure).into(), 6.0));
                     }
                     if d.take_trip_change() && p.duty_typed {
                         let (trip, stop) = d.trip_for_ibis();
