@@ -260,7 +260,16 @@ impl VehicleType {
                 .map(|l| l.first_mesh)
                 .unwrap_or(model.meshes.len());
             for (i, md) in model.meshes[start..end].iter().enumerate() {
-                let p = omsi_cfg::resolve_path(&model_dir, &md.file);
+                // OMSI resolves [mesh] paths from the vehicle's Model folder,
+                // even when the model.cfg itself lives in a subfolder. Some
+                // add-ons instead keep meshes beside that cfg; support both.
+                let model_root = dir.join("Model");
+                let from_root = omsi_cfg::resolve_path(&model_root, &md.file);
+                let p = if omsi_cfg::vfs::is_file(&from_root) {
+                    from_root
+                } else {
+                    omsi_cfg::resolve_path(&model_dir, &md.file)
+                };
                 match omsi_o3d::load_mesh(&p) {
                     Ok(m) => {
                         let skin = if md.smooth_skin {
