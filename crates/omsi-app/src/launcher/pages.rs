@@ -349,7 +349,7 @@ fn settings_columns(ui: &mut Ui, s: &mut Value, dirty: &mut f32, body: Rect) {
     y += 74.0;
     ui.heading(Rect::new(inner.x, y, inner.w, 28.0), "Interface & online", Some("forum"));
     y += 32.0;
-    sel_setting(ui, s, dirty, "s-lang", row(&mut y), "Language", "language", &[("ENG", "English"), ("DEU", "Deutsch"), ("FRA", "Français"), ("RUS", "Русский")]);
+    sel_setting(ui, s, dirty, "s-lang", row(&mut y), "Language", "language", &[("ENG", "English"), ("DEU", "Deutsch"), ("FRA", "Français"), ("RUS", "Русский"), ("ZHT", "繁體中文"), ("ZHS", "简体中文"), ("JPN", "日本語"), ("KOR", "한국어"), ("THA", "ไทย"), ("VIE", "Tiếng Việt"), ("IND", "Bahasa Indonesia"), ("MSA", "Bahasa Melayu"), ("TGL", "Filipino")]);
     // (the launcher speaks the chosen language at once)
     crate::ui_language(get(s, "language").as_str().unwrap_or("ENG"));
     // (texts nobody has translated: translated on this machine, see `mt`)
