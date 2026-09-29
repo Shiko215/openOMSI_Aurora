@@ -1439,6 +1439,15 @@ fn language_code(s: &str) -> &'static str {
         "de" | "deu" | "ger" | "german" | "deutsch" => "DEU",
         "fr" | "fra" | "fre" | "french" | "francais" | "français" => "FRA",
         "ru" | "rus" | "russian" | "русский" => "RUS",
+        "zh-tw" | "zh-hant" | "zh-hk" | "zh-mo" | "zht" | "cht" | "traditional chinese" | "繁體中文" | "繁体中文" => "ZHT",
+        "zh" | "zh-cn" | "zh-sg" | "zh-hans" | "zhs" | "chs" | "simplified chinese" | "简体中文" | "簡體中文" => "ZHS",
+        "ja" | "jp" | "jpn" | "japanese" | "日本語" => "JPN",
+        "ko" | "kr" | "kor" | "korean" | "한국어" => "KOR",
+        "th" | "tha" | "thai" | "ไทย" => "THA",
+        "vi" | "vie" | "vietnamese" | "tiếng việt" => "VIE",
+        "id" | "ind" | "indonesian" | "bahasa indonesia" => "IND",
+        "ms" | "msa" | "may" | "malay" | "bahasa melayu" => "MSA",
+        "tl" | "fil" | "tgl" | "filipino" | "tagalog" => "TGL",
         _ => "ENG",
     }
 }
