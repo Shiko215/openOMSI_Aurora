@@ -8060,17 +8060,31 @@ pub struct FreeTex {
     pub wants_upgrade: Arc<Mutex<Vec<PathBuf>>>,
 }
 
+/// A script-named texture takes precedence over the fixed `[texchanges]` list
+/// when both target the same material slot.
+fn texture_pair(
+    base: (MaterialId, MaterialId),
+    entries: &[(MaterialId, MaterialId)],
+    free: bool,
+    value: f32,
+) -> (MaterialId, MaterialId) {
+    if free || entries.is_empty() {
+        return base;
+    }
+    let i = if value.is_finite() { value.trunc() as i64 } else { 0 };
+    entries[i.clamp(0, entries.len() as i64 - 1) as usize]
+}
+
 impl VariantSlot {
-    /// The material the slot shows now: `[texchanges]` picks the texture, `[matl_change]`
-    /// then picks between the plain material and the `[matl_item]` variant.
+    /// The material the slot shows now: `[matl_freetex]` takes the script-named picture,
+    /// otherwise `[texchanges]` picks a fixed one; `[matl_change]` selects its variant.
     pub fn material(&self, var: impl Fn(&str) -> Option<f32>) -> MaterialId {
-        let (base, item) = if self.entries.is_empty() {
-            (self.base, self.item)
-        } else {
-            let v = var(&self.tex_var).unwrap_or(0.0);
-            let i = if v.is_finite() { v.trunc() as i64 } else { 0 };
-            self.entries[i.clamp(0, self.entries.len() as i64 - 1) as usize]
-        };
+        let (base, item) = texture_pair(
+            (self.base, self.item),
+            &self.entries,
+            self.free.is_some(),
+            var(&self.tex_var).unwrap_or(0.0),
+        );
         let x = self
             .var
             .trim()
@@ -9852,6 +9866,15 @@ mod tests {
 #[cfg(test)]
 mod material_tests {
     use super::*;
+
+    #[test]
+    fn freetex_overrides_a_fixed_texchanges_entry() {
+        let base = (10, 11); // material IDs rebuilt from the string variable
+        let fixed = [(20, 21), (30, 31)];
+        assert_eq!(texture_pair(base, &fixed, true, 1.0), base);
+        assert_eq!(texture_pair(base, &fixed, false, 1.0), fixed[1]);
+        assert_eq!(texture_pair(base, &fixed, false, 99.0), fixed[1]);
+    }
 
     #[test]
     fn null_texture_names() {
