@@ -247,6 +247,18 @@ impl Career {
         }
     }
 
+    /// Short service feedback after leaving a scheduled stop. The thresholds match the
+    /// personnel file counters, so the on-screen result and saved record agree.
+    pub fn stop_feedback(arrival: f64, departure: f64) -> &'static str {
+        if departure.round() < EARLY_DEPARTURE {
+            "Stop served · departed early"
+        } else if arrival.round() > LATE_ARRIVAL {
+            "Stop served · arrived late"
+        } else {
+            "Stop served · on time"
+        }
+    }
+
     /// A crash of `energy` joules at `speed` m/s: it weighs min(|v| / 5, 1) on the driving.
     pub fn crashed(&mut self, energy: f32, speed: f32) {
         self.crashes[0] += 1;
@@ -369,5 +381,17 @@ impl Career {
         std::fs::write(&path, serde_json::to_vec_pretty(&v)?)?;
         log::info!("session written to {}", path.display());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::Career;
+
+    #[test]
+    fn feedback_uses_personnel_thresholds() {
+        assert_eq!(Career::stop_feedback(0.0, -121.0), "Stop served · departed early");
+        assert_eq!(Career::stop_feedback(181.0, 181.0), "Stop served · arrived late");
+        assert_eq!(Career::stop_feedback(180.0, -120.0), "Stop served · on time");
     }
 }
