@@ -222,11 +222,17 @@ pub fn load_paint_schemes(dir: &Path) -> Vec<PaintScheme> {
 /// game folder) - the first of the vehicle folder, its `model` folder and the game folder
 /// that has it. The model folder's spelling when none does, for the warning.
 fn mesh_path(root: &Path, dir: &Path, model_dir: &Path, file: &str) -> PathBuf {
+    // Model cfg files can live in a subfolder while [mesh] entries remain relative
+    // to the vehicle's Model folder (for example, nested add-on configurations).
+    let model = omsi_cfg::resolve_path(dir, "model");
+    let from_model = omsi_cfg::resolve_path(&model, file);
+    if omsi_cfg::vfs::is_file(&from_model) {
+        return from_model;
+    }
     let first = omsi_cfg::resolve_path(model_dir, file);
     if omsi_cfg::vfs::exists(&first) {
         return first;
     }
-    let model = omsi_cfg::resolve_path(dir, "model");
     let parent = model_dir.parent().map(Path::to_path_buf);
     for base in [Some(dir.to_path_buf()), Some(model), parent, Some(root.to_path_buf())].into_iter().flatten() {
         let p = omsi_cfg::resolve_path(&base, file);
