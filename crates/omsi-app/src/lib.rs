@@ -79,13 +79,22 @@ mod world_load;
 // the interface's translations (locales/app.yml; the English text is the key)
 rust_i18n::i18n!("locales");
 
-/// Show the interface in `code` (the settings' ENG / DEU / FRA / RUS).
+/// Show the interface in the selected language; untranslated keys fall back to English.
 pub(crate) fn ui_language(code: &str) {
     omsi_ui::i18n::set_lookup(|lang, text| _rust_i18n_try_translate(lang, text).map(|t| t.into_owned()));
     omsi_ui::i18n::set_language(match code {
         "RUS" => "ru",
         "DEU" => "de",
         "FRA" => "fr",
+        "ZHT" => "zh-tw",
+        "ZHS" => "zh-cn",
+        "JPN" => "ja",
+        "KOR" => "ko",
+        "THA" => "th",
+        "VIE" => "vi",
+        "IND" => "id",
+        "MSA" => "ms",
+        "TGL" => "tl",
         _ => "",
     });
 }
