@@ -9330,7 +9330,11 @@ impl World {
                         || ov.iter().any(|o| o.bumpmap.is_some())
                         || (!mesh_has_overlay && material_has_vehicle_volume(&vm.data, slot));
                     let repair_body_depth = is_vehicle_body_material(&def.file, &m.texture, tex.is_some(), transmap.is_some(), ov.iter().any(|o| o.no_z_write), body_hint);
-                    if repair_body_depth && !dirt_overlay && !transparent_layer_hint {
+                    // Only correct the legacy reflection-mask case described above.
+                    // A fully opaque O3D diffuse alpha does not identify that case:
+                    // packs such as the Scania ASC deliberately mark their body
+                    // textures [matl_alpha] 2. Preserve that authored blend mode.
+                    if repair_body_depth && m.diffuse[3] < 0.999 && !dirt_overlay && !transparent_layer_hint {
                         alpha = AlphaMode::Opaque;
                     }
                     // Body-volume heuristics must never turn a named pane back into an
