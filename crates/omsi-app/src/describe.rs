@@ -21,7 +21,7 @@ impl ControlNames {
     /// Read the key assignment texts of `lang` from the installation (and the mods' copies).
     pub fn load(root: &Path, lang: &str) -> ControlNames {
         let lang = match language_code(lang).as_str() {
-            "RUS" => "ENG".to_string(),
+            "RUS" | "ZHT" | "ZHS" | "JPN" | "KOR" | "THA" | "VIE" | "IND" | "MSA" | "TGL" => "ENG".to_string(),
             l => l.to_string(),
         };
         let mut texts = HashMap::new();
@@ -122,6 +122,15 @@ pub fn language_code(s: &str) -> String {
         "fr" | "fra" | "fre" | "french" | "francais" | "français" => "FRA".into(),
         // (the navigator and the interface speak Russian; OMSI has no Russian cockpit names)
         "ru" | "rus" | "russian" | "русский" => "RUS".into(),
+        "zh-tw" | "zh-hant" | "zh-hk" | "zh-mo" | "zht" | "cht" | "traditional chinese" | "繁體中文" | "繁体中文" => "ZHT".into(),
+        "zh" | "zh-cn" | "zh-sg" | "zh-hans" | "zhs" | "chs" | "simplified chinese" | "简体中文" | "簡體中文" => "ZHS".into(),
+        "ja" | "jp" | "jpn" | "japanese" | "日本語" => "JPN".into(),
+        "ko" | "kr" | "kor" | "korean" | "한국어" => "KOR".into(),
+        "th" | "tha" | "thai" | "ไทย" => "THA".into(),
+        "vi" | "vie" | "vietnamese" | "tiếng việt" => "VIE".into(),
+        "id" | "ind" | "indonesian" | "bahasa indonesia" => "IND".into(),
+        "ms" | "msa" | "may" | "malay" | "bahasa melayu" => "MSA".into(),
+        "tl" | "fil" | "tgl" | "filipino" | "tagalog" => "TGL".into(),
         _ => "ENG".into(),
     }
 }
