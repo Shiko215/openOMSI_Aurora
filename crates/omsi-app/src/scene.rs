@@ -2080,7 +2080,7 @@ impl World {
                             mesh_def_index.push(start + i);
                             mesh_pivots.push(omsi_sim::anim::pivot_from_mesh(&m));
                         }
-                        Err(e) => log::debug!("{}: {e}", mesh_path.display()),
+                        Err(e) => log::warn!("scenery LOD0 mesh failed: object={} mesh={} error={e}", path.display(), mesh_path.display()),
                     }
                 }
             }
@@ -2095,11 +2095,15 @@ impl World {
                     } else {
                         omsi_cfg::resolve_path(&model_dir, &md.file)
                     };
-                    if let Ok(m) = omsi_o3d::load_mesh(&mesh_path) {
-                        list.push((mesh_from_o3d(&m), m.materials.clone(), md.materials.clone()));
+                    match omsi_o3d::load_mesh(&mesh_path) {
+                        Ok(m) => list.push((mesh_from_o3d(&m), m.materials.clone(), md.materials.clone())),
+                        Err(e) => log::warn!("scenery lower LOD mesh failed: object={} mesh={} error={e}", path.display(), mesh_path.display()),
                     }
                 }
                 lower_lods.push((model.lods[l].min_size, list));
+            }
+            if meshes.is_empty() && lower_lods.iter().all(|(_, lod)| lod.is_empty()) && !model.meshes.is_empty() {
+                log::warn!("scenery has mesh declarations but NO loadable visual meshes: object={} model_dir={} declared_meshes={} lod_levels={}", path.display(), model_dir.display(), model.meshes.len(), model.lods.len());
             }
             let lod0_min = model.lods.first().map(|l| l.min_size).unwrap_or(0.0);
             // [CTC] paint schemes (.cti items): texture substitutions for the chosen scheme
