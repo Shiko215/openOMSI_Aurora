@@ -1,7 +1,7 @@
 //! Textures.
 //!
 //! OMSI looks a texture up by *file name* in a search order: the object's `texture` folder,
-//! then the global `Texture` folder, trying the exact name first and then the other supported
+//! then the global `Texture` folder, trying a same-stem DDS first, the exact name, then other supported
 //! extensions (`.dds`, `.bmp`, `.tga`, `.jpg`, `.png`), plus seasonal (`Texture\Spring` …) and
 //! `_LOW` variants. A `<texture>.cfg` sidecar carries per-texture flags.
 
@@ -244,15 +244,18 @@ pub fn find_texture(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
 fn find_texture_uncached(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
     // a file named in full (a paint scheme's picture, resolved in its scheme's folder)
     let full = Path::new(name.trim());
-    if full.is_absolute() && omsi_cfg::vfs::is_file(full) {
-        return Some(full.to_path_buf());
+    if full.is_absolute() {
+        if let (Some(parent), Some(file)) = (full.parent(), full.file_name().and_then(|f| f.to_str())) {
+            if let Some(found) = find_texture_in_dir(parent, file) {
+                return Some(found);
+            }
+        }
     }
     let name = name.trim().replace('\\', "/");
     if name.is_empty() {
         return None;
     }
     let stem_path = Path::new(&name);
-    let stem = stem_path.with_extension("");
     let season = season_folder();
     // A seasonal texture lives in a subfolder of the folder the texture itself is in:
     // `Texture\WinterSnow\gras.bmp` for `Texture\gras.bmp`. The name often carries that
@@ -273,22 +276,12 @@ fn find_texture_uncached(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
     let from_root: Vec<PathBuf> = if name.contains('/') { omsi_cfg::content_roots().into_iter().take(1).collect() } else { Vec::new() };
     let dirs: Vec<&Path> = dirs.iter().copied().chain(from_root.iter().map(|p| p.as_path())).collect();
     for cand_name in &names {
-        let cand_stem = Path::new(cand_name).with_extension("");
         for dir in &dirs {
-            let p = omsi_cfg::resolve_path(dir, cand_name);
-            if omsi_cfg::vfs::is_file(&p) {
-                return Some(p);
-            }
-            for ext in EXTENSIONS {
-                let c = format!("{}.{}", cand_stem.display(), ext);
-                let p = omsi_cfg::resolve_path(dir, &c);
-                if omsi_cfg::vfs::is_file(&p) {
-                    return Some(p);
-                }
+            if let Some(found) = find_texture_in_dir(dir, cand_name) {
+                return Some(found);
             }
         }
     }
-    let _ = stem;
     // A path of the author's machine (`D:\OMSI 2\Vehicles\Sprinter_work\Texture\extras.jpg`
     // in the Sprinter 412D): the same file under the installation's content folders, else
     // the bare file name in the texture folders.
@@ -298,9 +291,8 @@ fn find_texture_uncached(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
         if let Some(i) = parts.iter().position(|p| omsi_cfg::CONTENT_FOLDERS.iter().any(|f| f.eq_ignore_ascii_case(p))) {
             let rel = parts[i..].join("/");
             for root in omsi_cfg::content_roots() {
-                let p = omsi_cfg::resolve_path(&root, &rel);
-                if omsi_cfg::vfs::is_file(&p) {
-                    return Some(p);
+                if let Some(found) = find_texture_in_dir(&root, &rel) {
+                    return Some(found);
                 }
             }
         }
@@ -308,6 +300,28 @@ fn find_texture_uncached(name: &str, dirs: &[&Path]) -> Option<PathBuf> {
             if let Some(p) = find_texture_uncached(file, &dirs) {
                 return Some(p);
             }
+        }
+    }
+    None
+}
+
+/// Prefer the authored DDS replacement within one search location. Folder/season
+/// precedence stays outside this function so a global DDS cannot override a local PNG.
+fn find_texture_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    let stem = Path::new(name).with_extension("");
+    let dds = format!("{}.dds", stem.display());
+    let p = omsi_cfg::resolve_path(dir, &dds);
+    if omsi_cfg::vfs::is_file(&p) {
+        return Some(p);
+    }
+    let p = omsi_cfg::resolve_path(dir, name);
+    if omsi_cfg::vfs::is_file(&p) {
+        return Some(p);
+    }
+    for ext in EXTENSIONS.into_iter().filter(|e| *e != "dds") {
+        let p = omsi_cfg::resolve_path(dir, &format!("{}.{}", stem.display(), ext));
+        if omsi_cfg::vfs::is_file(&p) {
+            return Some(p);
         }
     }
     None
@@ -505,6 +519,32 @@ impl TextureCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dds_precedes_exact_names_but_preserves_folder_priority() {
+        let dir = std::env::temp_dir().join(format!("omsi-dds-priority-{}", std::process::id()));
+        let local = dir.join("local");
+        let global = dir.join("global");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        for ext in ["png", "jpg", "tga", "bmp"] {
+            let stem = format!("sign_{ext}");
+            std::fs::write(local.join(format!("{stem}.{ext}")), b"x").unwrap();
+            std::fs::write(local.join(format!("{stem}.DDS")), b"x").unwrap();
+            let name = format!("{stem}.{ext}");
+            let found = find_texture_uncached(&name, &[&local]).unwrap();
+            assert_eq!(found.extension().unwrap().to_string_lossy().to_ascii_lowercase(), "dds");
+            assert_eq!(find_texture_uncached(local.join(&name).to_str().unwrap(), &[]), Some(found));
+        }
+        std::fs::write(local.join("local_only.png"), b"x").unwrap();
+        std::fs::write(global.join("local_only.dds"), b"x").unwrap();
+        assert_eq!(find_texture_uncached("local_only.png", &[&local, &global]), Some(local.join("local_only.png")));
+        // Without DDS, the requested format wins over the other fallback formats.
+        std::fs::write(local.join("local_only.bmp"), b"x").unwrap();
+        assert_eq!(find_texture_uncached("local_only.png", &[&local]), Some(local.join("local_only.png")));
+        assert_eq!(find_texture_uncached("missing.png", &[&local]), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A mesh's texture name with Windows' quirks (Ahlheim's `anz-oben.jpg.`) finds the file.
     #[test]
