@@ -12,6 +12,22 @@ pub enum RenderType {
     PreSurface,
     Surface,
     OnSurface,
+    BeforeNormal,
+    AfterNormal,
+    AfterVehicles,
+}
+
+/// Parse the OMSI `[rendertype]` spelling used by both a .sco and its model.cfg.
+pub fn parse_render_type(value: &str) -> RenderType {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "presurface" => RenderType::PreSurface,
+        "surface" => RenderType::Surface,
+        "on_surface" => RenderType::OnSurface,
+        "1" => RenderType::BeforeNormal,
+        "3" => RenderType::AfterNormal,
+        "4" => RenderType::AfterVehicles,
+        _ => RenderType::Normal,
+    }
 }
 
 /// One `[phase]` of a light: the value the lamp scripts read as `TrafficLightPhase`
@@ -84,6 +100,8 @@ pub struct SceneryObject {
     pub only_editor: bool,
     pub complexity: i32,
     pub render_type: RenderType,
+    /// Whether `[rendertype]` appeared in this .sco, which takes precedence over model.cfg.
+    pub render_type_explicit: bool,
     pub light_map_mapping: bool,
     pub no_map_lighting: bool,
     pub night_map_mode: i32,
@@ -93,6 +111,8 @@ pub struct SceneryObject {
     pub crossing_height_deformation: Option<String>,
     pub no_collision: bool,
     pub surface: bool,
+    /// Whether this .sco supplied `[surface]`; otherwise the model.cfg value may be inherited.
+    pub surface_explicit: bool,
     pub switch: Option<i32>,
     pub switch_dir: Vec<i32>,
     /// `[switchdir]` of each `[path]` (parallel to `paths`): the position of the points
@@ -160,7 +180,41 @@ impl SceneryObject {
         Ok(Self::parse(&f))
     }
 
+    /// Inherit render and surface tags from a referenced model.cfg when the .sco wrapper
+    /// did not author the corresponding tag. This mirrors OMSI's scenery-definition merge.
+    pub fn inherit_model_tags(&mut self, model: &Model) {
+        if !self.render_type_explicit {
+            if let Some(value) = model.render_type.as_deref() {
+                self.render_type = parse_render_type(value);
+            }
+        }
+        if !self.surface_explicit {
+            if let Some(surface) = model.surface {
+                self.surface = surface;
+                if surface {
+                    self.fixed = true;
+                }
+            }
+        }
+    }
+
     pub fn parse(file: &CfgFile) -> SceneryObject {
+        // Tram switches ship with an indented `[surface]`. The C++ handler trims
+        // this tag and applies the same surface lift as to adjacent spline rails.
+        // Normalize only this placement tag; indented mesh/animation commands must
+        // retain their existing semantics, including disabled blocks.
+        let normalized;
+        let file = if file.lines.iter().any(|line| line != "[surface]" && line.trim() == "[surface]") {
+            normalized = CfgFile {
+                path: file.path.clone(),
+                lines: file.lines.iter().map(|line| {
+                    if line.trim() == "[surface]" { "[surface]".to_string() } else { line.clone() }
+                }).collect(),
+            };
+            &normalized
+        } else {
+            file
+        };
         let mut o = SceneryObject { path: file.path.clone(), complexity: 0, model: Model { path: file.path.clone(), detail_factor: 1.0, tex_detail_factor: 1.0, ..Default::default() }, ..Default::default() };
         let base = file.dir().to_path_buf();
         let mut r = file.reader().disabled_blocks();
@@ -189,12 +243,8 @@ impl SceneryObject {
                 "onlyeditor" => o.only_editor = true,
                 "complexity" => o.complexity = r.i32(),
                 "rendertype" => {
-                    o.render_type = match r.word().to_ascii_lowercase().as_str() {
-                        "presurface" => RenderType::PreSurface,
-                        "surface" => RenderType::Surface,
-                        "on_surface" => RenderType::OnSurface,
-                        _ => RenderType::Normal,
-                    }
+                    o.render_type = parse_render_type(r.word());
+                    o.render_type_explicit = true;
                 }
                 "lightmapmapping" => o.light_map_mapping = true,
                 "nomaplighting" => o.no_map_lighting = true,
@@ -207,7 +257,14 @@ impl SceneryObject {
                 "collision_mesh" => o.collision_mesh = Some(r.str().to_string()),
                 "crossing_heightdeformation" => o.crossing_height_deformation = Some(r.str().to_string()),
                 "nocollision" => o.no_collision = true,
-                "surface" => o.surface = true,
+                // (and `[fixed]` with it, as Omsi.exe sets both at 0x7b6823)
+                "surface" => {
+                    // A bare tag means true. Peek so an immediately following
+                    // keyword (e.g. `[mesh]`) is not consumed as its optional value.
+                    o.surface = r.clone().word() != "0";
+                    o.surface_explicit = true;
+                    o.fixed = true;
+                }
                 "switch" => o.switch = Some(r.i32()),
                 "switchdir" => {
                     let d = r.i32();
@@ -373,5 +430,61 @@ mod tests {
         assert_eq!(a.origins, vec![omsi_model::AnimOrigin::RotY(90.0)]);
         assert_eq!((a.variable.as_str(), a.factor), ("barrier", 85.0));
         assert!(o.fixed);
+    }
+
+    #[test]
+    fn render_type_names_and_numeric_queues_match_omsi() {
+        for (value, expected) in [
+            ("presurface", RenderType::PreSurface),
+            ("surface", RenderType::Surface),
+            ("on_surface", RenderType::OnSurface),
+            ("1", RenderType::BeforeNormal),
+            ("3", RenderType::AfterNormal),
+            ("4", RenderType::AfterVehicles),
+            ("0", RenderType::Normal),
+        ] {
+            let text = format!("[rendertype]\n{value}\n");
+            assert_eq!(SceneryObject::parse(&CfgFile::from_str("phase.sco", &text)).render_type, expected);
+        }
+    }
+
+    #[test]
+    fn referenced_model_cfg_render_tags_are_inherited_unless_the_sco_overrides_them() {
+        let model = Model::parse(&CfgFile::from_str(
+            "model.cfg",
+            "[rendertype]\nsurface\n[surface]\n1\n",
+        ));
+        let mut inherited = SceneryObject::parse(&CfgFile::from_str("junction.sco", ""));
+        inherited.inherit_model_tags(&model);
+        assert_eq!(inherited.render_type, RenderType::Surface);
+        assert!(inherited.surface);
+        assert!(inherited.fixed);
+
+        let mut explicit = SceneryObject::parse(&CfgFile::from_str(
+            "junction.sco",
+            "[rendertype]\n0\n[surface]\n0\n",
+        ));
+        explicit.inherit_model_tags(&model);
+        assert_eq!(explicit.render_type, RenderType::Normal);
+        assert!(!explicit.surface);
+    }
+
+    #[test]
+    fn indented_switch_surface_tag_preserves_the_surface_lift() {
+        let text = "[rendertype]\nsurface\n[absheight]\n\n\t[surface]\n[mesh]\nWeiche_L_Asphalt.o3d\n\t[mesh]\nignored.o3d\n";
+        let o = SceneryObject::parse(&CfgFile::from_str("switch.sco", text));
+        assert!(o.surface && o.surface_explicit && o.fixed && o.abs_height);
+        assert_eq!(o.render_type, RenderType::Surface);
+        assert_eq!(o.model.meshes.len(), 1);
+        assert_eq!(o.model.meshes[0].file, "Weiche_L_Asphalt.o3d");
+
+        let o = SceneryObject::parse(&CfgFile::from_str("switch.sco", " \t[surface] \t\n0\n[mesh]\nswitch.o3d\n"));
+        assert!(o.surface_explicit);
+        assert!(!o.surface);
+        assert_eq!(o.model.meshes.len(), 1);
+
+        let o = SceneryObject::parse(&CfgFile::from_str("switch.sco", "-<DISABLED>-\n\t[surface]\n1\n-<ENABLED>-\n[mesh]\nswitch.o3d\n"));
+        assert!(!o.surface_explicit && !o.surface);
+        assert_eq!(o.model.meshes.len(), 1);
     }
 }

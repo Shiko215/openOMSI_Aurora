@@ -221,7 +221,8 @@ budget.
    everything blended behind it), glass reflections weighted by the viewing angle, WASD
    driving with shift for the three vehicle keys it covers, and a build stamp in the log and
    the HUD. **(done)**
-   Also: `[spline_terrain_align]` and `[terrainhole]` applied, and the ground only cut
+   Also: `[spline_terrain_align]` (the spline's hole outline, as Omsi.exe cuts it) and
+   `[terrainhole]` applied, and the ground only cut
    where a surface really crosses it; `OMSI_ROAD_PHOTO` photographs the carriageway network
    from above and reports where the picture shows ground instead of road (0 of ~400 points
    on both stock maps). **(done)**
@@ -949,10 +950,13 @@ position, message) is `PluginIo`'s new default methods. Tests: `crates/omsi-plug
   format of 8 axes, 4 POVs, 128 buttons, axes -10000..10000, the device list read on a thread
   every 3 s). Button numbers come from the system's code (HID usage - 1, evdev BTN_JOYSTICK /
   TRIGGER_HAPPY, the WGI index); they used to be the rank among buttons pressed so far. Force
-  feedback on a DirectInput wheel is one constant force set each frame: centring
-  -x (0.25 + 0.5 min(1, v/50)), drag -dx/dt 0.05 (1 + 2 max(0, 1 - v/20)), the scripts'
-  `FF_Vib_Amp`/`FF_Vib_Period` as a sine, scaled by the device's `[FFScale]`; the wheel's own
-  autocentre is switched off (as OMSI does). The set-up assistant (`launcher/pages.rs`,
+  feedback on a DirectInput wheel is one constant force set each frame: a gentle centring
+  force that increases as the bus rolls, tyre scrub that resists turning at parking speed,
+  a filtered and bounded contribution from the body's lateral acceleration, short
+  front-wheel jolts from suspension travel or wheel impacts, and the scripts'
+  `FF_Vib_Amp`/`FF_Vib_Period` as a sine; the first `[FFScale]` value scales steering forces,
+  the second scales vibration for that device. The wheel's own autocentre is switched off
+  (as OMSI does). The set-up assistant (`launcher/pages.rs`,
   `wizard_result`) records rest, left lock and each pedal and picks the axis that moved most.
 * **Multiplayer** (`omsi-net::bridge`, `lan.rs`): UPnP forwardings are asked for an hour and
   renewed every 20 minutes (they were asked once for 7200 s); the ntfy.sh rendezvous is polled

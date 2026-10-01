@@ -68,12 +68,13 @@ pub(crate) fn fatal_dialog(title: &str, text: &str) {
 /// installation (Vehicles, maps, Sceneryobjects ...). Mods live here; it is searched before
 /// the original installation.
 /// The `Inputs/keyboard.cfg` the game follows: the content folder's once the launcher has
-/// saved key bindings there, else the original installation's (never written).
+/// saved key bindings there, else the original installation's (never written) - or, where
+/// that has none, its `keyboard_reset.cfg`, the standard keys OMSI falls back to as well.
 pub(crate) fn keyboard_cfg(root: &Path) -> PathBuf {
     if let Some(own) = content_dir().map(|c| c.join("Inputs/keyboard.cfg")).filter(|p| p.exists()) {
         return own;
     }
-    root.join("Inputs/keyboard.cfg")
+    omsi_cfg::original_keyboard_cfg(root)
 }
 
 /// The keys (scan codes without a modifier) the player's own `keyboard.cfg` (the content
@@ -83,7 +84,7 @@ pub(crate) fn own_keys(root: &Path) -> std::collections::HashSet<i32> {
     own_bindings(root, 0)
 }
 
-/// The keys held with `modifier` (1: Shift) that the file in use binds otherwise than OMSI 2's
+/// The keys held with `modifier` (a chord: `KEY_SHIFT` …) that the file in use binds otherwise than OMSI 2's
 /// own assignment ([`crate::stock_keys::STOCK_KEYS`]): the player's own. Told apart from the
 /// built-in list, not from the installation's file - a player who edited that file had
 /// every change overridden by the game's conveniences (Z / X / C, Shift+number).
@@ -93,7 +94,7 @@ pub(crate) fn own_bindings(root: &Path, modifier: i32) -> std::collections::Hash
     m.vehicles
         .iter()
         .chain(m.game.iter())
-        .filter(|b| b.modifier == modifier && b.scan_code != 0 && !stock.contains(&(b.action.to_ascii_lowercase(), b.scan_code, b.modifier)))
+        .filter(|b| b.chord() == modifier && b.scan_code != 0 && !stock.contains(&(b.action.to_ascii_lowercase(), b.scan_code, b.modifier)))
         .map(|b| b.scan_code)
         .collect()
 }
@@ -110,7 +111,15 @@ pub(crate) fn content_dir() -> Option<PathBuf> {
     } else {
         dir
     };
-    Some(omsi_cfg::content_folder_of(&dir))
+    let cand = omsi_cfg::content_folder_of(&dir);
+    if (cand.exists() || std::fs::create_dir_all(&cand).is_ok()) && omsi_cfg::is_writable(&cand) {
+        Some(cand)
+    } else {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        let fallback = PathBuf::from(home).join(".openomsi").join("content");
+        let _ = omsi_cfg::ensure_content_layout(&fallback);
+        Some(fallback)
+    }
 }
 
 /// Where the last working installation was remembered.
@@ -150,33 +159,9 @@ pub(crate) fn graphics_instance() -> wgpu::Instance {
         descriptor.backend_options.noop = wgpu::NoopBackendOptions { enable: true };
         return wgpu::Instance::new(descriptor);
     }
-    // The graphics interface: Metal on a Mac; elsewhere Vulkan first, and where the
-    // graphics chip or its driver has none (an older card - a GeForce GT 530 -, an old phone)
-    // DirectX 12 on Windows and then OpenGL. Settings → Graphics API (`graphics_api`) or
-    // OMSI_BACKEND=vulkan|dx12|gl picks one: a driver whose Vulkan misbehaves is got round.
-    let wanted = omsi_cfg::env::var("OMSI_BACKEND").ok().unwrap_or_else(|| crate::settings::Settings::load().graphics_api);
-    let order: Vec<wgpu::Backends> = if cfg!(target_os = "macos") {
-        vec![wgpu::Backends::METAL]
-    } else {
-        let all: Vec<wgpu::Backends> = if cfg!(windows) {
-            vec![wgpu::Backends::VULKAN, wgpu::Backends::DX12, wgpu::Backends::GL]
-        } else {
-            vec![wgpu::Backends::VULKAN, wgpu::Backends::GL]
-        };
-        let first = match wanted.trim().to_ascii_lowercase().as_str() {
-            "vulkan" => Some(wgpu::Backends::VULKAN),
-            "dx12" | "directx" | "d3d12" if cfg!(windows) => Some(wgpu::Backends::DX12),
-            "gl" | "opengl" | "gles" => Some(wgpu::Backends::GL),
-            _ => None,
-        };
-        // (the one asked for first, the others after it: a machine without it still starts)
-        first.into_iter().chain(all.into_iter().filter(|b| Some(*b) != first)).collect()
-    };
     let mut last = None;
-    for b in order {
-        let mut d = wgpu::InstanceDescriptor::new_without_display_handle();
-        d.backends = b;
-        let instance = wgpu::Instance::new(d);
+    for b in backend_order() {
+        let instance = backend_instance(b);
         let adapters = pollster::block_on(instance.enumerate_adapters(b));
         if !adapters.is_empty() {
             log::info!("graphics: {:?} ({})", b, adapters.iter().map(|a| a.get_info().name).collect::<Vec<_>>().join(", "));
@@ -186,6 +171,115 @@ pub(crate) fn graphics_instance() -> wgpu::Instance {
         last = Some(instance);
     }
     last.unwrap_or_else(|| wgpu::Instance::new(descriptor))
+}
+
+/// The graphics interfaces in the order they are tried: Metal on a Mac; on Windows DirectX
+/// 12 first (the Windows drivers' best-kept path: on Vulkan they reset the device -
+/// "the graphics device was lost" - far more often), then Vulkan, then OpenGL for a card
+/// without either (a GeForce GT 530); elsewhere Vulkan, then OpenGL. Settings → Graphics API
+/// (`graphics_api`) or OMSI_BACKEND=vulkan|dx12|gl puts one first: a driver whose Vulkan
+/// misbehaves is got round.
+pub(crate) fn backend_order() -> Vec<wgpu::Backends> {
+    if cfg!(target_os = "macos") {
+        return vec![wgpu::Backends::METAL];
+    }
+    let settings = crate::settings::Settings::load();
+    let wanted = if settings.vr_requested() {
+        "dx12".to_owned()
+    } else {
+        omsi_cfg::env::var("OMSI_BACKEND").ok().unwrap_or(settings.graphics_api)
+    };
+    let all: Vec<wgpu::Backends> = if cfg!(windows) {
+        vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN, wgpu::Backends::GL]
+    } else {
+        vec![wgpu::Backends::VULKAN, wgpu::Backends::GL]
+    };
+    let first = match wanted.trim().to_ascii_lowercase().as_str() {
+        "vulkan" => Some(wgpu::Backends::VULKAN),
+        "dx12" | "directx" | "d3d12" if cfg!(windows) => Some(wgpu::Backends::DX12),
+        "gl" | "opengl" | "gles" => Some(wgpu::Backends::GL),
+        _ => None,
+    };
+    // (the one asked for first, the others after it: a machine without it still starts)
+    first.into_iter().chain(all.into_iter().filter(|b| Some(*b) != first)).collect()
+}
+
+fn backend_instance(b: wgpu::Backends) -> wgpu::Instance {
+    let mut d = wgpu::InstanceDescriptor::new_without_display_handle();
+    d.backends = b;
+    wgpu::Instance::new(d)
+}
+
+/// The renderer for a window: on `instance` if it can, else on the next graphics interface
+/// and adapter that can (`instance` then becomes that one's). Laptops with a GeForce GT or
+/// GTX beside the processor's graphics listed a Vulkan adapter whose device then could not
+/// be opened (an old driver, the switchable graphics), or whose opening took wgpu down: the
+/// game and the launcher ended before their window showed anything. Now each adapter that
+/// can show the window is tried in turn - the card, then the processor's graphics - on
+/// Vulkan, DirectX 12 and OpenGL, and only when none opens is the game given up, saying so.
+pub(crate) fn window_renderer(
+    instance: &mut wgpu::Instance,
+    window: &std::sync::Arc<winit::window::Window>,
+    options: omsi_render::RenderOptions,
+) -> Result<Renderer> {
+    let mut failures: Vec<String> = Vec::new();
+    // the instance made for the settings' interface first, then every interface in turn
+    let mut candidates: Vec<(Option<wgpu::Backends>, wgpu::Instance)> = vec![(None, instance.clone())];
+    for b in backend_order() {
+        candidates.push((Some(b), backend_instance(b)));
+    }
+    for (b, inst) in candidates {
+        let surface = match inst.create_surface(window.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                failures.push(format!("{}: no surface ({e})", b.map(|b| format!("{b:?}")).unwrap_or_else(|| "first choice".into())));
+                continue;
+            }
+        };
+        for adapter in Renderer::adapters_for(&inst, &surface) {
+            let info = adapter.get_info();
+            let what = format!("{} ({:?})", info.name, info.backend);
+            if failures.iter().any(|f| f.starts_with(&what)) {
+                continue;
+            }
+            match omsi_render::catch(|| pollster::block_on(Renderer::new_on(adapter, Some(&surface), None, options))) {
+                Some(Ok(r)) => {
+                    if !failures.is_empty() {
+                        log::warn!("graphics: drawing on {what}; before it {}", failures.join("; "));
+                    }
+                    drop(surface);
+                    *instance = inst;
+                    return Ok(r);
+                }
+                Some(Err(e)) => {
+                    log::warn!("graphics: {what} could not be opened: {e:#}");
+                    failures.push(format!("{what}: {e:#}"));
+                }
+                None => {
+                    log::warn!("graphics: {what} failed while being opened");
+                    failures.push(format!("{what}: failed while being opened"));
+                }
+            }
+        }
+    }
+    Err(anyhow!("no graphics device could be opened ({}); updating the graphics driver usually helps", if failures.is_empty() { "no adapter can show a window".to_string() } else { failures.join("; ") }))
+}
+
+/// Tell the player why the game cannot go on, also where there is no window yet (a message
+/// box on Windows; the log and the terminal elsewhere).
+pub(crate) fn fatal_message(text: &str) {
+    log::error!("{text}");
+    eprintln!("openOMSI: {text}");
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (t, c) = (wide(text), wide("openOMSI"));
+        unsafe {
+            MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONERROR);
+        }
+    }
 }
 
 /// The commit this binary was built from (see `build.rs`), so a log or a screenshot says
@@ -272,6 +366,6 @@ mod own_key_tests {
             return;
         }
         assert!(super::own_bindings(root, 0).is_empty());
-        assert!(super::own_bindings(root, 1).is_empty());
+        assert!(super::own_bindings(root, omsi_content::input::KEY_SHIFT).is_empty());
     }
 }

@@ -103,7 +103,7 @@ pub fn pull_out_room(def: &Vehicle, extent: (f32, f32, f32), obstacle_half_width
         for ramp in pull_out_ramps(gap, front, false) {
             let way = straight_pull_out(side, ramp);
             let mut body = AiBody::new(def, MotionKind::Road);
-            body.place(&way, None, 0.0);
+            body.place(&way, None, None, 0.0);
             if body.sweep_clearance(&way, 0.0, PULL_OUT_WAIT, PULL_OUT_ACCEL, 8.0, gap + 6.0, extent, &[obstacle]) >= PULL_OUT_CLEARANCE {
                 return gap + 0.5;
             }
@@ -135,6 +135,14 @@ struct Wheel {
     k: f32,
     c: f32,
 }
+
+/// How far over its way an AI car's wheel climbs onto what is drawn there (m), and how far
+/// under the way it goes down to it: the road drawn higher than the lane the map laid out
+/// (the car sank into it), not a deck overhead; and below the lane only a little - a lane
+/// running along the edge of a junction plate had its outer wheels drop onto the terrain
+/// beside it and the car leaned over by ten degrees (see `AiBody::settle`).
+const AI_STEP_UP: f64 = 0.6;
+const AI_STEP_DOWN: f64 = 0.1;
 
 #[derive(Debug, Clone)]
 pub struct AiBody {
@@ -236,7 +244,9 @@ impl AiBody {
             damper[2] += w.c * w.lat * w.lat;
         }
         let half_track = wheels.iter().map(|w| w.lat.abs()).fold(0.5, f32::max);
-        let mut inertia = [def.moment_of_inertia[0] * unit, def.moment_of_inertia[1] * unit];
+        // (pitch and roll: the first and the third value, as Omsi.exe reads them - see
+        // `RigidBody::from_definition`)
+        let mut inertia = [def.moment_of_inertia[0] * unit, def.moment_of_inertia[2] * unit];
         if inertia[0] <= 0.0 {
             inertia[0] = mass * (front_long * front_long + rear_long * rear_long) * 0.5;
         }
@@ -301,16 +311,18 @@ impl AiBody {
 
     /// Put the body onto its way, standing still and straight. `way(d)` is the point `d`
     /// metres along the way from the vehicle's origin.
-    pub fn place(&mut self, way: &dyn Fn(f32) -> DVec3, ground: Option<&dyn Fn(f64, f64) -> Option<f64>>, speed: f32) {
+    pub fn place(&mut self, way: &dyn Fn(f32) -> DVec3, ground: Option<&dyn Fn(f64, f64) -> Option<f64>>, contact: Option<&dyn crate::rigid::Ground>, speed: f32) {
         self.started = false;
         self.ground = None;
         self.contact_z.clear();
         self.last_speed = speed;
-        self.step(0.0, speed, way, ground);
+        self.step(0.0, speed, way, ground, contact);
     }
 
     /// Follow the way for `dt` seconds at `speed` (m/s, the planner's speed).
-    pub fn step(&mut self, dt: f32, speed: f32, way: &dyn Fn(f32) -> DVec3, ground: Option<&dyn Fn(f64, f64) -> Option<f64>>) {
+    /// `contact`: what the wheels stand on (the faces under a height, as the player's wheels
+    /// ask it); without it the plain height sampler `ground`.
+    pub fn step(&mut self, dt: f32, speed: f32, way: &dyn Fn(f32) -> DVec3, ground: Option<&dyn Fn(f64, f64) -> Option<f64>>, contact: Option<&dyn crate::rigid::Ground>) {
         if dt > 0.0 {
             let a = (speed - self.last_speed) / dt;
             self.a_long += (a - self.a_long) * (dt / 0.15).min(1.0);
@@ -319,7 +331,7 @@ impl AiBody {
         match self.kind {
             MotionKind::Road => {
                 self.drive(dt, speed, way);
-                self.settle(dt, way, ground);
+                self.settle(dt, way, ground, contact);
             }
             MotionKind::Rail => self.ride(way),
             MotionKind::Air => self.fly(dt, speed, way),
@@ -349,9 +361,31 @@ impl AiBody {
         let g = way(self.rot_long + look).truncate() - self.rear;
         let alpha = (g.dot(right) as f32).atan2(g.dot(fwd) as f32).clamp(-FRAC_PI_2, FRAC_PI_2);
         let reach = (g.length() as f32).max(1.0);
-        let want = (2.0 * self.wheelbase * alpha.sin() / reach).atan().to_degrees().clamp(-self.max_steer, self.max_steer);
+        // The way itself says how tight it bends here: a junction's turn laid tighter than
+        // the model's `[inv_min_turnradius]` still has to be followed - capped at the
+        // model's lock the car ran wide of it, through the kerb, the corner house and the
+        // people on the pavement (#249; OMSI's AI keeps to its path). The lock the bend
+        // needs, and a little more, is allowed, and the wheel may turn that much faster.
+        let (a, b, c) = (way(self.rot_long).truncate(), way(self.rot_long + 0.5 * look).truncate(), way(self.rot_long + look).truncate());
+        let (u, w) = (b - a, c - b);
+        let turn = (u.x * w.y - u.y * w.x).atan2(u.dot(w)).abs() as f32;
+        let bend_k = if look > 0.1 { 2.0 * turn / look } else { 0.0 };
+        let need = (bend_k * self.wheelbase).atan().to_degrees() * 1.15;
+        let limit = if std::env::var_os("OMSI_AI_MODEL_LOCK").is_some() { self.max_steer } else { self.max_steer.max(need.min(60.0)) };
+        // OMSI_DEBUG_AI_WIDE: every tenth of a second a car stands over 1.5 m beside its way
+        if std::env::var_os("OMSI_DEBUG_AI_WIDE").is_some() {
+            let off = ((target - self.rear).dot(right)).abs();
+            if off > 1.5 {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 50 == 0 {
+                    log::info!("ai wide: {off:.1} m beside its way at ({:.0}, {:.0}), bend needs {need:.0} deg, lock {:.0} ({} so far)", self.rear.x, self.rear.y, self.max_steer, n + 1);
+                }
+            }
+        }
+        let want = (2.0 * self.wheelbase * alpha.sin() / reach).atan().to_degrees().clamp(-limit, limit);
         if dt > 0.0 {
-            let rate = self.steer_rate * dt;
+            let rate = self.steer_rate * dt * if limit > self.max_steer { 1.5 } else { 1.0 };
             self.steer_cmd += (want - self.steer_cmd).clamp(-rate, rate);
             self.steer += (self.steer_cmd - self.steer) * (dt / 0.08).min(1.0);
         }
@@ -370,37 +404,66 @@ impl AiBody {
     /// The body on its springs over the ground under its wheels: the plane through the
     /// contact points is where the body wants to be, braking and cornering lean it off
     /// that plane, and the difference is how far each wheel moves in its arch.
-    fn settle(&mut self, dt: f32, way: &dyn Fn(f32) -> DVec3, ground: Option<&dyn Fn(f64, f64) -> Option<f64>>) {
+    fn settle(&mut self, dt: f32, way: &dyn Fn(f32) -> DVec3, ground: Option<&dyn Fn(f64, f64) -> Option<f64>>, contact: Option<&dyn crate::rigid::Ground>) {
         let fwd = dir(self.heading);
         let right = DVec2::new(fwd.y, -fwd.x);
         let origin = self.position.truncate();
         // the way's own height at each axle: the road the map says is there, which also
         // decides when a sampled height belongs to something else (a bridge over the road)
         let mut axle_z = vec![f64::NAN; self.axle_count];
-        let mut contacts: Vec<(f32, f32, f64)> = Vec::with_capacity(self.wheels.len());
+        // (lateral, longitudinal, axle, way height, what is drawn there)
+        let mut samples: Vec<(f32, f32, usize, f64, Option<f64>)> = Vec::with_capacity(self.wheels.len());
         for w in &self.wheels {
             if axle_z[w.axle].is_nan() {
                 axle_z[w.axle] = way(w.long).z;
             }
             let path_z = axle_z[w.axle];
             let p = origin + right * w.lat as f64 + fwd * w.long as f64;
-            // the wheels ride on the way itself; the surface under a wheel only counts where
-            // it lies within a few centimetres of it. Taken up to 0.8 m off, a wheel beside
-            // the lane climbed the kerb and the gutter, and the texel steps of the road
-            // raster kept every bus rocking like a boat (±0.25° pitch at a second's period
-            // on a straight road, 3.5° of roll standing at a stop)
-            // (faded out between 3 and 5 cm off the way instead of a hard cut, so that a
-            // sample near the limit does not flick between the two)
-            let h = match ground.and_then(|g| g(p.x, p.y)) {
-                Some(h) => {
-                    let off = (h - path_z).abs();
-                    let t = ((0.05 - off) / 0.02).clamp(0.0, 1.0);
-                    path_z + (h - path_z) * t
-                }
-                None => path_z,
+            // What the wheel stands on, as Omsi.exe stands an AI car's wheels (its AI cars
+            // are bodies on the same wheel physics as the player's bus, 0x7d5124 ->
+            // 0x7e2574, asking the ground under each wheel, 0x7aec3c): the drawn road, the
+            // surface objects, the terrain beside them - up to `AI_STEP_UP` over the way and
+            // down to `AI_STEP_DOWN` under it (farther is another level: a bridge over the
+            // road, the road under a bridge). Without it the plain height sampler, which
+            // knows no levels.
+            let drawn = match contact {
+                Some(c) => c.probe(p.x, p.y, path_z + AI_STEP_UP).below.filter(|g| *g >= path_z - AI_STEP_DOWN),
+                None => ground.and_then(|g| g(p.x, p.y)),
             };
-            contacts.push((w.lat, w.long, h));
+            samples.push((w.lat, w.long, w.axle, path_z, drawn));
         }
+        // How far each axle's road lies over its way (from what is drawn under its wheels):
+        // kept to the way alone, a car whose lane lay under the drawn road - a spline on a
+        // grade, a junction plate tilted on a hill - drove through the asphalt with only its
+        // roof showing. Per axle, not per wheel, and the least of its wheels: a wheel off
+        // the edge of the road or on the kerb would tip the car over, or lift it, when its
+        // neighbour stands on the way.
+        let mut lift = vec![f64::INFINITY; self.axle_count];
+        for &(_, _, a, path_z, drawn) in &samples {
+            let up = if contact.is_some() { drawn.map_or(0.0, |g| g - path_z) } else { 0.0 };
+            lift[a] = lift[a].min(up);
+        }
+        let contacts: Vec<(f32, f32, f64)> = samples
+            .iter()
+            .map(|&(lat, long, a, path_z, drawn)| {
+                let base = path_z + lift[a].clamp(0.0, AI_STEP_UP);
+                // The surface under the wheel itself counts only within a few centimetres of
+                // that: taken up to 0.8 m off, a wheel beside the lane climbed the kerb and
+                // the gutter, and the texel steps of the road raster kept every bus rocking
+                // like a boat (faded out between 3 and 5 cm off, so that a sample near the
+                // limit does not flick between the two).
+                let h = match drawn {
+                    Some(h) => {
+                        let off = (h - base).abs();
+                        let t = ((0.05 - off) / 0.02).clamp(0.0, 1.0);
+                        base + (h - base) * t
+                    }
+                    None => base,
+                };
+                (lat, long, h)
+            })
+            .collect();
+        let mut contacts = contacts;
         // each contact followed with a short lag (a tyre rolls over a texel step, it does
         // not jump onto it); a car put somewhere else starts from where it stands
         if self.contact_z.len() != contacts.len() {
@@ -632,14 +695,14 @@ mod tests {
         let speed = 6.0f32;
         let dt = 1.0 / 30.0;
         let mut s = 20.0f64;
-        body.place(&|d| bend(12.0, s + d as f64), None, speed);
+        body.place(&|d| bend(12.0, s + d as f64), None, None, speed);
         let mut last_yaw: Option<f32> = None;
         let mut worst_jump = 0.0f32;
         let mut worst_off = 0.0f64;
         for _ in 0..(12.0 / dt) as usize {
             s += (speed * dt) as f64;
             let at = s;
-            body.step(dt, speed, &|d| bend(12.0, at + d as f64), None);
+            body.step(dt, speed, &|d| bend(12.0, at + d as f64), None, None);
             if let Some(y) = last_yaw {
                 worst_jump = worst_jump.max((body.yaw_rate - y).abs().to_degrees());
             }
@@ -661,7 +724,7 @@ mod tests {
         let def = golf();
         let mut body = AiBody::new(&def, MotionKind::Road);
         let flat = |_x: f64, _y: f64| Some(10.0);
-        body.place(&|d| DVec3::new(0.0, d as f64, 10.0), Some(&flat), 10.0);
+        body.place(&|d| DVec3::new(0.0, d as f64, 10.0), Some(&flat), None, 10.0);
         let dt = 1.0 / 30.0;
         let mut speed = 10.0f32;
         let mut s = 0.0f64;
@@ -670,7 +733,7 @@ mod tests {
             speed = (speed - 3.0 * dt).max(0.0);
             s += (speed * dt) as f64;
             let at = s;
-            body.step(dt, speed, &|d| DVec3::new(0.0, at + d as f64, 10.0), Some(&flat));
+            body.step(dt, speed, &|d| DVec3::new(0.0, at + d as f64, 10.0), Some(&flat), None);
             min_pitch = min_pitch.min(body.pitch_deg);
         }
         assert!(min_pitch < -0.1, "braking pitch {min_pitch}");
@@ -702,7 +765,7 @@ mod tests {
                 .map(|ramp| {
                     let way = straight_pull_out(3.3, ramp);
                     let mut body = AiBody::new(&def, MotionKind::Road);
-                    body.place(&way, None, 0.0);
+                    body.place(&way, None, None, 0.0);
                     body.sweep_clearance(&way, 0.0, PULL_OUT_WAIT, PULL_OUT_ACCEL, 8.0, gap + 6.0, extent, &[bus_ahead(extent.0, gap, 1.25)])
                 })
                 .fold(f64::MIN, f64::max)
@@ -716,13 +779,13 @@ mod tests {
         // and the swept body does leave the lane: after the pull-out it is 3.3 m over
         let way = straight_pull_out(3.3, 8.0);
         let mut body = AiBody::new(&def, MotionKind::Road);
-        body.place(&way, None, 0.0);
+        body.place(&way, None, None, 0.0);
         let mut x = 0.0f32;
         let dt = 1.0 / 20.0;
         for _ in 0..400 {
             x += 4.0 * dt;
             let at = x;
-            body.step(dt, 4.0, &|d| way(at + d), None);
+            body.step(dt, 4.0, &|d| way(at + d), None, None);
         }
         assert!((body.position.x + 3.3).abs() < 0.2, "ended at x {}", body.position.x);
     }
@@ -742,7 +805,7 @@ mod tests {
             pull_out_ramps(gap, 2.1, false).into_iter().any(|ramp| {
                 let way = straight_pull_out(3.3, ramp);
                 let mut body = AiBody::new(&golf(), MotionKind::Road);
-                body.place(&way, None, 0.0);
+                body.place(&way, None, None, 0.0);
                 body.sweep_clearance(&way, 0.0, PULL_OUT_WAIT, PULL_OUT_ACCEL, 8.0, gap + 6.0, (2.1, 2.2, 0.85), &[bus_ahead(2.1, gap, 1.25)]) >= PULL_OUT_CLEARANCE
             })
         };
@@ -766,8 +829,8 @@ mod tests {
         def.axles.truncate(1);
         let mut body = AiBody::new(&def, MotionKind::Air);
         let way = |d: f32| DVec3::new(0.0, d as f64, 300.0 - d as f64 * 0.05);
-        body.place(&way, None, 70.0);
-        body.step(1.0 / 30.0, 70.0, &way, None);
+        body.place(&way, None, None, 70.0);
+        body.step(1.0 / 30.0, 70.0, &way, None, None);
         assert!((body.position.z - 300.0).abs() < 1e-6);
         assert!(body.pitch_deg < -2.0 && body.pitch_deg > -4.0, "pitch {}", body.pitch_deg);
     }

@@ -34,6 +34,8 @@
 //!       none - walking, at the desk or the door)
 //!   lights 6, each: crossing object 32, cycle position 17 (0.05 s), held 1
 //!   gone 6, each: kind 1 (0 car, 1 person), id 24
+//!   (first datagram, once a second) parked 1: then complete 1, count 7, each: the map
+//!   id of a parking space whose car has driven off 32
 //! ```
 //!
 //! A car takes 17 bytes, a person 12 (17 while waiting at a stop), a light program 6.
@@ -171,6 +173,11 @@ pub struct WorldFrame {
     pub lights: Vec<LightState>,
     /// Cars (false) and people (true) the host took away.
     pub gone: Vec<(bool, u32)>,
+    /// The parking spaces whose cars have driven off into the traffic at the host (their
+    /// map ids), and whether that is all of them: a client takes the same cars away, and
+    /// puts back those the host has had park again. Without it every client kept the
+    /// car the host had driven off, and the players' buses drove through it.
+    pub parked: Option<(bool, Vec<u32>)>,
 }
 
 fn anchor_of(frame: &WorldFrame) -> (i32, i32, i16) {
@@ -231,7 +238,8 @@ pub fn encode(frame: &WorldFrame, protocol: u8) -> Vec<Vec<u8>> {
         } else {
             &[]
         };
-        left = left.saturating_sub(lights.len() * LIGHT_BITS + gone.len() * GONE_BITS);
+        let parked: Option<(bool, &[u32])> = if first { frame.parked.as_ref().map(|(c, k)| (*c && k.len() <= 127, &k[..k.len().min(127)])) } else { None };
+        left = left.saturating_sub(lights.len() * LIGHT_BITS + gone.len() * GONE_BITS + 1 + parked.map(|p| 8 + p.1.len() * 32).unwrap_or(0));
         let c0 = ci;
         while ci < cars.len() && ci - c0 < 127 && left >= CAR_BITS {
             left -= CAR_BITS;
@@ -350,6 +358,14 @@ pub fn encode(frame: &WorldFrame, protocol: u8) -> Vec<Vec<u8>> {
         for (person, id) in gone {
             w.put(*person as u64, 1);
             w.put((*id).min(MAX_ID) as u64, 24);
+        }
+        w.put(parked.is_some() as u64, 1);
+        if let Some((complete, keys)) = parked {
+            w.put(complete as u64, 1);
+            w.put(keys.len() as u64, 7);
+            for k in keys {
+                w.put(*k as u64, 32);
+            }
         }
         out.push(w.finish());
         first = false;
@@ -472,6 +488,16 @@ pub fn decode(data: &[u8], protocol: u8) -> Option<WorldFrame> {
         let person = r.get(1)? == 1;
         let id = r.get(24)? as u32;
         f.gone.push((person, id));
+    }
+    // (an older host's datagram ends here: its padding reads as "no parked list")
+    if r.get(1).unwrap_or(0) == 1 {
+        let complete = r.get(1)? == 1;
+        let n = r.get(7)?;
+        let mut keys = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            keys.push(r.get(32)? as u32);
+        }
+        f.parked = Some((complete, keys));
     }
     Some(f)
 }
@@ -683,10 +709,12 @@ mod tests {
                 held: true,
             }],
             gone: vec![(false, 3), (true, 99)],
+            parked: Some((true, vec![242685, 7])),
         };
         let d = encode(&f, 4);
         assert_eq!(d.len(), 1);
-        assert!(d[0].len() <= 123, "{} bytes", d[0].len());
+        // (two parked spaces add 9 bytes: 1 + 1 + 7 + 2 x 32 bits)
+        assert!(d[0].len() <= 132, "{} bytes", d[0].len());
         let g = decode(&d[0], 4).unwrap();
         assert_eq!((g.seq, g.host_ms), (65535, 123_456_789));
         assert_eq!(g.cars.len(), 2);
@@ -720,6 +748,7 @@ mod tests {
         assert_eq!(g.lights.len(), 1);
         assert!(g.lights[0].held && (g.lights[0].time - 63.45).abs() < 0.026);
         assert_eq!(g.gone, vec![(false, 3), (true, 99)]);
+        assert_eq!(g.parked, Some((true, vec![242685, 7])));
         // anything else is not a frame
         assert!(decode(&d[0], 3).is_none());
         assert!(decode(&d[0][..d[0].len() - 3], 4).is_none() || d[0].len() < 3);

@@ -55,8 +55,11 @@ pub struct MapSpline {
     pub cant_end: f64,
     pub skew_start: f64,
     pub skew_end: f64,
-    /// Last numeric field (segment alignment length in the editor).
-    pub align_length: f64,
+    /// Last numeric field: where the spline's textures start along it, the length of the
+    /// chain before it (OMSI reads it from tile version 11 on and draws `v = v_scale *
+    /// (s + tex_offset)`, so a chain's textures run on across its joints; Omsi.exe
+    /// sub_79a8ec puts it into TSplineSegment+0x1a0).
+    pub tex_offset: f64,
     pub mirror: bool,
     pub is_h: bool,
     pub rules: Vec<MapRule>,
@@ -350,7 +353,7 @@ impl Tile {
                         }
                         nums.push(omsi_cfg::parse_f64(w));
                     }
-                    let (skew_start, skew_end, align_length) = match nums.len() {
+                    let (skew_start, skew_end, tex_offset) = match nums.len() {
                         0 => (0.0, 0.0, 0.0),
                         1 | 2 => (0.0, 0.0, nums[0]),
                         _ => (nums[0], nums[1], nums[2]),
@@ -371,7 +374,7 @@ impl Tile {
                         cant_end,
                         skew_start,
                         skew_end,
-                        align_length,
+                        tex_offset,
                         mirror,
                         is_h,
                         rules: Vec::new(),
@@ -627,12 +630,12 @@ Object Nr. 3\n[splineAttachement_repeater]\n0\n12\n5\nSceneryobjects\\lamp.sco\n
                 h.grad_end,
                 h.delta_h,
                 h.cant_start,
-                h.align_length
+                h.tex_offset
             ),
             (6.19, 0.0, Some(5.85), 1.5, 11.14)
         );
         let s = &t.splines[1];
-        assert_eq!((s.delta_h, s.cant_start, s.align_length), (None, 2.0, 30.0));
+        assert_eq!((s.delta_h, s.cant_start, s.tex_offset), (None, 2.0, 30.0));
     }
 
     /// Before tile version 12 an object has only its heading; the next line is already the

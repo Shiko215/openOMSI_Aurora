@@ -2,7 +2,7 @@
 //! tour), the time and weather, the roadbook - in a panel on the left, the bus itself in
 //! the showroom on the right, and the button that starts the game.
 
-use super::state::{fmt_bytes, hhmm};
+use super::state::{fmt_bytes, hhmm, trip_index_at};
 use super::theme::*;
 use super::ui::{id_of, ButtonKind};
 use super::Launcher;
@@ -174,6 +174,14 @@ fn step_bus(l: &mut Launcher, r: Rect) {
                 l.state.touched();
             }
         }
+        // the number plate (registration) by hand: empty leaves it to the bus's `[number]`
+        // list and the map's `registrations.txt`, as before
+        y += ROW + 8.0;
+        l.ui.label(Rect::new(r.x, y, 130.0, ROW), "Number plate");
+        if l.ui.text_input("plate", Rect::new(r.x + 130.0, y, r.w - 130.0, ROW), &mut l.state.choice.plate, "Automatic", Some("badge")) {
+            l.state.touched();
+        }
+        y += ROW + 8.0;
         if !v.missing_packs.is_empty() {
             let text = format!(
                 "This bus takes its dashboard, steering wheel or ticket machine from {} - not installed. It will drive with those parts missing, as in OMSI 2; install {} (Mods page) to complete it.",
@@ -273,7 +281,7 @@ fn step_route_rest(l: &mut Launcher, r: Rect, mut y: f32) {
             // (a long line name, as Ahlheim's "Eichenhoehe TA11 Mo-Do Schule", is cut)
             let count = format!("{tours}");
             let cw = ui.width(&count, 11.5, Weight::Bold) + 8.0;
-            let bw = (ui.width(name, 13.0, Weight::Black) + 14.0).clamp(34.0, rr.w - cw - 24.0);
+            let bw = (ui.width(name, 13.0, Weight::Black) + 14.0).clamp(34.0, (rr.w - cw - 24.0).max(34.0));
             let badge = Rect::new(rr.x + 8.0, rr.y + 8.0, bw, 22.0);
             ui.p().rounded(badge, 4.0, Color::rgba(52, 52, 52, 1.0));
             ui.text_in(name, badge.pad(6.0, 0.0), 12.5, Weight::Bold, TEXT, Align::Center);
@@ -297,12 +305,27 @@ fn step_route_rest(l: &mut Launcher, r: Rect, mut y: f32) {
     };
     let mut tours: Vec<&omsi_launcher_lib::TourInfo> = line.tours.iter().collect();
     tours.sort_by(|a, b| b.runs.cmp(&a.runs).then_with(|| natural(&a.number).cmp(&natural(&b.number))));
-    let tours: Vec<(String, usize, String, bool, Option<String>, f64, f64)> = tours.iter().map(|t| (t.number.clone(), t.trips.len(), t.days.clone(), t.runs, t.next_run.clone(), t.first, t.last)).collect();
+    let now = l.state.choice.time as f64 * 60.0;
+    let tours: Vec<(String, usize, String, bool, Option<String>, Option<(f64, f64)>, String, String)> = tours.iter().map(|t| {
+        let trip = trip_index_at(t, now).and_then(|i| t.trips.get(i));
+        let from = t.trips.first().map(|x| x.from.clone()).unwrap_or_default();
+        let terminus = t.trips.last().map(|x| x.terminus.clone()).unwrap_or_default();
+        (
+            t.number.clone(),
+            t.trips.len(),
+            t.days.clone(),
+            t.runs,
+            t.next_run.clone(),
+            trip.map(|x| (x.departure, x.arrival)),
+            from,
+            terminus,
+        )
+    }).collect();
     let chosen_t = l.state.choice.tour.clone();
     let mut pick = None;
     l.ui.scroll_area("tour-list", Rect::new(right.x - 4.0, right.y + 30.0, right.w + 8.0, right.h - 30.0), &mut |ui, v| {
-        let rh = 52.0;
-        for (k, (num, trips, days, runs, next, first, last)) in tours.iter().enumerate() {
+        let rh = 84.0;
+        for (k, (num, trips, days, runs, next, trip_time, from, terminus)) in tours.iter().enumerate() {
             let rr = Rect::new(v.x + 4.0, v.y + k as f32 * rh, v.w - 12.0, rh - 4.0);
             let on = chosen_t.as_deref() == Some(num.as_str());
             if ui.row(&format!("tour-{num}"), rr, on) {
@@ -311,8 +334,14 @@ fn step_route_rest(l: &mut Launcher, r: Rect, mut y: f32) {
             let c = if *runs { TEXT } else { TEXT_FAINT };
             // (the tour's name as the map writes it and OMSI lists it: "1", "Mo-Fr 1")
             let name = num.clone();
-            ui.text_in(&name, Rect::new(rr.x + 10.0, rr.y + 6.0, rr.w - 110.0, 18.0), 13.5, Weight::Bold, c, Align::Left);
-            ui.text_in(&format!("{} - {}", hhmm(*first), hhmm(*last)), Rect::new(rr.right() - 110.0, rr.y + 6.0, 100.0, 18.0), 12.0, Weight::Medium, if *runs { ACCENT } else { TEXT_FAINT }, Align::Right);
+            ui.text_in(&name, Rect::new(rr.x + 10.0, rr.y + 5.0, rr.w - 110.0, 18.0), 13.5, Weight::Bold, c, Align::Left);
+            if let Some((departure, arrival)) = trip_time {
+                ui.text_in(&format!("{} - {}", hhmm(*departure), hhmm(*arrival)), Rect::new(rr.right() - 110.0, rr.y + 6.0, 100.0, 18.0), 12.0, Weight::Medium, if *runs { ACCENT } else { TEXT_FAINT }, Align::Right);
+                ui.text_in(&format!("{}: {}", omsi_ui::tr("Trip duration"), trip_duration(*departure, *arrival)), Rect::new(rr.x + 10.0, rr.y + 43.0, rr.w - 20.0, 16.0), 12.0, Weight::Medium, c, Align::Left);
+            }
+            if !from.is_empty() || !terminus.is_empty() {
+                ui.text_in(&format!("{from} → {terminus}"), Rect::new(rr.x + 10.0, rr.y + 25.0, rr.w - 20.0, 16.0), 11.5, Weight::Medium, c, Align::Left);
+            }
             let sub = if *runs {
                 format!("{trips} trips · {days}")
             } else {
@@ -321,7 +350,7 @@ fn step_route_rest(l: &mut Launcher, r: Rect, mut y: f32) {
                     None => format!("{trips} trips · never within a year"),
                 }
             };
-            ui.text_in(&sub, Rect::new(rr.x + 10.0, rr.y + 27.0, rr.w - 20.0, 16.0), 11.0, Weight::Regular, TEXT_DIM, Align::Left);
+            ui.text_in(&sub, Rect::new(rr.x + 10.0, rr.y + 61.0, rr.w - 20.0, 16.0), 11.0, Weight::Regular, TEXT_DIM, Align::Left);
         }
         tours.len() as f32 * rh + 4.0
     });
@@ -339,9 +368,22 @@ fn step_route_rest(l: &mut Launcher, r: Rect, mut y: f32) {
     }
 }
 
-fn natural(s: &str) -> (u64, String) {
+pub(super) fn natural(s: &str) -> (u64, String) {
     let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
     (digits.parse().unwrap_or(u64::MAX), s.to_string())
+}
+
+/// Time from the departure to the arrival of one trip.
+fn trip_duration(first: f64, last: f64) -> String {
+    let minutes = ((last - first).max(0.0) / 60.0).round() as i64;
+    let hours = minutes / 60;
+    let remaining = minutes % 60;
+    let count = |n: i64, one: &str, many: &str| format!("{n} {}", omsi_ui::tr(if n == 1 { one } else { many }));
+    match (hours, remaining) {
+        (0, m) => count(m, "minute", "minutes"),
+        (h, 0) => count(h, "hour", "hours"),
+        (h, m) => format!("{} {}", count(h, "hour", "hours"), count(m, "minute", "minutes")),
+    }
 }
 
 /// The name of the server the Drive page is joined to (see the Multiplayer page).
@@ -443,6 +485,8 @@ fn step_time(l: &mut Launcher, r: Rect) {
     // (the airport nearest the map, not Berlin's for every map: Novi Sad got Berlin's rain)
     let home = nearest_airport(&l.state.config.root, &l.state.choice.map);
     items.push((format!("metar:{}", metar.clone().unwrap_or_else(|| home.clone())), "Current weather".into(), format!("METAR of {} (fetched at the start)", metar.clone().unwrap_or_else(|| home.clone())), "public".into(), false));
+    // the weather going on from one to another through the day
+    items.push(("cycle".into(), "Weather cycle".into(), "Changes every 25-60 minutes, as the month allows".into(), "autorenew".into(), false));
     for w in l.state.weathers.clone() {
         if !l.state.weather_fits(&w) {
             continue;
@@ -625,6 +669,7 @@ fn summary(l: &mut Launcher, side: Rect) {
     };
     let weather = match l.state.choice.weather.strip_prefix("metar:") {
         Some(code) => format!("Current weather at {code}"),
+        None if l.state.choice.weather == "cycle" => "Weather cycle".into(),
         None => l.state.weathers.iter().find(|w| w.file == l.state.choice.weather).map(|w| w.name.clone()).unwrap_or_else(|| "Map default".into()),
     };
     let (yy, mm, dd) = super::ui::parse_date(&l.state.choice.date);
@@ -693,6 +738,11 @@ fn summary(l: &mut Launcher, side: Rect) {
         l.ui.text_in(&note, nr, 12.5, Weight::Regular, if h { TEXT } else { OK }, Align::Center);
     }
     let _ = fmt_bytes;
+}
+
+/// The phone's Start: as the desktop's.
+pub(super) fn start_from_phone(l: &mut Launcher) {
+    start(l);
 }
 
 fn start(l: &mut Launcher) {

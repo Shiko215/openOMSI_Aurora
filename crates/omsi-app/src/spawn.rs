@@ -30,6 +30,25 @@ pub(crate) fn player_bus_path(root: &Path, bus: &str) -> Result<PathBuf> {
     }
 }
 
+/// The next vehicle of a consist from one with definition `def` (turned round: `rev`),
+/// towards the back of the train or its front, and whether that one is turned round - as
+/// Omsi.exe builds a consist (0x70a174): towards the back a vehicle goes on with its
+/// `[couple_back]`, or with its `[couple_front]` when it is itself turned round (towards the
+/// front the other way about); the coupled one is turned round when the coupling says so,
+/// against the one it hangs on; a coupling back to its own file that turns nothing round
+/// is not followed. (Following `[couple_back]` whatever the way, the Berlin A3's unit - the
+/// S car and its K car turned round, whose `[couple_back]` names the S car - went on S, K,
+/// S, K, S, none of them turned.)
+pub(crate) fn next_coupled(def: &omsi_vehicle::vehicle::Vehicle, rev: bool, toward_back: bool) -> Option<(PathBuf, bool)> {
+    let (file, flag) = if toward_back != rev { def.couple_back.as_ref() } else { def.couple_front.as_ref() }?;
+    let path = omsi_cfg::resolve_path(def.dir(), file);
+    let same = path.file_name().map(|f| f.to_ascii_lowercase()) == def.path.file_name().map(|f| f.to_ascii_lowercase());
+    if !flag && same {
+        return None;
+    }
+    Some((path, flag ^ rev))
+}
+
 /// Load the `[couple_back]` chain behind `vehicle` (articulated rear sections, trailers),
 /// each file resolved from the folder of the part before it in whichever content root
 /// holds it.
@@ -39,11 +58,11 @@ pub(crate) fn load_coupled_parts(
 ) -> Vec<Arc<omsi_sim::VehicleType>> {
     let mut parts = Vec::new();
     let mut lead = vehicle.ty.clone();
+    let mut lead_rev = false;
     for _ in 0..8 {
-        let Some((file, reversed)) = lead.def.couple_back.clone() else {
+        let Some((path, reversed)) = next_coupled(&lead.def, lead_rev, true) else {
             break;
         };
-        let path = omsi_cfg::resolve_path(lead.def.dir(), &file);
         match omsi_sim::VehicleType::load(root, &path) {
             Ok(t) => {
                 let t = Arc::new(t);
@@ -61,6 +80,7 @@ pub(crate) fn load_coupled_parts(
                 vehicle.attach_trailer_ex(t.clone(), reversed);
                 parts.push(t.clone());
                 lead = t;
+                lead_rev = reversed;
             }
             Err(e) => {
                 log::warn!(
@@ -123,6 +143,8 @@ pub(crate) fn spawn_player(
             h.info_trips.len()
         );
     }
+    // (the paint scheme's variables are there for the scripts' {init})
+    host.paint_scheme = Some(paint_scheme(&vt, args.paint.as_deref()));
     let mut vehicle = omsi_sim::VehicleInstance::new(vt.clone(), host);
     // place at the entry point
     if let Some(ep) = world
@@ -188,6 +210,7 @@ pub(crate) fn spawn_player(
         None => log::info!("paint: the model's own textures"),
     }
     vehicle.apply_paint_vars(scheme);
+    log::info!("gearbox: {}", if vehicle.ty.program.manual_gearbox() { "manual (gates)" } else { "automatic or none" });
     if let Some(sp) = &args.spawn {
         let v: Vec<f64> = sp
             .split(',')
@@ -248,12 +271,11 @@ pub(crate) fn spawn_player(
                 if let Some(i) = vt.program.str_var("number") {
                     vehicle.state.str_vars[i as usize] = n.clone();
                 }
-                let reg = match &vt.def.registration_automatic {
-                    Some((pre, post)) => format!("{pre}{n}{post}"),
-                    None => format!("B-V {n}"),
-                };
-                if let Some(i) = vt.program.str_var("ident") {
-                    vehicle.state.str_vars[i as usize] = reg;
+                // (a free plate is the player's to choose: from registrations.txt below)
+                if vt.def.registration_mode != 1 {
+                    if let Some(i) = vt.program.str_var("ident") {
+                        vehicle.state.str_vars[i as usize] = vt.def.chosen_plate_of_number(n);
+                    }
                 }
             }
         }
@@ -267,6 +289,18 @@ pub(crate) fn spawn_player(
                     vehicle.state.str_vars[i as usize] = reg;
                 }
             }
+        }
+    }
+    // a plate given by hand (the launcher's field, `--plate`) is the player's own: it wins
+    // over every plate the content gave the bus
+    if let Some(plate) = args.plate.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        match vt.program.str_var("ident") {
+            Some(i) => {
+                vehicle.state.str_vars[i as usize] = plate.to_string();
+                log::info!("number plate set by hand: {plate}");
+            }
+            // a bus whose scripts know no `ident` draws its plate from the model's texture
+            None => log::warn!("--plate {plate}: this bus has no `ident` string variable"),
         }
     }
     // ground following through the loaded tiles (road surfaces first, then terrain)
@@ -295,7 +329,9 @@ pub(crate) fn spawn_player(
         terrains,
         surfaces,
     }));
-    vehicle.collision = crate::settings::Settings::load().collision_objects.then(|| world.collision.lock().clone());
+    let objects = crate::settings::Settings::load().collision_objects;
+    vehicle.collision = objects.then(|| world.collision.lock().clone());
+    vehicle.wheel_walls = objects;
     // a rail vehicle rides the track (its position comes from the rails, not the tyres)
     let rail_bound = crate::rail_drive::is_rail(&vt.def);
     if rail_bound {
@@ -370,6 +406,9 @@ pub(crate) fn spawn_player(
         rail_bound,
         rail: None,
         head: Vec3::ZERO,
+        head_vel: Vec3::ZERO,
+        head_omega: Vec3::ZERO,
+        steer_look: 0.0,
         seat: Vec3::ZERO,
         mirror_offsets: crate::settings::mirror_offsets(&vt.def.path),
         mirrors_dirty: false,
@@ -380,6 +419,7 @@ pub(crate) fn spawn_player(
         ibis_duty: None,
         ibis_typist: None,
         duty_typed: false,
+        html_next_stop: None,
         ibis_background: false,
         arm: Default::default(),
         blinker_key_state: 0,
@@ -466,9 +506,9 @@ pub(crate) fn spawn_player(
                 .map(|f| {
                     !f.is_empty()
                         && def
-                            .file
-                            .to_ascii_lowercase()
-                            .contains(&f.to_ascii_lowercase())
+                        .file
+                        .to_ascii_lowercase()
+                        .contains(&f.to_ascii_lowercase())
                 })
                 .unwrap_or(false)
             {

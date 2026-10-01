@@ -21,11 +21,13 @@ pub struct Stop {
     pub bay: f32,
     /// Timetable departure (seconds of the day).
     pub depart: f64,
+    /// The stop's map object (its `[busstop]` strings weigh who gets off there).
+    pub id: i64,
 }
 
 impl Stop {
-    pub fn from_tuple(t: (usize, f32, f32, f64)) -> Stop {
-        Stop { ri: t.0, s: t.1, bay: t.2, depart: t.3 }
+    pub fn from_tuple(t: (usize, f32, f32, f64, i64)) -> Stop {
+        Stop { ri: t.0, s: t.1, bay: t.2, depart: t.3, id: t.4 }
     }
 }
 
@@ -65,6 +67,9 @@ pub struct BusService {
     /// The timetable still carries the route on as tiles bring their lanes: at the end of
     /// what it has, it waits for more.
     pub route_open: bool,
+    /// The terminus of its trip, the name the waiting people read off it (Omsi.exe's bus
+    /// +0x7bc) to see whether it goes their way.
+    pub terminus: String,
     /// People aboard when it was put on the road (seated by the passengers' side when the
     /// bus first comes near).
     pub riders: u8,
@@ -94,8 +99,10 @@ const EARLY_WAIT: f64 = 40.0;
 const LAYOVER_WAIT: f64 = 1800.0;
 /// On a layover, the doors open this long before the departure.
 const LAYOVER_BOARDING: f64 = 45.0;
-/// Pull into the bay over this distance before the stop.
-const BAY_REACH: f32 = 60.0;
+/// Pull into the bay over this distance before the stop: the stop's docking distance,
+/// 30 m unless its object strings say otherwise (Omsi.exe 0x620058, string 4; the bus
+/// moves over once it is that near, 0x7dac5e).
+const BAY_REACH: f32 = 30.0;
 /// Pulling out: at least this long after the doors were told to close (s), at most this
 /// long waiting for the script to say they are shut.
 const CLOSE_MIN: f32 = 1.5;
@@ -132,6 +139,7 @@ impl BusService {
             delay: 0.0,
             layover: false,
             route_open: false,
+            terminus: String::new(),
             riders,
             near_d: f32::INFINITY,
         }
@@ -188,7 +196,7 @@ impl BusService {
     }
 
     /// Arrived at the front stop: what now.
-    fn arrive(&mut self, ctx: &Ctx, depart: f64) {
+    fn arrive(&mut self, ctx: &Ctx, depart: f64, at: (usize, f32)) {
         if omsi_cfg::env::var_os("OMSI_DEBUG_STOPS").is_some() {
             log::info!("t={:.1}: timetable bus {} serves its stop", ctx.day_time, ctx.id);
         }
@@ -209,11 +217,12 @@ impl BusService {
         self.delay = (ctx.day_time + (self.boarding as f64).max(wait)) - depart;
         if ctx.debug {
             log::info!(
-                "t={:.1}: timetable bus {} at its stop, {:.0} s to its departure ({:?})",
+                "t={:.1}: timetable bus {} at its stop, {:.0} s to its departure ({:?}) at {:?}",
                 ctx.day_time,
                 ctx.id,
                 depart - ctx.day_time,
-                self.phase
+                self.phase,
+                ctx.net.lanes.get(at.0).map(|l| { let p = l.at(at.1).0; (p.x.round(), p.y.round()) })
             );
         }
     }
@@ -327,7 +336,7 @@ impl BusService {
             if stop.ri < st.route_index {
                 if crept_past {
                     self.near_d = f32::INFINITY;
-                    self.arrive(ctx, stop.depart);
+                    self.arrive(ctx, stop.depart, (st.lane, st.s));
                     return Some(st.front);
                 }
                 // behind it already (the route was cut short)
@@ -355,7 +364,7 @@ impl BusService {
             let queued = speed < 0.3 && ctx.stopped > 6.0 && d < 45.0 && d >= 2.0;
             if (d < 2.0 && speed < 0.3) || queued || (d < -2.0 && crept_past) {
                 self.near_d = f32::INFINITY;
-                self.arrive(ctx, stop.depart);
+                self.arrive(ctx, stop.depart, (st.lane, st.s));
                 return Some(st.front);
             }
             self.near_d = d;
@@ -375,6 +384,17 @@ impl BusService {
             return None;
         }
     }
+}
+
+/// How far before a station's point a vehicle stops with its origin, as Omsi.exe measures
+/// the way to the station (0x7da4e3): from the origin of the vehicle that leads, less half
+/// its length for a train (its front comes to rest at the station, not its middle - the
+/// S-Bahn stopped with half a car past the end of the platform), plus the holding point
+/// offset of its `[ai_brakeperformance]` ("to correct unprecise braking").
+pub fn stop_shift(ty: &omsi_sim::VehicleType, rail: bool) -> f32 {
+    let hold = ty.def.ai_brake_performance.map(|b| b[4]).unwrap_or(0.0);
+    let half = if rail { ty.half_length().unwrap_or(0.0) } else { 0.0 };
+    half - hold
 }
 
 /// How many people ride a timetable bus put on the road at `day_time` (seconds of the

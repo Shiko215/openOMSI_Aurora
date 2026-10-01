@@ -113,7 +113,9 @@ impl Ambience {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_ascii_lowercase())
                     .unwrap_or_default();
-                n.starts_with("step") && n.ends_with(".wav")
+                // (not `Step_St_*`, steps on a stair: every step of the crowd sounded as if
+                // it climbed one)
+                n.starts_with("step") && n.ends_with(".wav") && !n.starts_with("step_st")
             })
             .collect();
         files.sort();
@@ -176,8 +178,10 @@ impl Ambience {
             pitch: 1.0,
             looping: true,
             position: None,
+            doppler: true,
             range: 1.0,
             lowpass_hz: if inside { 400.0 } else { 0.0 },
+            important: false,
         };
         match (self.rain_voice, gain > 0.001) {
             (Some(id), true) => {
@@ -205,8 +209,10 @@ impl Ambience {
             pitch: 1.0,
             looping: true,
             position: None,
+            doppler: true,
             range: 1.0,
             lowpass_hz: 300.0,
+            important: false,
         };
         match (self.hum_voice, gain > 0.001) {
             (Some(id), true) => {
@@ -249,6 +255,11 @@ impl Ambience {
             if self.step_budget < 1.0 {
                 break;
             }
+            // (the samples are steps on a bus's floor, `Sounds\Passengers` - the passengers'
+            // sound in OMSI; people in the street walked with them as if still aboard, #236)
+            if !f.inside {
+                continue;
+            }
             let d = (f.position - listener).length();
             if d > self.step_range as f64 * 12.0 {
                 continue;
@@ -271,8 +282,10 @@ impl Ambience {
                 pitch: pitch * (0.94 + 0.12 * self.rand()),
                 looping: false,
                 position: Some(f.position.as_vec3()),
+                doppler: true,
                 range: self.step_range,
                 lowpass_hz: lowpass,
+                important: false,
             };
             engine.play(clip, params);
             played += 1;

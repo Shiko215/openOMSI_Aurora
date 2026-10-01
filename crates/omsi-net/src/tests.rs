@@ -64,6 +64,31 @@ fn an_info_with_everything_at_its_longest_fits_one_datagram() {
 }
 
 #[test]
+fn info_carries_the_freetex_pictures_and_an_older_info_has_none() {
+    let mut p = pose(1.5);
+    p.texts = vec!["17".into()];
+    p.freetex = vec![
+        r"..\..\Anzeigen\Rollband_FC\Paris\17.tga".into(),
+        String::new(),
+        r"..\..\Anzeigen\Rollband_FC\Paris\217.tga".into(),
+    ];
+    let text = p.encode_info();
+    let q = Pose::decode_info(&text.split('|').collect::<Vec<_>>()).unwrap();
+    assert_eq!(q.freetex, p.freetex);
+    assert_eq!(q.texts, p.texts);
+    // an older game's INFO ends with the figure: no pictures, everything else as before
+    let older = text.rsplit_once('|').unwrap().0;
+    let q = Pose::decode_info(&older.split('|').collect::<Vec<_>>()).unwrap();
+    assert!(q.freetex.is_empty());
+    assert_eq!(q.texts, p.texts);
+    // and with everything else at its longest the INFO still fits one datagram
+    p.freetex = (0..MAX_FREETEX).map(|k| format!("{k}{}", "é".repeat(200))).collect();
+    p.bus = format!("Vehicles/{}/{}.bus", "Ü".repeat(60), "b".repeat(120));
+    p.texts = (0..MAX_TEXTS).map(|k| format!("{k}ß{}", "ñ".repeat(40))).collect();
+    assert!(p.encode_info().len() <= MAX_DATAGRAM);
+}
+
+#[test]
 fn info_round_trip_and_cleaning() {
     let mut p = pose(1.5);
     p.id = 7;
@@ -331,7 +356,9 @@ fn session_codes() {
         session: 0x49A5_0EA5_8A1F,
     };
     let text = multi.encode();
-    assert_eq!(text.replace('-', "").len(), 4 + 37, "{text}");
+    // (37 characters, the last group filled up to four: 40)
+    assert_eq!(text.replace('-', "").len(), 4 + 40, "{text}");
+    assert!(text.split('-').all(|g| g.len() == 4), "{text}");
     assert!(!text[5..].contains(['0', '1', 'O', 'I']), "{text}");
     assert_eq!(SessionCode::decode(&text).unwrap(), multi);
     assert_eq!(
@@ -342,13 +369,20 @@ fn session_codes() {
         ips: multi.ips[..2].to_vec(),
         ..multi.clone()
     };
-    assert_eq!(two.encode().replace('-', "").len(), 4 + 31);
+    assert_eq!(two.encode().replace('-', "").len(), 4 + 32);
+    // the code without the filling (as an older game wrote it) is read the same
+    let short: String = two.encode().replace('-', "")[4..35].to_string();
+    assert_eq!(SessionCode::decode(&short).unwrap(), two);
+    assert!(looks_like_code(&two.encode()) && looks_like_code(&short));
     assert_eq!(SessionCode::decode(&two.encode()).unwrap(), two);
     // every character matters in the long codes too
     let chars: Vec<char> = text.chars().collect();
     for i in (5..chars.len()).filter(|i| chars[*i] != '-') {
         let mut bad = chars.clone();
-        bad[i] = if bad[i] == 'A' { 'B' } else { 'A' };
+        // (its top bit, which is always data: the lowest bits of the last character may be
+        // the zeros that fill up the last byte, and changing them changes nothing)
+        let k = ALPHABET.iter().position(|c| *c as char == bad[i]).unwrap();
+        bad[i] = ALPHABET[k ^ 16] as char;
         let bad: String = bad.into_iter().collect();
         assert_ne!(SessionCode::decode(&bad).ok(), Some(multi.clone()), "{bad}");
     }
@@ -809,10 +843,11 @@ fn old_protocol_is_turned_away() {
         .unwrap();
     let mut buf = [0u8; 512];
     // a protocol 2 game: its hello, and its poses sent blindly
+    let told = format!("protocol {PROTOCOL}, your game protocol 2");
     for (msg, want) in [
         (
             "HELLO|2|-|someone|Vehicles/x.bus|m|1989-05-30|32400||0|0|0|0|12|2.5",
-            "protocol 5, your game protocol 2",
+            told.as_str(),
         ),
         (
             "POSE|2|someone|Vehicles/x.bus||1|2|3|0|0|0|0|0000|0|0|||12|2.5|-|0",
@@ -831,7 +866,7 @@ fn old_protocol_is_turned_away() {
             }
         }
         assert!(
-            answers.iter().all(|a| a.starts_with("REJECT|5|"))
+            answers.iter().all(|a| a.starts_with(&format!("REJECT|{PROTOCOL}|")))
                 && answers.iter().any(|a| a.contains(want)),
             "{answers:?}"
         );

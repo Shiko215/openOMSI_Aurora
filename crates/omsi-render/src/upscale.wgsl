@@ -4,7 +4,8 @@
 // edges do not ring, and a contrast-adaptive sharpening pass (after AMD's CAS) brings back
 // what the smaller picture lost, most where the picture is flat and least on hard edges.
 struct Params {
-    // xy: size of the source picture, z: sharpening 0..1, w unused
+    // xy: size of the source picture, z: sharpening 0..1, w: 1 = the picture at the window's
+    // own size smoothed by FXAA instead (the plain graphics without multisampling)
     src: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> p: Params;
@@ -55,9 +56,111 @@ fn catmull_rom(uv: vec2<f32>, size: vec2<f32>) -> vec3<f32> {
     return c;
 }
 
+// FXAA as the Enhanced post pass does it (after Lottes' FXAA 3.11), on a picture with
+// linear values: the luma is taken of their square roots, near enough to the gamma curve.
+fn luma(c: vec3<f32>) -> f32 {
+    return dot(sqrt(max(c, vec3<f32>(0.0))), vec3<f32>(0.299, 0.587, 0.114));
+}
+
+fn lum_at(uv: vec2<f32>) -> f32 {
+    return luma(tap(uv));
+}
+
+fn fxaa(uv: vec2<f32>, texel: vec2<f32>) -> vec3<f32> {
+    let rgbm = tap(uv);
+    let m = luma(rgbm);
+    let n = lum_at(uv + vec2<f32>(0.0, -texel.y));
+    let s = lum_at(uv + vec2<f32>(0.0, texel.y));
+    let e = lum_at(uv + vec2<f32>(texel.x, 0.0));
+    let w = lum_at(uv + vec2<f32>(-texel.x, 0.0));
+    let hi = max(m, max(max(n, s), max(e, w)));
+    let lo = min(m, min(min(n, s), min(e, w)));
+    let range = hi - lo;
+    if (range < max(0.0312, hi * 0.125)) {
+        return rgbm;
+    }
+    let nw = lum_at(uv + vec2<f32>(-texel.x, -texel.y));
+    let ne = lum_at(uv + vec2<f32>(texel.x, -texel.y));
+    let sw = lum_at(uv + vec2<f32>(-texel.x, texel.y));
+    let se = lum_at(uv + vec2<f32>(texel.x, texel.y));
+    let avg = (2.0 * (n + s + e + w) + nw + ne + sw + se) / 12.0;
+    let sub = smoothstep(0.0, 1.0, clamp(abs(avg - m) / range, 0.0, 1.0));
+    let blend_sub = sub * sub * 0.75;
+    let horz = abs(nw + sw - 2.0 * w) + abs(n + s - 2.0 * m) * 2.0 + abs(ne + se - 2.0 * e);
+    let vert = abs(nw + ne - 2.0 * n) + abs(w + e - 2.0 * m) * 2.0 + abs(sw + se - 2.0 * s);
+    let is_h = horz >= vert;
+    var stp = select(texel.x, texel.y, is_h);
+    let l1 = select(w, n, is_h);
+    let l2 = select(e, s, is_h);
+    let g1 = abs(l1 - m);
+    let g2 = abs(l2 - m);
+    let neg = g1 >= g2;
+    let grad = max(g1, g2) * 0.25;
+    let edge_l = 0.5 * (m + select(l2, l1, neg));
+    if (neg) {
+        stp = -stp;
+    }
+    var cuv = uv;
+    if (is_h) {
+        cuv.y = cuv.y + stp * 0.5;
+    } else {
+        cuv.x = cuv.x + stp * 0.5;
+    }
+    let dir = select(vec2<f32>(0.0, texel.y), vec2<f32>(texel.x, 0.0), is_h);
+    let steps = array<f32, 12>(1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+    var p_uv = cuv + dir;
+    var n_uv = cuv - dir;
+    var p_end = lum_at(p_uv) - edge_l;
+    var n_end = lum_at(n_uv) - edge_l;
+    var p_done = abs(p_end) >= grad;
+    var n_done = abs(n_end) >= grad;
+    for (var i = 1; i < 12; i = i + 1) {
+        if (p_done && n_done) {
+            break;
+        }
+        if (!p_done) {
+            p_uv = p_uv + dir * steps[i];
+            p_end = lum_at(p_uv) - edge_l;
+            p_done = abs(p_end) >= grad;
+        }
+        if (!n_done) {
+            n_uv = n_uv - dir * steps[i];
+            n_end = lum_at(n_uv) - edge_l;
+            n_done = abs(n_end) >= grad;
+        }
+    }
+    var dp: f32;
+    var dn: f32;
+    if (is_h) {
+        dp = p_uv.x - uv.x;
+        dn = uv.x - n_uv.x;
+    } else {
+        dp = p_uv.y - uv.y;
+        dn = uv.y - n_uv.y;
+    }
+    let near_neg = dn <= dp;
+    let end_l = select(p_end, n_end, near_neg);
+    let span = dp + dn;
+    var blend_edge = 0.0;
+    if ((m - edge_l < 0.0) != (end_l < 0.0)) {
+        blend_edge = 0.5 - min(dp, dn) / span;
+    }
+    let blend = max(blend_edge, blend_sub);
+    var fuv = uv;
+    if (is_h) {
+        fuv.y = fuv.y + blend * stp;
+    } else {
+        fuv.x = fuv.x + blend * stp;
+    }
+    return tap(fuv);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let size = p.src.xy;
+    if (p.src.w > 0.5) {
+        return vec4<f32>(fxaa(in.uv, 1.0 / size), 1.0);
+    }
     let px = 1.0 / size;
     // the four texels around the point bound the filtered value (no ringing)
     let base = (floor(in.uv * size - 0.5) + 0.5) * px;

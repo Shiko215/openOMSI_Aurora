@@ -60,6 +60,9 @@ pub struct MaterialDef {
     pub index: i32,
     /// 0 = opaque, 1 = alpha test, 2 = alpha blend (OMSI `[matl_alpha]` modes).
     pub alpha: i32,
+    /// This block has a `[matl_alpha]` of its own. A later `[matl]` of the same slot only
+    /// changes the slot's mode when it has one (see `material_alpha` in omsi-app).
+    pub alpha_set: bool,
     pub no_z_write: bool,
     pub no_z_check: bool,
     pub z_bias: i32,
@@ -151,6 +154,14 @@ pub struct Lod {
     /// Minimum screen size factor at which this LOD is used.
     pub min_size: f32,
     pub first_mesh: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HtmlTextureDef {
+    pub script_index: usize,
+    pub width: i32,
+    pub height: i32,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -349,6 +360,11 @@ impl ParticleSystemDef {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Model {
     pub path: PathBuf,
+    /// Scenery render queue when a model.cfg supplies `[rendertype]` (inherited by its .sco
+    /// wrapper unless the wrapper explicitly overrides it).
+    pub render_type: Option<String>,
+    /// `[surface]` from model.cfg, inherited by a scenery object's .sco wrapper when absent.
+    pub surface: Option<bool>,
     pub lods: Vec<Lod>,
     /// The first level was opened by a `[mesh]` before any `[LOD]` (see "lod" below).
     pub implicit_lod: bool,
@@ -360,6 +376,7 @@ pub struct Model {
     pub ctc: Vec<Ctc>,
     pub ctc_textures: Vec<(String, String)>,
     pub script_textures: Vec<(i32, i32)>,
+    pub html_textures: Vec<HtmlTextureDef>,
     pub text_textures: Vec<TextTexture>,
     /// `[texttexture_enh]` raw parameter lines.
     pub text_textures_enh: Vec<Vec<String>>,
@@ -370,8 +387,22 @@ pub struct Model {
     pub interior_lights: Vec<InteriorLight>,
     /// `[light]` legacy lights (raw).
     pub lights: Vec<Vec<String>>,
+    /// `[setvar]` lines before any `[item]`: Omsi.exe files them under an item that is
+    /// never chosen, so they set nothing (kept for the record).
     pub set_vars: Vec<(String, f32)>,
+    /// The model's own paint items (`[item]`: name, `[CTCTexture]` name, texture), each with
+    /// the `[setvar]` lines after it - a `.cti` written into the model.cfg (0x5efae8 files
+    /// a `[setvar]` under the item before it).
+    pub items: Vec<ModelItem>,
     pub unknown_keywords: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ModelItem {
+    pub name: String,
+    pub ctc: String,
+    pub texture: String,
+    pub set_vars: Vec<(String, f32)>,
 }
 
 impl Model {
@@ -445,6 +476,11 @@ impl Model {
     /// model vocabulary (so the caller can try its own).
     pub fn handle_keyword(&mut self, k: &str, r: &mut CfgReader) -> bool {
         match k {
+            "rendertype" => self.render_type = Some(r.word().to_ascii_lowercase()),
+            "surface" => {
+                let value = r.word();
+                self.surface = Some(value != "0");
+            }
             "lod" => {
                 let min_size = r.f32();
                 // Meshes written before the first [LOD] belong to that first level: OMSI gives
@@ -492,6 +528,14 @@ impl Model {
                 let h = r.i32();
                 self.script_textures.push((w, h));
             }
+            "htmltexture" => {
+                let width = r.i32();
+                let height = r.i32();
+                let path = r.str().to_string();
+                let script_index = self.script_textures.len();
+                self.script_textures.push((width, height));
+                self.html_textures.push(HtmlTextureDef { script_index, width, height, path });
+            }
             "texttexture" => {
                 let variable = r.str().to_string();
                 let font = r.str().to_string();
@@ -535,11 +579,19 @@ impl Model {
                 let illumination_interior = self.meshes.last().map(|m| m.illumination_interior.clone()).unwrap_or_else(|| vec![0, 1, 2, 3]);
                 self.meshes.push(MeshDef { file, lod: self.lods.len() - 1, illumination_interior, ..Default::default() });
             }
-            "item" => {}
+            "item" => {
+                let name = r.str().to_string();
+                let ctc = r.str().to_string();
+                let texture = r.str().to_string();
+                self.items.push(ModelItem { name, ctc, texture, set_vars: Vec::new() });
+            }
             "setvar" => {
                 let n = r.str().to_string();
                 let v = r.f32();
-                self.set_vars.push((n, v));
+                match self.items.last_mut() {
+                    Some(i) => i.set_vars.push((n, v)),
+                    None => self.set_vars.push((n, v)),
+                }
             }
             "mesh_ident" => {
                 let s = r.str().to_string();
@@ -681,7 +733,18 @@ impl Model {
                 let texture = r.str().to_string();
                 let index = r.i32();
                 if let Some(m) = self.cur_mesh() {
-                    m.materials.push(MaterialDef { texture, index, ..Default::default() });
+                    // [matl] selects a material and what follows changes it: a second [matl] of
+                    // the same one goes on with it (TH_Wald's chain barrier gives its slot an
+                    // envmap in one block and [matl_alpha] 1 in the next - the second block was
+                    // lost and the chain stood on a white band)
+                    let same = |d: &MaterialDef| !d.item && d.change.is_none() && d.index == index && d.texture.eq_ignore_ascii_case(&texture);
+                    match m.materials.iter().position(same) {
+                        Some(k) => {
+                            let d = m.materials.remove(k);
+                            m.materials.push(d);
+                        }
+                        None => m.materials.push(MaterialDef { texture, index, ..Default::default() }),
+                    }
                 }
             }
             "matl_change" => {
@@ -757,6 +820,16 @@ impl Model {
                     m.use_script_texture = Some(v);
                 }
             }
+            "usehtmltexture" => {
+                let v = r.i32();
+                let index = usize::try_from(v)
+                    .ok()
+                    .and_then(|n| self.html_textures.get(n))
+                    .map(|d| d.script_index as i32);
+                if let (Some(m), Some(i)) = (self.cur_matl(), index) {
+                    m.use_script_texture = Some(i);
+                }
+            }
             "usetexttexture" => {
                 let v = r.i32();
                 if let Some(m) = self.cur_matl() {
@@ -800,6 +873,7 @@ impl Model {
                 let v = r.i32();
                 if let Some(m) = self.cur_matl() {
                     m.alpha = v;
+                    m.alpha_set = true;
                 }
             }
             "matl_nozwrite" => {
@@ -962,6 +1036,18 @@ pub fn load_texchanges(base: &Path, files: &[String]) -> Vec<TexChangeMaster> {
 #[cfg(test)]
 mod tests {
 
+    /// Two [matl] blocks of one material are one material (Absperrung_grau.sco).
+    #[test]
+    fn a_second_matl_block_goes_on_with_the_same_material() {
+        let f = omsi_cfg::CfgFile::from_str("x.sco", "[mesh]\nx.o3d\n\n[matl]\nAbsperr_gr.dds\n0\n[matl_envmap]\nenvmap_Glas.dds\n0.03\n\n[matl]\nOther.dds\n0\n\n[matl]\nAbsperr_gr.dds\n0\n[matl_alpha]\n1\n");
+        let m = super::Model::parse(&f);
+        let mats = &m.meshes[0].materials;
+        assert_eq!(mats.len(), 2, "{mats:?}");
+        let a = mats.iter().find(|d| d.texture == "Absperr_gr.dds").unwrap();
+        assert_eq!(a.alpha, 1);
+        assert!(a.envmap.is_some());
+    }
+
     /// A mesh before the first [LOD] belongs to that level (the WH UK AI cars' shadow).
     #[test]
     fn a_mesh_before_the_first_lod_joins_it() {
@@ -975,6 +1061,30 @@ mod tests {
     }
 
     use super::*;
+
+    /// `[setvar]` belongs to the `[item]` before it (a paint scheme in the model.cfg), as
+    /// Omsi.exe files it; one before any item sets nothing.
+    #[test]
+    fn setvar_belongs_to_the_item_before_it() {
+        let text = "[setvar]\nlost\n1\n[item]\nBVG\nbody\nbvg.dds\n[setvar]\nDisplay_Type\n2\n[item]\nHVL\nbody\nhvl.dds\n";
+        let m = Model::parse(&CfgFile::from_str("model.cfg", text));
+        assert_eq!(m.items.len(), 2);
+        assert_eq!(m.items[0].set_vars, vec![("Display_Type".to_string(), 2.0)]);
+        assert!(m.items[1].set_vars.is_empty());
+        assert_eq!((m.items[1].name.as_str(), m.items[1].ctc.as_str(), m.items[1].texture.as_str()), ("HVL", "body", "hvl.dds"));
+        assert_eq!(m.set_vars, vec![("lost".to_string(), 1.0)]);
+    }
+
+    #[test]
+    fn an_html_texture_takes_a_script_texture_index() {
+        let text = "[scripttexture]\n64\n32\n\n[htmltexture]\n800\n480\nhtml\\demo.html\n\n[mesh]\nx.o3d\n\n[matl]\nx.dds\n0\n[useHtmlTexture]\n0\n";
+        let m = Model::parse(&CfgFile::from_str("model.cfg", text));
+        assert_eq!(m.script_textures, vec![(64, 32), (800, 480)]);
+        assert_eq!(m.html_textures.len(), 1);
+        assert_eq!(m.html_textures[0].script_index, 1);
+        assert_eq!(m.html_textures[0].path, "html\\demo.html");
+        assert_eq!(m.meshes[0].materials[0].use_script_texture, Some(1));
+    }
 
     /// A tab-indented block (the stock F90 lorry's second rear axle, whose mesh does not
     /// exist) is switched off: no mesh, and its lines do not reach the animation above.
@@ -1008,5 +1118,21 @@ mod tests {
         let m = Model::parse(&CfgFile::from_str("model.cfg", text));
         let files: Vec<&str> = m.meshes.iter().map(|m| m.file.as_str()).collect();
         assert_eq!(files, vec!["a.o3d", "c.o3d"]);
+    }
+
+    /// `[matl_alpha]` is marked as given where a block has one: a `[matl]` without it
+    /// leaves the flag off, and a second block of the same material that has it turns it on
+    /// for the one definition both blocks make.
+    #[test]
+    fn repeated_matl_marks_its_own_alpha() {
+        let text = "[mesh]\nb.o3d\n[matl]\nchain.dds\n0\n[matl_envmap]\nenv.dds\n0.03\n\n[matl]\nother.dds\n0\n";
+        let m = Model::parse(&CfgFile::from_str("x.sco", text));
+        assert!(m.meshes[0].materials.iter().all(|d| !d.alpha_set));
+        let text = format!("{text}\n[matl]\nchain.dds\n0\n[matl_alpha]\n1\n");
+        let m = Model::parse(&CfgFile::from_str("x.sco", &text));
+        let d = &m.meshes[0].materials;
+        assert_eq!(d.len(), 2);
+        let chain = d.iter().find(|d| d.texture == "chain.dds").unwrap();
+        assert!(chain.envmap.is_some() && chain.alpha_set && chain.alpha == 1);
     }
 }

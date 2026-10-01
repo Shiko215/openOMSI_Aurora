@@ -39,6 +39,9 @@ pub struct ServerInfo {
     /// The buses that may be driven there (vehicle files, `Vehicles/…/….bus`): what the
     /// host has installed, or a server's own list. Empty: not said (an older game).
     pub vehicles: Vec<String>,
+    /// Where it answered (`http(s)://…`), set by `query`: a server added by its bare
+    /// address (`1.2.3.4`, `host:27025`) is joined there.
+    pub reached_at: String,
 }
 
 impl ServerInfo {
@@ -76,6 +79,7 @@ impl ServerInfo {
             weather: text("weather").unwrap_or_default(),
             password: json_value(s, "password").map(|v| v.trim() == "true").unwrap_or(false),
             vehicles: text("vehicles").map(|v| v.split(';').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(),
+            reached_at: String::new(),
         })
     }
 }
@@ -151,12 +155,76 @@ pub fn http_base(target: &str) -> Option<String> {
     Some(u.replacen("wss://", "https://", 1).replacen("ws://", "http://", 1))
 }
 
+/// The web addresses a server may answer at, for whatever address a player gave: a web
+/// address as it is; a bare `host` or `host:port` (an IP, a domain) at that port, at the
+/// port ten above it (the game's port was given: a server's web port is its game port + 10
+/// unless `web_port` says otherwise), at the servers' default 27025, and over https.
+pub fn web_bases(target: &str) -> Vec<String> {
+    if let Some(b) = http_base(target) {
+        return vec![b];
+    }
+    let t = target.trim().trim_end_matches('/');
+    let t = t.strip_suffix("/ws").unwrap_or(t);
+    if t.is_empty() || t.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    // (an IPv6 address is written in brackets with a port: [::1]:27025)
+    let (host, port) = match t.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && (!h.contains(':') || h.ends_with(']')) => match p.parse::<u16>() {
+            Ok(p) => (h.to_string(), Some(p)),
+            Err(_) => (t.to_string(), None),
+        },
+        _ if t.contains(':') && !t.starts_with('[') => (format!("[{t}]"), None),
+        _ => (t.to_string(), None),
+    };
+    let mut out = Vec::new();
+    let mut add = |u: String| {
+        if !out.contains(&u) {
+            out.push(u);
+        }
+    };
+    if let Some(p) = port {
+        add(format!("http://{host}:{p}"));
+        if p <= 65525 {
+            add(format!("http://{host}:{}", p + 10));
+        }
+    }
+    add(format!("http://{host}:27025"));
+    if port.is_none() {
+        add(format!("https://{host}"));
+        add(format!("http://{host}"));
+    }
+    out
+}
+
 /// Ask a server (by its address as typed) about itself: its status and its icon.
 pub fn query(target: &str, with_icon: bool) -> Result<ServerInfo, String> {
-    let base = http_base(target).ok_or_else(|| "not a server address (https://…)".to_string())?;
+    let target = &crate::official::resolve_target(target)?;
+    let bases = web_bases(target);
+    if bases.is_empty() {
+        return Err("no address given".into());
+    }
     let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(6)).user_agent("openOMSI").build();
-    let body = agent.get(&format!("{base}/status")).call().map_err(|e| e.to_string())?.into_string().map_err(|e| e.to_string())?;
-    let mut info = ServerInfo::from_json(&body).ok_or_else(|| "the answer is not an openOMSI server's".to_string())?;
+    let mut err = String::new();
+    let mut found = None;
+    for base in bases {
+        match agent.get(&format!("{base}/status")).call().map_err(|e| e.to_string()).and_then(|r| r.into_string().map_err(|e| e.to_string())) {
+            Ok(body) => match ServerInfo::from_json(&body) {
+                Some(i) => {
+                    found = Some((base, i));
+                    break;
+                }
+                None => err = "the answer is not an openOMSI server's".into(),
+            },
+            Err(e) => {
+                if err.is_empty() {
+                    err = e;
+                }
+            }
+        }
+    }
+    let (base, mut info) = found.ok_or(err)?;
+    info.reached_at = base.clone();
     if with_icon && !info.icon.is_empty() {
         info.icon.clear();
         if let Ok(r) = agent.get(&format!("{base}/icon.png")).call() {
@@ -549,11 +617,15 @@ mod tests {
         assert_eq!(ws_url("http://10.0.0.2:27025/").as_deref(), Some("ws://10.0.0.2:27025/ws"));
         assert_eq!(ws_url("192.168.1.4:27015"), None);
         assert_eq!(http_base("https://abc.trycloudflare.com").as_deref(), Some("https://abc.trycloudflare.com"));
+        assert_eq!(web_bases("192.168.1.4:27015"), ["http://192.168.1.4:27015", "http://192.168.1.4:27025"]);
+        assert_eq!(web_bases("play.example.org"), ["http://play.example.org:27025", "https://play.example.org", "http://play.example.org"]);
+        assert_eq!(web_bases("::1")[0], "http://[::1]:27025");
+        assert_eq!(web_bases("[::1]:27025"), ["http://[::1]:27025", "http://[::1]:27035"]);
     }
 
     #[test]
     fn status_round_trip() {
-        let i = ServerInfo { name: "Spandau \"1\"".into(), motd: "hi".into(), map: "maps/Berlin-Spandau/global.cfg".into(), players: 2, max_players: 16, version: "0.1".into(), icon: vec![1, 2], time: "08:00".into(), weather: "Sommerlich".into(), password: false, vehicles: vec!["Vehicles/MAN_SD202/SD202.bus".into()] };
+        let i = ServerInfo { name: "Spandau \"1\"".into(), motd: "hi".into(), map: "maps/Berlin-Spandau/global.cfg".into(), players: 2, max_players: 16, version: "0.1".into(), icon: vec![1, 2], time: "08:00".into(), weather: "Sommerlich".into(), password: false, vehicles: vec!["Vehicles/MAN_SD202/SD202.bus".into()], ..Default::default() };
         let j = i.to_json();
         let b = ServerInfo::from_json(&j).unwrap();
         assert_eq!(b.name, i.name);

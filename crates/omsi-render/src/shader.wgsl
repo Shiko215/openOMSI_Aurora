@@ -21,6 +21,7 @@ struct Camera {
     inside_c: vec4<f32>,     // box centre offset xyz, w = 1 when there is a box
     flags: vec4<f32>,        // x detail texturing, y enhanced graphics, z never set (see fs_main's end), w close cascade half range
     light_view_proj_close: mat4x4<f32>,
+    wind: vec4<f32>,         // the player's vehicle's velocity (m/s, world): the airstream on its glass
 };
 
 // 1 when the point lies inside the player's vehicle (its [boundingbox], shrunk a little so
@@ -181,6 +182,8 @@ fn weather_outside_n(world: vec3<f32>, n: vec3<f32>, terrain: bool, surface: f32
 // hidden surface removal as well - for everything it draws, and the heavy shading then
 // ran for every covered layer of the city, not once per pixel.
 override ALPHA_TEST: bool = true;
+// Multisampled cutout pipelines can turn filtered alpha directly into sample coverage.
+override ALPHA_TO_COVERAGE: bool = false;
 @group(0) @binding(5) var t_shadow: texture_depth_2d;
 @group(0) @binding(6) var s_shadow: sampler_comparison;
 @group(0) @binding(7) var t_shadow_far: texture_depth_2d;
@@ -229,6 +232,17 @@ fn ao_at(frag: vec2<f32>, world: vec3<f32>) -> f32 {
 // they lie: x, y the south-west corner (render-origin relative), z the side, w 1 when set
 @group(0) @binding(18) var t_lmap: texture_2d<f32>;
 @group(0) @binding(19) var<uniform> lmap: vec4<f32>;
+
+// The sRGB curve both ways (the textures are sampled through it, the target writes through
+// it): the classic picture multiplies on the encoded values, as Omsi.exe does.
+fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
+    let x = max(c, vec3<f32>(0.0));
+    return select(1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055, x * 12.92, x <= vec3<f32>(0.0031308));
+}
+fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
+    let x = max(c, vec3<f32>(0.0));
+    return select(pow((x + 0.055) / 1.055, vec3<f32>(2.4)), x / 12.92, x <= vec3<f32>(0.04045));
+}
 
 // The tile light map's light at a world point (black outside the loaded square).
 fn light_map_at(p: vec3<f32>) -> vec3<f32> {
@@ -305,9 +319,46 @@ struct MaterialParams {
 // The reflection mask of a [matl_envmap] material: the alpha of its [matl_envmap_mask]
 // texture when it has one, else the diffuse texture's alpha - which reads 1 for a texture
 // without an alpha channel (a 24-bit bitmap, DXT1, a JPEG), so its factor alone decides.
+fn has_env_mask() -> bool {
+    return (u32(material.params2.w + 0.5) & 1u) != 0u;
+}
+
+// [matl_transmap] was given (its file there or not: see MaterialExtra::transmap_declared)
+fn has_transmap_declared() -> bool {
+    return (u32(material.params2.w + 0.5) & 2u) != 0u;
+}
+
+// [matl_texadress_border]: where the diffuse texture's coordinates leave [0, 1] (a roller
+// blind's band scrolled away by [texcoordtransX/Y]) Direct3D reads the border colour, not
+// the texture's edge (the sampler only clamps). Its rgb comes packed in flags.z.
+fn diffuse_border(tex: vec4<f32>, uv: vec2<f32>) -> vec4<f32> {
+    let p = u32(material.flags.z + 0.5);
+    let border = vec4<f32>(
+        f32((p >> 16u) & 0xffu) / 255.0,
+        f32((p >> 8u) & 0xffu) / 255.0,
+        f32(p & 0xffu) / 255.0,
+        material.flags.w,
+    );
+    let outside = any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0));
+    return select(tex, border, material.flags.y > 0.5 && outside);
+}
+
 fn reflection_mask(uv: vec2<f32>, diffuse_a: f32) -> f32 {
     let mask = textureSample(t_envmask, s_diffuse, uv).a;
-    return select(diffuse_a, mask, material.params2.w > 0.5);
+    return select(diffuse_a, mask, has_env_mask());
+}
+
+// The D3DCOLOR Omsi.exe packs for its environment stage (0x7ff8ed): each channel the
+// [matl_envmap] factor x 255 x its light (at most 1), truncated, and OR-ed together shifted
+// into place without saturation - a factor over 1 spills into the neighbouring channel
+// exactly as there (a factor of 10 at full light reads almost white).
+fn omsi_texture_factor(factor: f32, light: vec3<f32>) -> vec3<f32> {
+    let m = min(max(light, vec3<f32>(0.0)), vec3<f32>(1.0)) * max(factor, 0.0) * 255.0;
+    let r = u32(m.r);
+    let g = u32(m.g);
+    let b = u32(m.b);
+    let packed = (0xffu << 24u) | (r << 16u) | (g << 8u) | b;
+    return vec3<f32>(f32((packed >> 16u) & 0xffu), f32((packed >> 8u) & 0xffu), f32(packed & 0xffu)) / 255.0;
 }
 
 // [matl_bumpmap]: Direct3D's bump-mapped environment stage moves the sphere-map lookup by
@@ -340,7 +391,40 @@ struct VsOut {
     @location(2) uv: vec2<f32>,
     @location(3) params: vec4<f32>,
     @location(4) params2: vec4<f32>,
+    // the D3D material's highlight, lit at the vertex as Omsi.exe's fixed function lights
+    // it: from the sun (light A) and from the light above (light B)
+    @location(5) spec_sun: vec3<f32>,
+    @location(6) spec_sky: vec3<f32>,
 };
+
+// Direct3D's specular term at a vertex (Omsi.exe switches it on in FormActivate, 0x8254e0):
+// Omsi.exe's sun (light 0, 0x7089f0: directional, specular = light A) and the light from
+// straight above (light 1: specular = light B), each (N.H)^power with the local viewer's
+// half vector, only where the light falls on the face, times the material's specular colour
+// and clamped at 1 - then interpolated across the face. Computed per pixel instead, every
+// small flat part (a gear selector, a switch, a dashboard screen) caught a sharp spot of the
+// sun in its middle that the original, lighting only at the corners, never shows.
+fn vertex_specular(wp: vec3<f32>, n: vec3<f32>) -> array<vec3<f32>, 2> {
+    var out = array<vec3<f32>, 2>(vec3<f32>(0.0), vec3<f32>(0.0));
+    if (material.specular.w <= 0.0 || material.params.y >= 0.5) {
+        return out;
+    }
+    let v = normalize(camera.cam_pos.xyz - wp);
+    let p = material.specular.w;
+    let l = camera.sun_dir.xyz;
+    if (dot(n, l) > 0.0) {
+        out[0] = camera.sun_color.rgb * camera.sun_dir.w * pow(max(dot(n, normalize(v + l)), 0.0), p);
+    }
+    let up = vec3<f32>(0.0, 0.0, 1.0);
+    if (n.z > 0.0) {
+        out[1] = camera.sky_color.rgb * pow(max(dot(n, normalize(v + up)), 0.0), p);
+    }
+    let total = out[0] + out[1];
+    let k = min(vec3<f32>(1.0), total) / max(total, vec3<f32>(1e-6));
+    out[0] = min(vec3<f32>(1.0), out[0] * k * material.specular.rgb);
+    out[1] = min(vec3<f32>(1.0), out[1] * k * material.specular.rgb);
+    return out;
+}
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
@@ -348,20 +432,16 @@ fn vs_main(in: VsIn) -> VsOut {
     let m = model_matrix(e);
     let wp = m * vec4<f32>(in.pos, 1.0);
     var out: VsOut;
-    // Road surfaces (splines, crossings, markings, a vehicle's shadow blob) are pulled
-    // towards the eye along the line of sight - the picture does not move, only the depth -
-    // by two centimetres near and more far away (seen from above at a slant that is a few
-    // millimetres of height: a tyre on the road does not sink into it). A road a little under the terrain
-    // otherwise lost to it: the ground's triangles came through the carriageway in teeth
-    // and flickered. A depth bias cannot do it with a floating-point depth buffer: its
-    // steps are relative to the depth, well under a millimetre at a hundred metres. The
-    // painted ground layers (0.75) are the ground and stay where they are.
+    // Legacy surfaces are pulled towards the eye along the line of sight. OMSI splines and
+    // [surface] objects use a fixed 8 cm world lift; ordered scenery phases use their authored
+    // world positions. Both use code 0.9 to keep weather classification without view-space pull.
+    // Painted ground (0.75) stays put.
     let surf = inst_params[e * 2u + 1u].w;
     var cp = wp.xyz;
     if (surf > 0.9) {
         let to = wp.xyz - camera.cam_pos.xyz;
         let d = length(to);
-        // (surface objects, 1.25, a little more than the splines under them)
+        // (legacy surface objects, 1.25, a little more than the splines under them)
         let decal = select(0.0, 0.01 + 0.001 * d, surf > 1.1 && surf < 1.5);
         let pull = min(0.02 + 0.002 * d + decal, d * 0.3);
         cp = wp.xyz - to / max(d, 1e-3) * pull;
@@ -369,6 +449,9 @@ fn vs_main(in: VsIn) -> VsOut {
     out.clip = camera.view_proj * vec4<f32>(cp, 1.0);
     out.world = wp.xyz;
     out.normal = safe_normal((m * vec4<f32>(in.normal, 0.0)).xyz);
+    let sp = vertex_specular(wp.xyz, out.normal);
+    out.spec_sun = sp[0];
+    out.spec_sky = sp[1];
     let pr = inst_params[e * 2u];
     out.uv = in.uv + pr.zw;
     out.params = pr;
@@ -381,15 +464,28 @@ fn vs_main(in: VsIn) -> VsOut {
 }
 
 // Shadow map passes: depth from the sun, alpha-tested materials cut out by their texture.
+// A surface that casts - a spline standing clear of the ground, a bridge deck - casts from
+// half a metre further away from the sun: what lies right under it (the embankment object
+// under a railway, the ground a ramp touches down on) is no darker for it, while the ground
+// metres below a deck gets its shadow.
+fn shadow_caster_pos(e: u32, wp: vec4<f32>) -> vec4<f32> {
+    if (abs(inst_params[e * 2u + 1u].w - 1.0) < 0.01) {
+        return vec4<f32>(wp.xyz - camera.sun_dir.xyz * 0.5, wp.w);
+    }
+    return wp;
+}
+
 @vertex
 fn vs_shadow(in: VsIn) -> VsOut {
     let e = draw_list[in.inst];
     let m = model_matrix(e);
-    let wp = m * vec4<f32>(in.pos, 1.0);
+    let wp = shadow_caster_pos(e, m * vec4<f32>(in.pos, 1.0));
     var out: VsOut;
     out.clip = camera.light_view_proj * wp;
     out.world = wp.xyz;
     out.normal = in.normal;
+    out.spec_sun = vec3<f32>(0.0);
+    out.spec_sky = vec3<f32>(0.0);
     let pr = inst_params[e * 2u];
     out.uv = in.uv + pr.zw;
     out.params = pr;
@@ -404,11 +500,13 @@ fn vs_shadow(in: VsIn) -> VsOut {
 fn vs_shadow_close(in: VsIn) -> VsOut {
     let e = draw_list[in.inst];
     let m = model_matrix(e);
-    let wp = m * vec4<f32>(in.pos, 1.0);
+    let wp = shadow_caster_pos(e, m * vec4<f32>(in.pos, 1.0));
     var out: VsOut;
     out.clip = camera.light_view_proj_close * wp;
     out.world = wp.xyz;
     out.normal = in.normal;
+    out.spec_sun = vec3<f32>(0.0);
+    out.spec_sky = vec3<f32>(0.0);
     let pr = inst_params[e * 2u];
     out.uv = in.uv + pr.zw;
     out.params = pr;
@@ -423,11 +521,13 @@ fn vs_shadow_close(in: VsIn) -> VsOut {
 fn vs_shadow_far(in: VsIn) -> VsOut {
     let e = draw_list[in.inst];
     let m = model_matrix(e);
-    let wp = m * vec4<f32>(in.pos, 1.0);
+    let wp = shadow_caster_pos(e, m * vec4<f32>(in.pos, 1.0));
     var out: VsOut;
     out.clip = camera.light_view_proj_far * wp;
     out.world = wp.xyz;
     out.normal = in.normal;
+    out.spec_sun = vec3<f32>(0.0);
+    out.spec_sky = vec3<f32>(0.0);
     let pr = inst_params[e * 2u];
     out.uv = in.uv + pr.zw;
     out.params = pr;
@@ -455,14 +555,28 @@ fn fs_shadow_test(in: VsOut) {
     // paint/gloss value rather than coverage (vehicle bodies use values such as 0.03). Only
     // alpha-test materials use diffuse alpha as a cutout; blended bodies are solid unless a
     // real transmap supplies coverage.
-    var a = select(textureSample(t_diffuse, s_diffuse, duv).a, 1.0, material.params.x > 1.5 && material.params.z < 0.5);
+    var a = select(diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv).a, 1.0, material.params.x > 1.5 && material.params.z < 0.5);
     if (material.params.z > 0.5) {
-        let tm = textureSample(t_trans, s_diffuse, in.uv);
+        // (the transmap stays where it is: [texcoordtransX/Y] only moves the diffuse stage)
+        let tm = textureSample(t_trans, s_diffuse, in.uv - in.params.zw);
         a = select(1.0, tm.a, material.params.w > 0.5);
     }
     if (a < 0.5) {
         discard;
     }
+}
+
+// Roads with feathered alpha borders stay blended while their overlaps compose.
+// Once the surface phases are complete, only fully covered diffuse pixels occlude
+// later scenery. The transparent borders must not become invisible depth walls.
+@fragment
+fn fs_surface_depth(in: VsOut) -> @location(0) vec4<f32> {
+    let a = diffuse_border(textureSample(t_diffuse, s_diffuse, in.uv), in.uv).a
+        * material.color.a * in.params.x;
+    if (a < 0.999) {
+        discard;
+    }
+    return vec4<f32>(0.0);
 }
 
 // A vehicle body and its windows are often one mesh/material. OMSI represents that
@@ -477,7 +591,7 @@ fn fs_transmap_depth(in: VsOut) {
     if (material.params.z < 0.5) {
         discard;
     }
-    let tm = textureSample(t_trans, s_diffuse, in.uv);
+    let tm = textureSample(t_trans, s_diffuse, in.uv - in.params.zw);
     let a = select(1.0, tm.a, material.params.w > 0.5) * in.params.x;
     // Only what the colour pass will cover completely may hide what lies behind it: a
     // texel that is merely more opaque than not (the dimmer and anti-aliased dots of a
@@ -697,7 +811,13 @@ fn point_lights(p: vec3<f32>, n: vec3<f32>, map_k: f32) -> vec3<f32> {
             let r0 = l.pos.w * 0.125;
             let att = min(1.0, (r0 * r0) / max(dist * dist, 0.01)) * clamp(1.0 - dist / l.pos.w, 0.0, 1.0) * 3.75;
             let ndl = max(dot(n, d / max(dist, 0.01)), 0.15);
-            let k = select(map_k, 1.0, l.dir.x > 0.5 && l.dir.w < -1.5);
+            var k = select(map_k, 1.0, l.dir.x > 0.5 && l.dir.w < -1.5);
+            if (l.dir.w >= -1.5) {
+                // a spot (a vehicle's [spotlight], as Direct3D lights with it): full inside
+                // the inner cone, fading to nothing at the outer one; nothing behind it
+                let c = dot(-d / max(dist, 0.01), l.dir.xyz);
+                k = smoothstep(l.dir.w, max(l.extra.x, l.dir.w + 1e-3), c);
+            }
             sum = sum + l.color.rgb * l.color.w * att * ndl * k;
         }
     }
@@ -818,42 +938,108 @@ fn finite_or(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
 }
 
 fn rain_hash(p: vec2<f32>) -> vec2<f32> {
-    let q = vec2<f32>(dot(p, vec2<f32>(127.1, 311.7)), dot(p, vec2<f32>(269.5, 183.3)));
-    return fract(sin(q) * 43758.5453);
+    // Integer mixing keeps neighbouring cells independent without the precision loss and
+    // repeated sine evaluations of a floating-point hash.
+    let cell = bitcast<vec2<u32>>(vec2<i32>(floor(p)));
+    var a = cell.x * 0x9e3779b9u ^ cell.y * 0x85ebca6bu;
+    a = (a ^ (a >> 16u)) * 0x7feb352du;
+    a = (a ^ (a >> 15u)) * 0x846ca68bu;
+    a = a ^ (a >> 16u);
+    var b = a ^ 0x68bc21ebu;
+    b = (b ^ (b >> 16u)) * 0x7feb352du;
+    b = (b ^ (b >> 15u)) * 0x846ca68bu;
+    b = b ^ (b >> 16u);
+    return vec2<f32>(f32(a), f32(b)) * (1.0 / 4294967296.0);
 }
 
-// Raindrops on a window pane: the drops that sit on the glass (they land, grow and dry up
-// again, each at its own pace) and the few that grow heavy enough to run down it, in fits
-// and starts, leaving a trail of small droplets. `uv` is the pane's own texture coordinate
-// (without the [texcoordtransY] scroll: that moved the whole picture of drops down at once,
-// like paper off a roll), `wet` how wet the pane is. Scaled in metres over the glass and
-// running down along the world's vertical as it lies on the pane, whatever way the
-// model's texture is turned. Returns the drops' colour and cover.
-fn rain_drops(world: vec3<f32>, uv: vec2<f32>, n: vec3<f32>, wet: f32, t: f32) -> vec4<f32> {
-    if (wet <= 0.002) {
-        return vec4<f32>(0.0);
-    }
-    // metres per unit of uv, and which way is down in uv
+// The rain on a window pane at one pixel: the water's surface and how much of the pixel it
+// covers. Three kinds of water, as on a bus window in the rain:
+// * a mist of droplets too small to make out one by one, which greys the glass a little;
+// * drops that sit on the glass in three sizes (they land, grow and dry up again, each at
+//   its own pace; more and bigger ones the wetter the pane), each a little dome flattened
+//   by its weight;
+// * runners: drops grown heavy enough to slide down, in fits and starts, a teardrop that
+//   wipes a clear track through the mist and the drops below it and leaves a string of
+//   beads behind.
+// `uv` is the pane's own texture coordinate (without the [texcoordtransY] scroll: that
+// moved the whole picture of drops down at once, like paper off a roll), `n` its normal,
+// `wet` how wet it is. Laid out in metres over the glass and running down along the
+// world's vertical as it lies on the pane, whatever way the model's texture is turned.
+struct RainGlass {
+    // the water's surface normal (world), pointing out of the water
+    n: vec3<f32>,
+    // how much of the pixel a drop or a bead covers (0..1, antialiased)
+    cover: f32,
+    // the pane's normal on the side the rain is on (outside the bus)
+    out: vec3<f32>,
+    // the fine mist of droplets (0..1)
+    mist: f32,
+};
+
+// One drop of radius `r` (metres) centred `d` (metres, across / down the glass) away:
+// its cover of the pixel (`px`: the pixel's size on the glass) and the slope of its dome
+// (the normal's part along the glass). A drop wets the glass at about 70°: the dome is a
+// spherical cap whose normal tilts by up to sin 70° at the rim.
+fn rain_dome(d: vec2<f32>, r: f32, px: f32) -> vec3<f32> {
+    let rr = length(d) / max(r, 1e-5);
+    let aa = max(px / max(r, 1e-5), 0.02);
+    // (a drop smaller than a pixel fades away rather than flicker: the mist stands in)
+    let seen = smoothstep(0.3, 0.9, r / max(px, 1e-6));
+    let cover = (1.0 - smoothstep(1.0 - aa, 1.0 + aa, rr)) * seen;
+    let slope = d / max(r, 1e-5) * 0.94;
+    let s = select(slope, slope / max(length(slope), 1e-5) * 0.94, length(slope) > 0.94);
+    return vec3<f32>(s, cover);
+}
+
+// Smooth noise over the glass (0..1): the rain gathers in patches, not evenly.
+fn rain_patches(q: vec2<f32>) -> f32 {
+    let c = floor(q);
+    let f = q - c;
+    let w = f * f * (3.0 - 2.0 * f);
+    let a = rain_hash(c).x;
+    let b = rain_hash(c + vec2<f32>(1.0, 0.0)).x;
+    let d = rain_hash(c + vec2<f32>(0.0, 1.0)).x;
+    let e = rain_hash(c + vec2<f32>(1.0, 1.0)).x;
+    return mix(mix(a, b, w.x), mix(d, e, w.x), w.y);
+}
+
+// A grid of its own for each layer of drops: turned by its own angle and shifted, so that
+// no two layers line up and none runs along the glass's edges.
+fn rain_turn(q: vec2<f32>, a: f32) -> vec2<f32> {
+    let cs = vec2<f32>(cos(a), sin(a));
+    return vec2<f32>(q.x * cs.x - q.y * cs.y, q.x * cs.y + q.y * cs.x);
+}
+
+fn rain_glass(world: vec3<f32>, uv: vec2<f32>, n: vec3<f32>, wet: f32, t: f32, outside_in: bool) -> RainGlass {
+    var g: RainGlass;
+    g.n = n;
+    g.out = n;
+    g.cover = 0.0;
+    g.mist = 0.0;
+    // (the derivatives first, while every pixel of the quad still takes part)
     let dpx = dpdx(world);
     let dpy = dpdy(world);
     let dux = dpdx(uv);
     let duy = dpdy(uv);
+    // the pixel's size on the glass
+    let px = max(max(length(dpx), length(dpy)), 1e-5);
     let det = dux.x * duy.y - dux.y * duy.x;
-    if (abs(det) < 1e-12) {
-        return vec4<f32>(0.0);
+    if (wet <= 0.002 || abs(det) < 1e-12) {
+        return g;
     }
-    // world position's derivative along u and v (inverse of the screen Jacobian)
+    // world position's derivative along u and v (inverse of the screen Jacobian): metres
+    // per unit of uv, and which way is down in uv
     let dpdu = (dpx * duy.y - dpy * dux.y) / det;
     let dpdv = (dpy * dux.x - dpx * duy.x) / det;
     let mu = length(dpdu);
     let mv = length(dpdv);
     if (mu < 1e-6 || mv < 1e-6) {
-        return vec4<f32>(0.0);
+        return g;
     }
     // quantised so neighbouring triangles of one pane share the grid
     let su = exp2(round(log2(mu)));
     let sv = exp2(round(log2(mv)));
-    var p = vec2<f32>(uv.x * su, uv.y * sv);
+    let p = vec2<f32>(uv.x * su, uv.y * sv);
     // down in uv: against the height's gradient
     var down = -vec2<f32>(dpdu.z / mu, dpdv.z / mv);
     if (length(down) < 0.2) {
@@ -870,84 +1056,287 @@ fn rain_drops(world: vec3<f32>, uv: vec2<f32>, n: vec3<f32>, wet: f32, t: f32) -
     let side = vec2<f32>(down.y, -down.x);
     // pane coordinates in metres: x across, y down the glass
     let q = vec2<f32>(dot(p, side), dot(p, down));
-    // a drop is a lens: it shows the world behind it upside down and small, which reads as
-    // a darker rim with a bright spot where it catches the sky - not a white fleck
-    var rim = 0.0;
-    var glint = 0.0;
-    var body = 0.0;
-    // the drops that sit: two sizes on grids of 16 and 9 mm, one drop a cell at most
-    for (var layer = 0; layer < 2; layer = layer + 1) {
-        let cellsz = select(0.016, 0.009, layer == 1);
-        let g = q / cellsz + vec2<f32>(f32(layer) * 17.3, f32(layer) * 5.1);
-        let c = floor(g);
+    // the same two directions in the world, and the pane's normal on the rain's side: the
+    // film faces the eye unless the eye is in the bus behind it
+    let tu = dpdu / su;
+    let tv = dpdv / sv;
+    let eye = normalize(camera.cam_pos.xyz - world);
+    var out = safe_normal(n);
+    out = select(-out, out, dot(out, eye) >= 0.0);
+    out = select(out, -out, outside_in);
+    g.out = out;
+    var side_w = side.x * tu + side.y * tv;
+    side_w = side_w - out * dot(side_w, out);
+    side_w = side_w / max(length(side_w), 1e-6);
+    var down_w = down.x * tu + down.y * tv;
+    down_w = down_w - out * dot(down_w, out) - side_w * dot(down_w, side_w);
+    down_w = down_w / max(length(down_w), 1e-6);
+
+    var best = 0.0;
+    var slope = vec2<f32>(0.0);
+
+    // --- the airstream: the glass moves through the air with the bus, and a drop's drag
+    // grows with the speed squared - at about 40 km/h it matches the drop's weight. Along
+    // the glass the air drives drops back; where it meets the glass head on (the
+    // windscreen) it parts, up and out. The runners go where weight and air take them
+    // together (in sixteenths of a turn, so that they do not shiver with every change of
+    // speed); the drops that sit hold on.
+    var flow = vec2<f32>(0.0, 1.0);
+    var blow = 0.0;
+    if (camera.wind.w > 0.5 && near_player_vehicle(world) > 0.5) {
+        let air = -camera.wind.xyz;
+        var aw = vec2<f32>(dot(air, side_w), dot(air, down_w));
+        aw.y = aw.y - abs(dot(air, out)) * 0.6;
+        let v2 = dot(aw, aw);
+        blow = clamp(v2 / 130.0, 0.0, 3.0);
+        flow = flow + aw / max(sqrt(v2), 1e-4) * blow;
+    }
+    let fa = round(atan2(flow.x, flow.y) / 0.3926991) * 0.3926991;
+    // pane coordinates turned so the runners run down +y
+    let qr = rain_turn(q, fa);
+
+    // --- the runners: now and then a drop grown heavy breaks loose and slides down on its
+    // own - each at its own moment, a few centimetres to a hand's width, nearly straight
+    // with a little drift, in jerks (it sticks, then slips on), and stops again; it leaves a
+    // cleared track with a few beads in it. (They were lanes of drops on wavy paths all
+    // going at once: the pane looked like a wave of snakes.) One chance a cell of 3 x 25 cm;
+    // a pixel looks at its own cell and the one above, whose drop may have slid into it.
+    let lane_w = 0.03;
+    let seg_h = 0.25;
+    let lane = floor(qr.x / lane_w);
+    let seg0 = floor(qr.y / seg_h);
+    var track = 0.0;
+    for (var k = 0; k < 2; k = k + 1) {
+        let seg = seg0 - f32(k);
+        let h1 = rain_hash(vec2<f32>(lane * 1.7 + 3.0, seg * 2.3 + 11.0));
+        if (h1.x >= wet * 0.22 * (1.0 + blow)) {
+            continue;
+        }
+        let h2 = rain_hash(vec2<f32>(lane * 1.7 + 8.1, seg * 2.3 + 5.1));
+        let h3 = rain_hash(vec2<f32>(lane * 1.7 + 1.3, seg * 2.3 + 29.7));
+        let period = 12.0 + 28.0 * h1.y;
+        let tau = fract(t / period + h2.x) * period;
+        // sits and grows a moment, then goes in jerks, then lies still till it dries
+        let sit = 1.5 + 3.0 * h2.y;
+        let st = max(tau - sit, 0.0);
+        let pulse = 0.6 + 0.8 * h3.x;
+        let step_len = (0.012 + 0.02 * h3.y) * (1.0 + 2.0 * blow);
+        let run_len = 0.05 + 0.17 * h2.y;
+        let travel = min((floor(st / pulse) + smoothstep(0.2, 0.9, fract(st / pulse))) * step_len, run_len);
+        let vis = smoothstep(0.0, 0.05, tau / period) * (1.0 - smoothstep(0.85, 1.0, tau / period));
+        let y0 = (seg + 0.1 + 0.3 * h3.x) * seg_h;
+        let x0 = (lane + 0.35 + 0.3 * h3.y) * lane_w;
+        let drift = (h2.y - 0.5) * 0.12;
+        let rh = (0.0011 + 0.0008 * h1.y) * mix(0.8, 1.0, smoothstep(0.0, sit, tau));
+        let head = rain_dome(vec2<f32>(qr.x - (x0 + drift * travel), qr.y - (y0 + travel)), rh, px);
+        if (head.z * vis > best) {
+            best = head.z * vis;
+            slope = rain_turn(head.xy, -fa);
+        }
+        // the track it cleared, and a few beads left in it
+        let along = qr.y - y0;
+        if (along > 0.0 && along < travel - rh) {
+            let dxp = qr.x - (x0 + drift * along);
+            let hw = rh * 0.7;
+            track = max(track, (1.0 - smoothstep(hw * 0.6, hw, abs(dxp))) * vis);
+            let bc = floor(along / 0.008);
+            let bh = rain_hash(vec2<f32>(lane * 3.1 + bc, seg * 1.9 + 41.0));
+            if (bh.x < 0.35) {
+                let bcen = vec2<f32>((bh.y - 0.5) * hw, (bc + 0.5) * 0.008 - along);
+                let bead = rain_dome(vec2<f32>(dxp, 0.0) - bcen, 0.0004 + 0.0005 * bh.y, px);
+                if (bead.z * vis > best) {
+                    best = bead.z * vis;
+                    slope = rain_turn(bead.xy, -fa);
+                }
+            }
+        }
+    }
+
+    // where the glass is wetter and where drier, in patches a hand across
+    let wetter = 0.45 + 1.1 * rain_patches(q * 9.0 + 3.1);
+
+    // --- the drops that sit: four sizes, one drop a cell at most, anywhere in it (the
+    // fourth the few big ones, a centimetre and more, grown from drops that ran together)
+    for (var layer = 0; layer < 4; layer = layer + 1) {
+        let fl = f32(layer);
+        let cellsz = select(select(select(0.0045, 0.0075, layer == 1), 0.012, layer == 0), 0.015, layer == 3);
+        let turn = 0.61 + fl * 1.37;
+        let g2 = rain_turn(q, turn) / cellsz + vec2<f32>(fl * 17.3, fl * 5.1);
+        let c = floor(g2);
         let h = rain_hash(c);
-        let life = 6.0 + h.y * 14.0;
-        let ph = fract(t / life + h.x);
-        // landed, full, drying: a drop comes and goes; more of them the wetter the glass
-        let present = step(h.x, wet * select(0.55, 0.4, layer == 1)) * smoothstep(0.0, 0.05, ph) * (1.0 - smoothstep(0.8, 1.0, ph));
-        let centre = c + 0.3 + 0.4 * rain_hash(c + 3.7);
-        let r = (0.12 + 0.2 * h.y) * mix(0.7, 1.0, ph);
-        let dv = (g - centre) * vec2<f32>(1.0, 0.85);
-        let dist = length(dv) / max(r, 1e-3);
-        let inside = (1.0 - smoothstep(0.8, 1.0, dist)) * present;
-        body = max(body, inside);
-        rim = max(rim, inside * smoothstep(0.45, 0.95, dist));
-        // the sky's reflection: a small spot towards the top
-        glint = max(glint, inside * (1.0 - smoothstep(0.0, 0.3, length(dv / max(r, 1e-3) - vec2<f32>(-0.25, -0.35)))));
+        let h2 = rain_hash(c + 3.7);
+        let life = 8.0 + h.y * 18.0;
+        let ph = fract(t / life + h2.x);
+        // landed, grown, drying: a drop comes and goes; more of them the wetter the pane,
+        // and the big ones only on a wet pane
+        let dens = wet * wetter * select(select(select(0.45, 0.36, layer == 2), 0.42 * smoothstep(0.15, 0.6, wet), layer == 0), 0.1 * smoothstep(0.3, 0.8, wet), layer == 3);
+        let present = step(h.x, dens) * smoothstep(0.0, 0.04, ph) * (1.0 - smoothstep(0.85, 1.0, ph)) * (1.0 - track);
+        if (present <= 0.0) {
+            continue;
+        }
+        let r = select(0.1 + 0.2 * h.y * h.y, 0.14 + 0.16 * h.y, layer == 3) * mix(0.75, 1.0, smoothstep(0.0, 0.5, ph)) * mix(0.8, 1.1, wet);
+        // (anywhere in the cell it still fits in)
+        let room = min(r * 1.12, 0.48);
+        let centre = c + vec2<f32>(room) + rain_hash(c + 9.1) * (1.0 - 2.0 * room);
+        // flattened by its weight (below the pane's own down, not the turned grid's):
+        // fuller below than above
+        var d = rain_turn((g2 - centre) * cellsz, -turn);
+        d.y = d.y * select(1.12, 0.9, d.y > 0.0);
+        // no drop is a circle: its rim wanders where the glass held it as it spread, the
+        // big ones most, and a heavy one hangs drawn out downwards
+        // (a pixel beyond any rim it could have: nothing more to work out)
+        let dl = length(d);
+        if (dl > r * cellsz * 1.5) {
+            continue;
+        }
+        let h3 = rain_hash(c + 23.9);
+        // the rim's wander as waves of 2, 3 and 4 round the drop, each turned its own way
+        // (sin(k a + phase) from the direction's cosine and sine, without an atan2)
+        let u = d / max(dl, 1e-6);
+        let c2 = u.x * u.x - u.y * u.y;
+        let s2 = 2.0 * u.x * u.y;
+        let c3 = u.x * (4.0 * u.x * u.x - 3.0);
+        let s3 = u.y * (3.0 - 4.0 * u.y * u.y);
+        let c4 = c2 * c2 - s2 * s2;
+        let s4 = 2.0 * s2 * c2;
+        let p2 = h3 * 2.0 - 1.0;
+        let p3 = h2.yx * 2.0 - 1.0;
+        let wave = (s2 * p2.x + c2 * p2.y) * h3.y + 0.55 * (s3 * p3.x + c3 * p3.y) + 0.3 * (s4 * p2.y - c4 * p3.x);
+        let wob = 1.0 + (0.03 + 0.06 * h.y) * wave;
+        d = d / max(wob, 0.4);
+        d.y = d.y * mix(1.0, 0.88, h.y * h.y * h3.x);
+        let drop = rain_dome(d, r * cellsz, px);
+        let cover = drop.z * present;
+        if (cover > best) {
+            best = cover;
+            slope = drop.xy;
+        }
     }
-    // the runners: one lane every 6 cm, each with its own drop sliding down in jerks
-    let lane_w = 0.06;
-    let lane = floor(q.x / lane_w);
-    let lh = rain_hash(vec2<f32>(lane, 7.0));
-    if (lh.x < wet * 0.6) {
-        let speed = 0.03 + 0.09 * lh.y;
-        // stick and slip: the drop pauses and then hurries on
-        let tt = t * speed + lh.x * 13.0;
-        let y = (floor(tt) + smoothstep(0.35, 1.0, fract(tt))) * 0.35;
-        let span = 1.5;
-        let dy = fract((q.y - y) / span) * span; // how far above the drop's head
-        let head_y = q.y - dy;
-        let wobble = sin(head_y * 40.0 + lane) * 0.004;
-        let x0 = (lane + 0.5 + (lh.y - 0.5) * 0.4) * lane_w + wobble;
-        let dx = q.x - x0;
-        // the head: a drop about 4 mm across, a little longer than wide
-        let hd = length(vec2<f32>(dx, (dy - 0.004) * 0.7)) / 0.0028;
-        let head = 1.0 - smoothstep(0.8, 1.0, hd);
-        // the trail above it: a clear streak where the drop wiped the glass, beaded with
-        // droplets, fading with the distance
-        let trail_len = 0.1 + 0.25 * lh.y;
-        let bead = step(0.6, fract(dy * 80.0 + lh.x * 5.0));
-        let trail = (1.0 - smoothstep(0.0007, 0.0013, abs(dx))) * (1.0 - smoothstep(0.0, trail_len, dy)) * step(0.006, dy) * bead;
-        // (the wiped streak behind the drop read as a drawn line down the glass in the
-        // enhanced picture: only the head is drawn)
-        _ = trail;
-        body = max(body, head);
-        rim = max(rim, head * smoothstep(0.45, 0.95, hd));
-        glint = max(glint, head * (1.0 - smoothstep(0.0, 0.35, length(vec2<f32>(dx / 0.0028 + 0.25, (dy - 0.004) * 0.7 / 0.0028 + 0.35)))));
+
+    // --- the mist: droplets of a millimetre or less, scattered on two turned grids
+    var grain = 0.0;
+    for (var k = 0; k < 2; k = k + 1) {
+        let mg = rain_turn(q, 0.33 + f32(k) * 2.1) / 0.0028 + f32(k) * 7.7;
+        let mc = floor(mg);
+        let mh = rain_hash(mc + 71.0);
+        let mr = 0.1 + 0.16 * mh.y;
+        let at = mc + vec2<f32>(mr) + rain_hash(mc + 5.3) * (1.0 - 2.0 * mr);
+        grain = max(grain, step(mh.x, wet * wetter * 0.35) * (1.0 - smoothstep(mr * 0.6, mr, length(mg - at))));
     }
-    let k = clamp(wet * 1.5, 0.0, 1.0);
-    let a = clamp(body * 0.22 + rim * 0.45 + glint * 0.55, 0.0, 1.0) * k;
-    let col = (vec3<f32>(0.18, 0.2, 0.22) * rim * 0.45 + vec3<f32>(0.55, 0.58, 0.62) * body * 0.22 + vec3<f32>(1.0) * glint * 0.55) / max(a / max(k, 1e-3), 1e-3);
+    // (seen from further than a millimetre a pixel: their average)
+    let mist = mix(wet * wetter * 0.35 * 0.12, grain, smoothstep(0.0015, 0.0006, px));
+    g.mist = mist * (1.0 - track) * clamp(wet * 1.4, 0.0, 1.0);
+
+    g.cover = best;
+    let nz = sqrt(max(1.0 - dot(slope, slope), 0.02));
+    g.n = normalize(out * nz + side_w * slope.x + down_w * slope.y);
+    return g;
+}
+
+// The way the eye looks through a drop: bent at its dome and at the flat glass, like
+// through a strong lens (the world shows upside down in it). Zero where the light is
+// trapped by total internal reflection: the dark ring round every drop.
+fn rain_through(g: RainGlass, v: vec3<f32>) -> vec3<f32> {
+    if (dot(g.out, v) > 0.0) {
+        // the eye on the rain's side: into the dome, out through the glass
+        let t1 = refract(-v, g.n, 1.0 / 1.333);
+        if (dot(t1, t1) < 1e-4) {
+            return vec3<f32>(0.0);
+        }
+        return refract(normalize(t1), g.out, 1.333);
+    }
+    // the eye in the bus: through the glass into the water, out of the dome
+    let t1 = refract(-v, -g.out, 1.0 / 1.333);
+    if (dot(t1, t1) < 1e-4) {
+        return vec3<f32>(0.0);
+    }
+    return refract(normalize(t1), -g.n, 1.333);
+}
+
+// What the eye sees along `through` (the way out of a drop, `rain_through`) from the drop
+// at `world`: the street behind the glass as the last frame drew it, looked up where that
+// way meets it a few metres on - through a drop's rim the way bends far round, so the
+// drop holds the whole street small and upside down, the sky at its bottom, as a real
+// one does. The rain film's reflection slot holds that picture (see `Renderer::glass_slot`);
+// without it (a mirror's view, the first frame of the rain) or off the picture's edge,
+// `fallback` (the sky's colours). `scale` takes the picture into the caller's units.
+fn rain_behind(world: vec3<f32>, through: vec3<f32>, fallback: vec3<f32>, scale: f32) -> vec3<f32> {
+    if (camera.flags.z > -0.5 || dot(through, through) < 1e-4) {
+        return fallback;
+    }
+    let c = camera.view_proj * vec4<f32>(world + normalize(through) * 6.0, 1.0);
+    if (c.w <= 0.05) {
+        return fallback;
+    }
+    let ndc = c.xy / c.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    let inside = smoothstep(0.0, 0.06, min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)));
+    let seen = finite_or(textureSampleLevel(t_env, s_diffuse, clamp(uv, vec2<f32>(0.001), vec2<f32>(0.999)), 0.0).rgb * scale, fallback);
+    return mix(fallback, seen, inside);
+}
+
+// A drop lit: `refl` what the dome mirrors, `thru` what is seen through it (both
+// radiance), `mist_col` the light the mist scatters, `sun` the sun's strength for the
+// sparkles, `d_thru` the way through (from `rain_through`). Colour and cover.
+fn rain_light(g: RainGlass, v: vec3<f32>, d_thru: vec3<f32>, refl: vec3<f32>, thru: vec3<f32>, mist_col: vec3<f32>, sun: vec3<f32>) -> vec4<f32> {
+    let facing = dot(g.out, v) > 0.0;
+    let cosv = clamp(abs(dot(g.n, v)), 0.0, 1.0);
+    // (from inside, the dome's inner face mirrors the cab: little of it)
+    let f = select(0.02, 0.02 + 0.98 * pow(1.0 - cosv, 5.0), facing);
+    let trapped = dot(d_thru, d_thru) < 1e-4;
+    // the trapped light at the rim: what the dome mirrors, darkened
+    var c = select(thru * 0.96 * (1.0 - f), refl * 0.3, trapped) + refl * f;
+    // the sun: a pinpoint where the dome mirrors it, and the drop lit up whole where it
+    // focuses the sun towards the eye
+    let s = camera.sun_dir.xyz;
+    if (facing) {
+        let r = reflect(-v, g.n);
+        c = c + sun * pow(max(dot(r, s), 0.0), 900.0) * f * 60.0;
+    }
+    if (!trapped) {
+        c = c + sun * pow(max(dot(normalize(d_thru), s), 0.0), 60.0) * 1.5;
+    }
+    let a_drop = g.cover * 0.94;
+    let a_mist = g.mist * 0.2 * (1.0 - a_drop);
+    let a = a_drop + a_mist;
+    let col = (c * a_drop + mist_col * a_mist) / max(a, 1e-4);
     return vec4<f32>(col, a);
+}
+
+// What a drop shows in the classic picture: the sky from the weather's colours, the
+// horizon in the fog's, the ground darker.
+fn rain_env_vanilla(d: vec3<f32>) -> vec3<f32> {
+    let zenith = camera.sky_color.rgb + camera.ambient.rgb * 0.5;
+    let horizon = max(camera.fog.rgb, camera.ambient.rgb);
+    let ground = camera.ambient.rgb * 0.4 + camera.sun_color.rgb * camera.sun_dir.w * 0.06;
+    let sky = mix(horizon, zenith, smoothstep(0.0, 0.5, d.z));
+    return mix(ground, sky, smoothstep(-0.06, 0.04, d.z));
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (material.emissive.w > 1.5) {
         // a pane's film of water: drops, not the sliding texture
-        let wet = in.params.x;
-        let d = rain_drops(in.world, in.uv - in.params.zw, safe_normal(in.normal), wet, camera.post.y);
-        let light = camera.sun_color.rgb * camera.sun_dir.w * 0.5 + camera.sky_color.rgb + camera.ambient.rgb;
-        // (fading out with the distance: see enhanced.wgsl - far off, black flecks)
-        let near = 1.0 - smoothstep(4.0, 12.0, distance(in.world, camera.cam_pos.xyz));
-        return vec4<f32>(d.rgb * clamp(light, vec3<f32>(0.05), vec3<f32>(1.2)), d.a * near);
+        let v = normalize(camera.cam_pos.xyz - in.world);
+        let in_cab = inside_vehicle(camera.cam_pos.xyz) * near_player_vehicle(in.world) > 0.5;
+        let g = rain_glass(in.world, in.uv - in.params.zw, in.normal, in.params.x, camera.post.y, in_cab);
+        let through = rain_through(g, v);
+        let seen = select(rain_behind(in.world, through, rain_env_vanilla(normalize(through)), 1.0), vec3<f32>(0.0), dot(through, through) < 1e-4);
+        let d = rain_light(g, v, through, rain_env_vanilla(reflect(-v, g.n)), seen, rain_env_vanilla(vec3<f32>(0.0, 0.0, 0.5)) * 0.9, camera.sun_color.rgb * camera.sun_dir.w);
+        // (fading out with the distance: see enhanced.wgsl)
+        let near = 1.0 - smoothstep(5.0, 15.0, distance(in.world, camera.cam_pos.xyz));
+        return vec4<f32>(min(d.rgb, vec3<f32>(1.5)), d.a * near);
     }
     var duv = in.uv;
     if (material.extra.x > 0.5) {
         // terrain: uv is tile space; the ground texture repeats extra.z times per tile
         duv = in.uv * material.extra.z;
     }
-    var tex = textureSample(t_diffuse, s_diffuse, duv);
+    var tex = diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv);
+    // The texture coordinates without the [texcoordtransX/Y] offset: in Omsi.exe's
+    // fixed-function pipeline the texture transform is the diffuse stage's alone, the
+    // transmap, night map and light map stay in place under a scrolling roller blind.
+    let buv = in.uv - in.params.zw;
     if (material.extra.x > 0.5 && material.extra.y > 0.0) {
         // the ground texture's detail texture, repeated finer than the texture itself and
         // modulated over it as the original's terrain pass does. The stock detail maps are
@@ -961,7 +1350,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         // is opaque, as D3D samples it: the WH UK AI cars' paint layer has a black 24-bit
         // `transmap_null.tga`, read as luminance the paint was invisible);
         // for terrain the map is the per-tile surface mask in tile space
-        let tm = textureSample(t_trans, s_diffuse, in.uv);
+        let tm = textureSample(t_trans, s_diffuse, buv);
         tex.a = select(1.0, tm.a, material.params.w > 0.5);
         if (material.extra.x > 0.5 && material.params.x > 1.5) {
             // A painted ground layer. The brush mask is coarse (0.6-3 m per texel) and
@@ -977,8 +1366,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
     let mode = material.params.x;
-    if (ALPHA_TEST && mode > 0.5 && mode < 1.5 && tex.a < 0.5) {
-        discard;
+    // Mip-filtered alpha is the fraction of the pixel covered by leaves or fence wires.
+    // Tighten the transition around the cutout edge before MSAA turns it into sample
+    // coverage. The depth prepass leaves these draws out so its binary cutoff cannot hide
+    // the scene behind samples that the colour pass leaves open.
+    if (ALPHA_TEST && mode > 0.5 && mode < 1.5) {
+        if (ALPHA_TO_COVERAGE) {
+            let aa = max(fwidth(tex.a) * 0.5, 1.0 / 255.0);
+            if (tex.a < 0.5 - aa) {
+                discard;
+            }
+            tex.a = smoothstep(0.5 - aa, 0.5 + aa, tex.a);
+        } else if (tex.a < 0.5) {
+            discard;
+        }
     }
     let n = safe_normal(in.normal);
     let ndl = max(dot(n, camera.sun_dir.xyz), 0.0);
@@ -1006,21 +1407,68 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // (a light-mapped road or plate takes the map's lamps only in Vanilla+: as OMSI 2 shows
     // it, the vanilla picture lights it from the tile light map alone)
     let lm_only = light_map_mapped(material.params) && camera.sky_color.w > 0.5;
-    let map_lamps = select(1.0, 0.0, (material.params.y > 0.2 && material.params.y < 0.3) || lm_only);
-    var lit = albedo * material.color.rgb * (diffuse + point_lights(in.world, n, map_lamps));
-    if (material.specular.w > 0.0 && material.params.y < 0.5) {
-        // the D3D material's own highlight (specular colour and power of the o3d file or a
-        // [matl_allcolor]) from the sun, added after the texture as D3D's specular is;
-        // only on the side that faces the sun, and not in its shadow
-        let vdir_s = normalize(camera.cam_pos.xyz - in.world);
-        let hs = normalize(vdir_s + camera.sun_dir.xyz);
-        let towards_sun = clamp(ndl * 4.0, 0.0, 1.0);
-        lit = lit + material.specular.rgb * camera.sun_color.rgb * camera.sun_dir.w * pow(max(dot(n, hs), 0.0), material.specular.w) * shadow * towards_sun;
+    // (and a [tree]'s leaf cards, params.y 0.15: OMSI 2 leaves a tree dark even right under
+    // a street lamp, where the lamp's 40 m core lit the crown up yellow-green)
+    let tree_unlamped = camera.sky_color.w > 0.5 && material.params.y > 0.1 && material.params.y < 0.2;
+    let map_lamps = select(1.0, 0.0, (material.params.y > 0.2 && material.params.y < 0.3) || lm_only || tree_unlamped);
+    let lamp_light = point_lights(in.world, n, map_lamps);
+    var light = diffuse + lamp_light;
+    let light_mapped = material.params2.x > 0.5 && material.extra.x < 0.5;
+    var lit = albedo * material.color.rgb * light;
+    // The vanilla picture: Omsi.exe's texture stages multiply the gamma-encoded texture by
+    // the vertex light (clamped at 1); here the texture is sampled linear and the target
+    // encodes again, so multiplied here a light L showed as L^(1/2.2) - a night at 0.06
+    // looked like 0.28, a late dusk (#300). So the product is made on the encoded texture
+    // and decoded again, with the light map laid on encoded as well. (Through the sRGB curve
+    // itself: taken as a power of 2.2, t v^2.2, the curve's linear foot below 0.0031 put a
+    // night wall at a quarter of OMSI 2's - a texture of 0.66 under a light of 0.05 came out
+    // at 2 of 255 instead of 8.)
+    let classic = camera.sky_color.w > 0.5;
+    // (the terrain's night map is its tile light map: light, not a glow - see below)
+    let terrain_night = classic
+        && material.params.y < 0.5
+        && material.extra.x > 0.5
+        && material.extra.w > 0.5
+        && material.extra.w < 1.5;
+    if (classic && material.params.y < 0.5) {
+        var v = clamp(material.emissive.rgb + material.color.rgb * (light + interior_lamps(in.world, n, in.params2.z)), vec3<f32>(0.0), vec3<f32>(1.0));
+        if (light_mapped) {
+            let lm = srgb_encode(textureSample(t_light, s_diffuse, buv).rgb) * clamp(in.params2.x, 0.0, 1.0);
+            v = v + lm * (vec3<f32>(1.0) - v);
+        }
+        if (terrain_night) {
+            // the terrain's tile light map lights the ground as the lamps' own light: added
+            // to the vertex light before the texture is multiplied in. Laid over the lit
+            // ground instead, as a night map glows, its faint fringe (0.01, linear) put
+            // one beige veil over cobbles and grass alike, a whole car park the colour of
+            // sand where OMSI 2 shows it dark grey.
+            let nm = srgb_encode(textureSample(t_night, s_diffuse, vec2<f32>(in.uv.x, 1.0 - in.uv.y)).rgb);
+            v = min(v + nm * camera.sun_color.w * clamp(in.params2.y, 0.0, 1.0), vec3<f32>(1.0));
+        }
+        lit = srgb_decode(srgb_encode(albedo) * v);
+    } else if (light_mapped) {
+        // [matl_lightmap], as Omsi.exe's texture stages have it (0x7fe4d3..0x7fe604): the
+        // light map is laid onto the vertex light with D3DTOP_ADDSMOOTH (light + map x (1 -
+        // light)) before the texture is multiplied in - a lit saloon glows at night and
+        // hardly shows in daylight. The vertex light is D3D's: the material's emissive and
+        // its colour times every light - the saloon lamps (`[interiorlight]`, D3D lights
+        // too, 0x5fa8f0) among them - clamped at 1. (Added once more after the map, the
+        // saloon lamps lit a cabin twice over, flat white where the map was full; and the
+        // material's colour took the map down with it.)
+        let lm = textureSample(t_light, s_diffuse, buv).rgb * clamp(in.params2.x, 0.0, 1.0);
+        let v = clamp(material.emissive.rgb + material.color.rgb * (light + interior_lamps(in.world, n, in.params2.z)), vec3<f32>(0.0), vec3<f32>(1.0));
+        lit = albedo * (v + lm * (vec3<f32>(1.0) - v));
     }
+    // the D3D material's own highlight (specular colour and power of the o3d file or a
+    // [matl_allcolor]), lit at the vertices (see `vertex_specular`) and added after the
+    // texture as D3D's specular is; the sun's not in its shadow
+    lit = lit + in.spec_sun * shadow + in.spec_sky;
     if (material.params.y > 0.5) {
         lit = tex.rgb * material.color.rgb;
     }
-    lit = lit + tex.rgb * material.emissive.rgb;
+    if ((!light_mapped && !classic) || material.params.y > 0.5) {
+        lit = lit + tex.rgb * material.emissive.rgb;
+    }
     // the tile light map, as on the terrain: the lamps' pools on the roads and the plates,
     // lighting the surface (not painted over it: added as it was, the pool lay on the road
     // as a white patch); only where it is their light at night - elsewhere the map's lamps
@@ -1028,84 +1476,42 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (lm_only) {
         lit = lit + albedo * material.color.rgb * light_map_at(in.world) * camera.sun_color.w;
     }
-    // [interiorlight]: the saloon lamps on the meshes and passengers they illuminate
-    lit = lit + tex.rgb * interior_lamps(in.world, n, in.params2.z);
-    if (material.extra.w > 0.5) {
+    // [interiorlight]: the saloon lamps on the meshes and passengers they illuminate (in
+    // a light-mapped material's vertex light already, above)
+    if (!light_mapped && !classic) {
+        lit = lit + tex.rgb * interior_lamps(in.world, n, in.params2.z);
+    }
+    if (material.extra.w > 0.5 && !terrain_night) {
         // [matl_nightmap]: self-illumination that fades in with the night
         // terrain: the tile light map in tile space (north at the top row)
-        let nuv = select(duv, vec2<f32>(in.uv.x, 1.0 - in.uv.y), material.extra.x > 0.5);
+        let nuv = select(buv, vec2<f32>(in.uv.x, 1.0 - in.uv.y), material.extra.x > 0.5);
         let nm = textureSample(t_night, s_diffuse, nuv);
         // a [matl_item] night map is switched by its variable (warning lamps, displays):
         // it glows whenever that is on, by day as well; the others fade in with the night
         let night = select(camera.sun_color.w, 1.0, material.extra.w > 1.5);
         lit = lit + nm.rgb * night * select(clamp(in.params2.y, 0.0, 1.0), 1.0, material.extra.w > 1.5);
     }
-    if (material.params2.x > 0.5 && material.extra.x < 0.5) {
-        // [matl_lightmap]: a light mask (interior lighting) multiplied with the diffuse
-        // texture, scaled by a script variable
-        let lm = textureSample(t_light, s_diffuse, duv);
-        lit = lit + tex.rgb * lm.rgb * clamp(in.params2.x, 0.0, 1.0);
-    }
-    // a pane's reflection, laid over what shows through it (see the end)
-    var pane_refl = vec3<f32>(0.0);
-    var pane_k = 0.0;
     if (material.params2.y > 0.0) {
         // [matl_envmap]: sphere map reflection, masked by the diffuse alpha like the original
         let vdir = normalize(in.world - camera.cam_pos.xyz);
         let r = reflect(vdir, n);
-        let rx = dot(r, camera.cam_right.xyz);
-        let ry = dot(r, camera.cam_up.xyz);
-        // paint reflects a soft image; glass keeps the sphere map sharp. Sampled sharp,
-        // the trees photographed into envmap.bmp showed up as camouflage on the body.
+        // (the headset: laid out by the bus's heading, level, not by each eye's view)
+        let vr_env = camera.cam_up.w > 0.5;
+        let env_right = select(camera.cam_right.xyz, vec3<f32>(cos(camera.cam_right.w), -sin(camera.cam_right.w), 0.0), vr_env);
+        let env_up = select(camera.cam_up.xyz, vec3<f32>(0.0, 0.0, 1.0), vr_env);
+        let rx = dot(r, env_right);
+        let ry = dot(r, env_up);
         var env_uv = vec2<f32>(rx * 0.5 + 0.5, 0.5 + ry * 0.5);
         if (material.bump.y > 0.5) {
             env_uv = env_uv + bump_offset(duv);
         }
-        // A blended transmap body is a masked paint surface, not glass. Traffic cars
-        // commonly use this form for the body; only an actual depth-disabled blend is
-        // treated as a window/transparent surface.
-        let glass = material.params.x > 1.5 && material.bump.z > 0.5 &&
-            (material.params2.y > 0.0 || material.params.z > 0.5 || material.emissive.w > 0.5);
-        let painted_transmap = material.params.z > 0.5 && !glass;
-        let painted_body = material.params.x < 1.5 || painted_transmap;
-        let env = textureSampleBias(t_env, s_diffuse, env_uv, select(2.0, 0.0, glass));
-        let diffuse_a = textureSample(t_diffuse, s_diffuse, duv).a;
-        // strength: reflection mask x factor; the factor saturates at 1 like a D3D texture
-        // factor (the SD202 body writes 10 for "full": its paint alpha of 0.03-0.08 is the
-        // gloss, and the far LOD's own mask of 0.05-0.12 matches that, not ten times it),
-        // capped so transparent glass keeps its tint
-        // Glass needs a visible normal-incidence reflection as well as the stronger
-        // grazing-angle reflection. The old 0.22/0.05 combination made bus windows look
-        // like pale uncoated plastic when viewed from the driver's seat.
-        let factor = max(min(material.params2.y, 1.0), select(0.0, 0.25, glass));
-        // (a blended pane's alpha is its transparency, not a reflection mask: read as one,
-        // the Scania's nearly clear panes reflected nothing at all)
-        var k = clamp(factor * reflection_mask(duv, select(diffuse_a, 1.0, glass)), 0.0, 1.0) * select(1.0, 0.65, glass);
-        if (painted_body) {
-            // Opaque vehicle paint may carry an envmap for legacy content, but it must
-            // not inherit the window's mirror-like sphere-map reflection (in vanilla too:
-            // taken as D3D blends it, every bus body turned into a mirror).
-            k = 0.0;
-        }
-        if (glass) {
-            // See-through glass reflects a few per cent of the sphere map when you look
-            // straight through it and much more at a grazing angle - without that the
-            // windscreen carried an even milky veil over the whole road ahead.
-            // (seen from inside the glass the normal points away, so take the angle
-            // either way round)
-            let facing = clamp(abs(dot(vdir, n)), 0.0, 1.0);
-            k = k * (0.18 + 0.82 * pow(1.0 - facing, 4.0));
-        }
-        // the sphere map was photographed by day: dim it with the scene light at night
-        // (outside the classic picture it goes with the night as well: the photo's sunlit
-        // trees and blue sky kept a fifth of their light at midnight, and the mirrors of
-        // an enhanced session - drawn with this shader - showed a street by daylight in
-        // every pane they caught)
-        let env_night = select(1.0 - 0.85 * clamp(camera.sun_color.w, 0.0, 1.0), 1.0, camera.sky_color.w > 0.5);
-        let env_light = clamp(camera.sun_color.r * camera.sun_dir.w + camera.sky_color.r + camera.ambient.r, 0.05, 1.0) * env_night;
+        let env = textureSample(t_env, s_diffuse, env_uv);
+        let diffuse_a = diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv).a;
         if (material.params.x < 1.5) {
             // rain: a painted body goes darker and glossier when it is wet, so the bus
             // stands out against a grey street instead of fading into it
+            let env_night = select(1.0 - 0.85 * clamp(camera.sun_color.w, 0.0, 1.0), 1.0, camera.sky_color.w > 0.5);
+            let env_light = clamp(camera.sun_color.r * camera.sun_dir.w + camera.sky_color.r + camera.ambient.r, 0.05, 1.0) * env_night;
             let wet = camera.shadow.w * weather_outside_n(in.world, n, false, in.params2.w);
             lit = lit * (1.0 - 0.30 * wet);
             // the water film mirrors the (overcast) sky a little, mostly at grazing
@@ -1114,13 +1520,42 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             let sheen = wet * min(material.params2.y, 1.0) * (0.05 + 0.22 * pow(1.0 - facing, 5.0));
             lit = mix(lit, camera.sky_color.rgb * env_light, sheen);
         }
-        if (glass) {
-            pane_refl = env.rgb * env_light;
-            // the inner face of the bus's own glass mirrors the dark cab, not the sky (see
-            // enhanced.wgsl): the doors seen from the driver's seat were a grey veil
-            pane_k = k * (1.0 - 0.85 * near_player_vehicle(in.world) * inside_vehicle(camera.cam_pos.xyz));
+        // Omsi.exe's environment stage (0x7fd6c4 at 0x7ff626, fixed function), for paint
+        // and glass alike: the sphere map's colour as it is, over what the stages before
+        // made of the lit texture - D3DTOP_LERP by the texture factor when the material has
+        // neither a [matl_transmap] nor a [matl_envmap_mask], D3DTOP_BLENDCURRENTALPHA when
+        // it has one - and the alpha left as the stages before made it (ALPHAARG1 CURRENT,
+        // SELECTARG1, 0x7ff98a): a clear pane shows its reflection as faintly as it shows
+        // itself. (A glass path of our own - a quarter reflection at least, a Fresnel rim
+        // and the pane made opaque where it reflected - mirrored the street in every
+        // window far more than the original does.) The factor is [matl_envmap]'s times
+        // the ambient light plus `g` (the light the vehicle stands in: the lamps of the
+        // tile's light map and the sky), each at most 1, packed into a D3DCOLOR without
+        // saturation (0x7ff8ed: a factor over 1 spills its bits into the next channel, as
+        // there). The alpha it blends by is the mask's, or the diffuse texture's times `g`
+        // (0x7feacc, 0x7ff092) - never the diffuse alpha of a material without one of
+        // them: taken as a reflection mask, a body whose texture carries an alpha channel
+        // for other purposes was mirrored (dark) where that alpha was high.
+        // `g` (0x861ca0, set per vehicle at 0x7d8735): the mean of the light the tile's
+        // light map throws on it plus the day's light A (weather +0xac = the mean of
+        // lightcolor A, 0x75333f - by it the stars fade), at most 1
+        let g = clamp(dot(lamp_light, vec3<f32>(1.0 / 3.0)) + dot(camera.sun_color.rgb, vec3<f32>(1.0 / 3.0)), 0.0, 1.0);
+        var kk = vec3<f32>(0.0);
+        if (has_transmap_declared() || has_env_mask()) {
+            let a = select(diffuse_a, textureSample(t_envmask, s_diffuse, duv).a, has_env_mask());
+            kk = vec3<f32>(a * g);
         } else {
-            lit = mix(lit, env.rgb * env_light, k);
+            kk = omsi_texture_factor(material.params2.y, camera.ambient.rgb + vec3<f32>(g));
+        }
+        // In the vanilla picture the lerp is made on the encoded values, as the stage makes
+        // it, like the texture x light product above: made on linear ones it showed the
+        // reflection about twice as bright over a dark surface - since the nights got dark
+        // (#300) the instrument glass of the MAN NL/NG (Fenster.tga, factor 0.5, the sky
+        // at the sphere map's bottom) lay milky white over the unlit gauges.
+        if (classic) {
+            lit = srgb_decode(mix(srgb_encode(lit), srgb_encode(env.rgb), kk));
+        } else {
+            lit = mix(lit, env.rgb, kk);
         }
     }
     // wet road: a surface whose texture carries [moisture] darkens under rain and starts
@@ -1172,12 +1607,5 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         a = 1.0;
     }
     a = a * in.params.x;
-    if (pane_k > 0.0 && mode > 1.5) {
-        // the reflection lies on top of the pane: at the pane's own faint alpha it
-        // vanished with it; the blend keeps it where the glass itself is clear
-        let a2 = clamp(a + (1.0 - a) * pane_k, a, 1.0);
-        let refl = mix(pane_refl, camera.fog.xyz, clamp(f, 0.0, 1.0));
-        return vec4<f32>((rgb * a + refl * pane_k) / max(a2, 1e-3), a2);
-    }
     return vec4<f32>(rgb, a);
 }

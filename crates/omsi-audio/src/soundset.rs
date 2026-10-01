@@ -29,6 +29,9 @@ pub struct SoundSet {
     inside: bool,
     /// This set belongs to an AI vehicle (`[viewpoint]` bit 4).
     ai: bool,
+    /// The player's own vehicle moves with its listener; its 3D sounds still pan and fade,
+    /// but frame timing must not turn their fixed cabin positions into Doppler pitch shifts.
+    listener_vehicle: bool,
     /// The listener sits in *some* vehicle's cabin right now - set every frame on every
     /// sound set, this vehicle's own and every other vehicle's alike (see
     /// [`SoundSet::set_muffled`] and [`SoundSet::lowpass_of`]).
@@ -123,6 +126,7 @@ impl SoundSet {
             exterior: false,
             inside: false,
             ai: false,
+            listener_vehicle: false,
             muffled: false,
             parts: Vec::new(),
         }
@@ -135,6 +139,14 @@ impl SoundSet {
         self.inside = inside;
         for (_, p) in &mut self.parts {
             p.set_inside(inside);
+        }
+    }
+
+    /// Track whether the listener travels with the player's vehicle and its coupled parts.
+    pub fn set_listener_vehicle(&mut self, follows: bool) {
+        self.listener_vehicle = follows;
+        for (_, p) in &mut self.parts {
+            p.set_listener_vehicle(follows);
         }
     }
 
@@ -158,6 +170,7 @@ impl SoundSet {
         part.muffled = self.muffled;
         part.exterior = self.exterior;
         part.ai = self.ai;
+        part.listener_vehicle = self.listener_vehicle;
         self.parts.push((index, part));
     }
 
@@ -275,8 +288,10 @@ impl SoundSet {
                 pitch: 1.0,
                 looping: false,
                 position,
+                doppler: !self.listener_vehicle,
                 range: if s.def.range > 0.0 { s.def.range } else { 5.0 },
                 lowpass_hz: Self::lowpass_of(muffled, exterior),
+                important: s.def.important,
             };
             if let Some(id) = s.voice.take() {
                 engine.stop(id);
@@ -372,7 +387,7 @@ impl SoundSet {
         if !engine.enabled {
             return;
         }
-        let (muffled, exterior, master) = (self.muffled, self.exterior, self.master);
+        let (muffled, exterior, master, doppler) = (self.muffled, self.exterior, self.master, !self.listener_vehicle);
         let view = self.view_mask();
         let world_pos = |p: Option<[f32; 3]>| {
             p.map(|p| object_to_world.transform_point3(Vec3::from_array(p)))
@@ -425,8 +440,10 @@ impl SoundSet {
                 pitch: pitch.max(0.001),
                 looping,
                 position: world_pos(s.def.pos),
+                doppler,
                 range: range_of(s.def.range),
                 lowpass_hz: Self::lowpass_of(muffled, exterior),
+                important: s.def.important,
             };
             if !triggered && !s.def.no_loop {
                 let params = params(true);

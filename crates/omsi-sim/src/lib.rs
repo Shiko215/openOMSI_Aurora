@@ -7,6 +7,8 @@ pub mod collision;
 pub mod crowd;
 pub mod daylight;
 pub mod host;
+pub mod htmlengine;
+pub mod htmltex;
 pub mod ibis;
 pub mod human;
 pub mod input;
@@ -19,6 +21,7 @@ pub mod startup;
 pub mod texttex;
 pub mod traffic;
 pub mod vehicle;
+pub mod vehicle_api;
 
 pub use anim::{AnimState, MeshAnimator};
 pub use clock::SimClock;

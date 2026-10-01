@@ -6,7 +6,7 @@
 //! Every text is rendered once into a small texture and kept while it is shown; the
 //! overlays are rectangles in physical pixels (`Scene::overlays`).
 
-use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
+use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use omsi_render::{Renderer, Scene, TextureId};
 
 /// Roboto (Apache 2.0), the interface font.
@@ -23,14 +23,14 @@ struct Label {
 
 /// Texts rendered into textures, kept while they are used.
 pub struct TextCache {
-    font: FontArc,
+    font: FontVec,
     labels: hashbrown::HashMap<(String, u32, [u8; 4]), Label>,
     frame: u64,
 }
 
 impl TextCache {
     pub fn new() -> Option<TextCache> {
-        let font = FontArc::try_from_slice(ROBOTO).ok()?;
+        let font = FontVec::try_from_vec(ROBOTO.to_vec()).ok()?;
         Some(TextCache { font, labels: hashbrown::HashMap::new(), frame: 0 })
     }
 
@@ -54,16 +54,19 @@ impl TextCache {
     /// Text width in pixels, without rendering it.
     pub fn width(&self, text: &str, px: f32) -> f32 {
         let text = &*omsi_ui::tr(text);
-        let f = self.font.as_scaled(PxScale::from(px));
         let mut w = 0.0;
-        let mut prev = None;
+        let mut prev: Option<(ab_glyph::GlyphId, *const FontVec)> = None;
         for c in text.chars() {
+            let font = font_for(&self.font, c);
+            let f = font.as_scaled(PxScale::from(px));
             let id = f.glyph_id(c);
-            if let Some(p) = prev {
-                w += f.kern(p, id);
+            if let Some((p, pf)) = prev {
+                if std::ptr::eq(pf, font) {
+                    w += f.kern(p, id);
+                }
             }
             w += f.h_advance(id);
-            prev = Some(id);
+            prev = Some((id, font as *const FontVec));
         }
         w + outline_px(px) * 2.0 + 2.0
     }
@@ -87,31 +90,46 @@ fn outline_px(px: f32) -> f32 {
     (px / 9.0).clamp(1.0, 3.0)
 }
 
+/// The font that draws `c`: Roboto, else the system's font for the script (Chinese,
+/// Japanese, Korean, Thai, Hindi - the menu was a column of boxes in those languages).
+fn font_for(roboto: &FontVec, c: char) -> &FontVec {
+    if omsi_ui::text::needs_fallback(roboto, c) {
+        if let Some(f) = omsi_ui::text::fallback_font(c) {
+            return f;
+        }
+    }
+    roboto
+}
+
 /// `text` as straight-alpha RGBA: the glyphs in `color` over a dark outline.
-fn render_text(font: &FontArc, text: &str, px: f32, color: [u8; 4]) -> omsi_texture::Image {
+fn render_text(font: &FontVec, text: &str, px: f32, color: [u8; 4]) -> omsi_texture::Image {
     let f = font.as_scaled(PxScale::from(px));
     let stroke = outline_px(px);
     let pad = stroke.ceil() as i32 + 1;
     let asc = f.ascent();
     let h = (asc - f.descent()).ceil() as i32 + pad * 2;
     // lay the glyphs out
-    let mut glyphs = Vec::new();
+    let mut glyphs: Vec<(&FontVec, ab_glyph::Glyph)> = Vec::new();
     let mut x = pad as f32;
-    let mut prev = None;
+    let mut prev: Option<(ab_glyph::GlyphId, *const FontVec)> = None;
     for c in text.chars() {
-        let id = f.glyph_id(c);
-        if let Some(p) = prev {
-            x += f.kern(p, id);
+        let gf = font_for(font, c);
+        let sf = gf.as_scaled(PxScale::from(px));
+        let id = sf.glyph_id(c);
+        if let Some((p, pf)) = prev {
+            if std::ptr::eq(pf, gf) {
+                x += sf.kern(p, id);
+            }
         }
-        glyphs.push(id.with_scale_and_position(PxScale::from(px), ab_glyph::point(x, pad as f32 + asc)));
-        x += f.h_advance(id);
-        prev = Some(id);
+        glyphs.push((gf, id.with_scale_and_position(PxScale::from(px), ab_glyph::point(x, pad as f32 + asc))));
+        x += sf.h_advance(id);
+        prev = Some((id, gf as *const FontVec));
     }
     let w = (x.ceil() as i32 + pad).max(1);
     let (wu, hu) = (w as usize, h.max(1) as usize);
     let mut cov = vec![0f32; wu * hu];
-    for g in glyphs {
-        if let Some(o) = font.outline_glyph(g) {
+    for (gf, g) in glyphs {
+        if let Some(o) = gf.outline_glyph(g) {
             let b = o.px_bounds();
             o.draw(|gx, gy, c| {
                 let xx = b.min.x as i32 + gx as i32;
@@ -216,6 +234,8 @@ pub struct Frame<'a> {
     pub width: f32,
     pub height: f32,
     pub cursor: (f32, f32),
+    /// An OpenXR headset is drawing this frame.
+    pub vr: bool,
     /// The name of what the cursor points at (a switch, a part), shown next to it.
     pub tooltip: Option<String>,
     /// The chat, when a LAN session runs and the chat is not switched off.
@@ -246,6 +266,13 @@ pub struct Ui {
     pub chat: ChatWidget,
     /// Where the game menu's lines were drawn this frame (physical pixels), for the mouse.
     pub menu_rects: Vec<[f32; 4]>,
+    pub menu_scroll_thumb: Option<[f32; 4]>,
+    pub menu_scroll_track: Option<[f32; 4]>,
+    /// Overlay entries belonging to the game menu.
+    pub menu_overlay_range: std::ops::Range<usize>,
+    /// The pointer texture, positioned separately for each headset eye.
+    pub vr_cursor_overlay: Option<usize>,
+    pub vr_tooltip_overlay: Option<usize>,
     /// The first line of the menu shown (a long menu scrolls: `menu_rects[k]` is line
     /// `menu_start + k`).
     pub menu_start: usize,
@@ -259,7 +286,7 @@ pub struct Ui {
 
 impl Ui {
     pub fn new() -> Option<Ui> {
-        Some(Ui { text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default() })
+        Some(Ui { text: TextCache::new()?, chat: ChatWidget::default(), menu_rects: Vec::new(), menu_scroll_thumb: None, menu_scroll_track: None, menu_overlay_range: 0..0, vr_cursor_overlay: None, vr_tooltip_overlay: None, menu_start: 0, menu_rows: 0, menu_row_h: 1.0, images: Default::default() })
     }
 
     /// Draw the frame's interface: its overlays go after the HUD's in `scene.overlays`.
@@ -467,15 +494,20 @@ impl Ui {
         }
         // --- the game menu, in the middle over a dimmed picture
         self.menu_rects.clear();
+        self.menu_scroll_thumb = None;
+        self.menu_scroll_track = None;
+        let menu_overlay_start = scene.overlays.len();
         if let Some((sel, items)) = f.menu {
             let dim = self.text.plate(r, scene, 6);
             scene.overlays.push((dim, [0.0, 0.0, f.width, f.height]));
             let w = 340.0 * s;
-            let title_h = 56.0 * s;
+            let title_h = if f.vr { 50.0 * s } else { 56.0 * s };
             // as many lines as fit at a readable height; a longer menu scrolls (the wheel,
             // the arrow keys), the chosen line kept in view
-            let room = f.height * 0.92 - title_h - 16.0 * s;
-            let row_h = (44.0 * s).min(room / items.len().max(1) as f32).max(34.0 * s);
+            let room = f.height * (if f.vr { 0.60 } else { 0.92 }) - title_h - 16.0 * s;
+            let row_h = (if f.vr { 40.0 } else { 44.0 }) * s;
+            let row_h = row_h
+                .min(room / items.len().max(1) as f32).max(34.0 * s);
             let rows = ((room / row_h).floor() as usize).clamp(1, items.len().max(1));
             let start = match (items.len() > rows, f.menu_top) {
                 (false, _) => 0,
@@ -497,13 +529,16 @@ impl Ui {
             // the scroll bar: where the lines shown lie in the whole menu
             if items.len() > rows {
                 let track = [x + w - 7.0 * s, y + title_h, x + w - 3.0 * s, y + title_h + row_h * rows as f32 - 6.0 * s];
+                self.menu_scroll_track = Some(track);
                 let tp = self.text.plate(r, scene, 5);
                 scene.overlays.push((tp, track));
                 let th = track[3] - track[1];
                 let t0 = track[1] + th * start as f32 / items.len() as f32;
                 let t1 = track[1] + th * (start + rows) as f32 / items.len() as f32;
                 let thumb = self.text.plate(r, scene, 4);
-                scene.overlays.push((thumb, [track[0], t0, track[2], t1]));
+                let thumb_rect = [track[0], t0, track[2], t1];
+                scene.overlays.push((thumb, thumb_rect));
+                self.menu_scroll_thumb = Some(thumb_rect);
                 let more = format!("{} of {}", sel + 1, items.len());
                 let l = self.text.label(r, scene, &more, (12.0 * s) as u32, [150, 150, 150, 0]);
                 scene.overlays.push((l.tex, [x + w - 16.0 * s - l.w as f32, y + 22.0 * s, x + w - 16.0 * s, y + 22.0 * s + l.h as f32]));
@@ -535,7 +570,9 @@ impl Ui {
                 self.menu_rects.push(rect);
             }
         }
+        self.menu_overlay_range = menu_overlay_start..scene.overlays.len();
         // --- the mouse-over name, right of the cursor
+        self.vr_tooltip_overlay = None;
         if let Some(t) = f.tooltip.as_ref().filter(|t| !t.is_empty()) {
             let l = self.text.label(r, scene, t, (14.0 * s) as u32, [255, 255, 255, 235]);
             let mut x = f.cursor.0 + 16.0 * s;
@@ -546,13 +583,52 @@ impl Ui {
             if y + l.h as f32 > f.height {
                 y = f.height - l.h as f32;
             }
+            if f.vr { self.vr_tooltip_overlay = Some(scene.overlays.len()); }
             scene.overlays.push((l.tex, [x, y, x + l.w as f32, y + l.h as f32]));
+        }
+        if f.vr {
+            let pointer = self.text.vr_pointer(r, scene);
+            self.vr_cursor_overlay = Some(scene.overlays.len());
+            scene.overlays.push((pointer, [0.0, 0.0, 7.0 * s, 7.0 * s]));
+        } else {
+            self.vr_cursor_overlay = None;
         }
         self.text.end_frame(r, scene);
     }
 }
 
 impl TextCache {
+    /// A small white circle, centred on the point that receives the click.
+    fn vr_pointer(&mut self, r: &Renderer, scene: &mut Scene) -> TextureId {
+        let key = ("\u{0}vr_pointer_dot".to_string(), 0, [0, 0, 0, 0]);
+        if let Some(label) = self.labels.get_mut(&key) {
+            label.used = self.frame;
+            return label.tex;
+        }
+        const W: usize = 32;
+        const H: usize = 32;
+        let mut rgba = vec![0u8; W * H * 4];
+        for y in 0..H {
+            for x in 0..W {
+                let dx = x as f32 + 0.5 - W as f32 * 0.5;
+                let dy = y as f32 + 0.5 - H as f32 * 0.5;
+                let radius = (dx * dx + dy * dy).sqrt();
+                let alpha = (16.0 - radius).clamp(0.0, 1.0);
+                let white = radius < 13.0;
+                let color = if white {
+                    [255, 255, 255, (alpha * 255.0) as u8]
+                } else {
+                    [0, 0, 0, (alpha * 220.0) as u8]
+                };
+                rgba[(y * W + x) * 4..(y * W + x + 1) * 4].copy_from_slice(&color);
+            }
+        }
+        let image = omsi_texture::Image { width: W as u32, height: H as u32, rgba, has_alpha: true };
+        let tex = r.add_texture(scene, &image, false);
+        self.labels.insert(key, Label { tex, w: W as u32, h: H as u32, used: self.frame });
+        tex
+    }
+
     /// A plate of one colour: 0 the chat's dark translucent input box, 1 the loading
     /// screen's bar track, 2 its fill.
     fn plate(&mut self, r: &Renderer, scene: &mut Scene, kind: u8) -> TextureId {
@@ -665,7 +741,7 @@ mod tests {
 
     #[test]
     fn text_renders_with_an_outline() {
-        let f = FontArc::try_from_slice(ROBOTO).unwrap();
+        let f = FontVec::try_from_vec(ROBOTO.to_vec()).unwrap();
         let img = render_text(&f, "Savva: hi", 16.0, [255, 255, 255, 220]);
         assert!(img.width > 40 && img.height > 14);
         // white text and dark outline pixels are both there
@@ -674,10 +750,27 @@ mod tests {
         assert!(px.iter().any(|p| p[3] > 100 && p[0] < 40));
     }
 
+    /// The Esc menu in Chinese, Korean and Thai: the system's fonts, not boxes.
+    #[test]
+    fn scripts_roboto_lacks_come_from_the_system() {
+        let f = FontVec::try_from_vec(ROBOTO.to_vec()).unwrap();
+        for t in ["继续", "繼續", "계속", "ดำเนินการต่อ"] {
+            if t.chars().next().and_then(omsi_ui::text::fallback_font).is_none() {
+                continue;
+            }
+            for c in t.chars() {
+                let g = font_for(&f, c);
+                assert!(!std::ptr::eq(g, &f) && g.glyph_id(c).0 != 0, "{t}: {c}");
+            }
+            let img = render_text(&f, t, 20.0, [255, 255, 255, 220]);
+            let ink = img.rgba.chunks(4).filter(|p| p[3] > 128 && p[0] > 128).count();
+            assert!(ink > 30, "{t}: {ink}");
+        }
+    }
+
     #[test]
     fn chat_filter_stars_out_swearing() {
         assert_ne!(filter_chat("you are a fucking idiot"), "you are a fucking idiot");
         assert_eq!(filter_chat("next stop Rathaus Spandau"), "next stop Rathaus Spandau");
     }
 }
-

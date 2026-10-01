@@ -428,7 +428,7 @@ pub fn lookup_tunnel(session: u64) -> Option<String> {
 }
 
 /// A string field of a flat JSON object (the relay's answers need no more than this).
-fn json_field(line: &str, key: &str) -> Option<String> {
+pub(crate) fn json_field(line: &str, key: &str) -> Option<String> {
     let pat = format!("\"{key}\":\"");
     let start = line.find(&pat)? + pat.len();
     let mut out = String::new();

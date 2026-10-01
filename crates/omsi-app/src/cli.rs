@@ -39,7 +39,7 @@ pub(crate) struct Args {
     /// Entry point index (from global.cfg) where the vehicle is placed.
     #[arg(long, default_value_t = 0)]
     pub(crate) entry: usize,
-    /// View: driver, pax, outside, or free.
+    /// View: driver, pax, outside, or free; mirror<n> shows what mirror n's camera sees (a check).
     #[arg(long, default_value = "driver")]
     pub(crate) view: String,
     /// Put the bus into service at the start of the run (the Shift+U auto-start).
@@ -86,6 +86,11 @@ pub(crate) struct Args {
     /// Paint scheme / advert of the player vehicle: item name or index from its .cti files.
     #[arg(long)]
     pub(crate) paint: Option<String>,
+    /// Number plate (registration) of the player vehicle, e.g. `--plate "B-AB 1234"`: it goes
+    /// into the bus's `ident` string variable instead of the plate its `[number]` list, its
+    /// `[registration_*]` mode or the map's `registrations.txt` gives it.
+    #[arg(long)]
+    pub(crate) plate: Option<String>,
     /// Time of day at start, HH:MM (default 09:00).
     #[arg(long, default_value = "09:00")]
     pub(crate) time: String,
@@ -235,15 +240,16 @@ pub(crate) fn parse_cam(s: &str) -> Result<Camera> {
         .split(',')
         .map(|x| x.trim().parse::<f32>())
         .collect::<Result<_, _>>()?;
-    if v.len() != 5 {
-        return Err(anyhow!("--cam needs x,y,z,yaw,pitch"));
+    // (a sixth number is the field of view)
+    if v.len() != 5 && v.len() != 6 {
+        return Err(anyhow!("--cam needs x,y,z,yaw,pitch[,fov]"));
     }
     Ok(Camera {
         position: DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64),
         yaw: v[3],
         pitch: v[4],
         roll: 0.0,
-        fov_deg: 60.0,
+        fov_deg: v.get(5).copied().unwrap_or(60.0),
         near: 0.5,
         far: 6000.0,
     })
@@ -270,6 +276,7 @@ pub(crate) struct SituationOther {
     /// x,y,heading,z as `--spawn` takes it
     pub spawn: String,
     pub hof: Option<String>,
+    pub paint: Option<String>,
     pub vars: Vec<(String, f32)>,
     pub strvars: Vec<(String, String)>,
 }

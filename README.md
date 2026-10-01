@@ -5,8 +5,6 @@
   </picture>
 </p>
 
-
-
 <p align="center">
   <a href="https://github.com/Shiko215/openOMSI_Aurora/releases/latest"><img alt="Version" src="https://img.shields.io/github/v/release/Shiko215/openOMSI_Aurora?label=version&color=f47f30&style=for-the-badge"></a>
   <a href="https://github.com/Shiko215/openOMSI_Aurora/actions/workflows/release.yml"><img alt="Build" src="https://img.shields.io/github/actions/workflow/status/Shiko215/openOMSI_Aurora/release.yml?branch=main&style=for-the-badge&label=build"></a>
@@ -56,7 +54,7 @@ page); the original installation is never written to.
 
 From 0.1.7 on the launcher updates itself: when a newer release is out it asks at the start
 and, with your yes, downloads it, replaces the program and starts again (on Android through
-the system's installer). Settings → Updates switches the check off or installs without
+the system's installer). Settings → General → Updates switches the check off or installs without
 asking.
 
 ## Installation
@@ -96,10 +94,10 @@ to.
   message says what the chosen folder lacks.
 * **The game closes after a few seconds, or "the graphics device was lost"** - update the
   graphics driver (NVIDIA, AMD or Intel's own, not the one Windows installs). On Windows you
-  can also switch to DirectX 12: Settings → Graphics API (the launcher offers it after such a
+  can also switch to DirectX 12: Settings → Graphics → Graphics API (the launcher offers it after such a
   crash).
 * **An older graphics card** (no Vulkan): openOMSI falls back to DirectX 12 and then OpenGL by
-  itself; Settings → Graphics API chooses one.
+  itself; Settings → Graphics → Graphics API chooses one.
 * **Stuck at a bridge or an invisible wall** on a mod map: Esc → Options → *Collisions with
   objects* switches collisions with the map's objects off (Settings has it too).
 * **Multiplayer: you do not meet the others** - both players need the host's map (a map in
@@ -129,9 +127,11 @@ pages live in [`docs/`](docs):
 | Document | What is in it |
 | --- | --- |
 | [User guide](docs/USER_GUIDE.md) | running, controls, launcher, settings, mods, LAN play, debug switches |
+| [Virtual reality](docs/VR.md) | OpenXR setup, VR settings and controls on Windows |
 | [Android](docs/ANDROID.md) | the mobile version: install, touch controls, building the APK |
+| [Modding](docs/MODDING.md) | limits lifted for modders: more interior lights, larger textures, additions OMSI 2 ignores |
 | [PBR materials](docs/PBR.md) | normal, roughness, metalness and occlusion maps for mods |
-| [Building](docs/BUILDING.md) | building from source on macOS, Windows and Linux |
+| [Building](docs/BUILDING.md) | building from source on macOS, Windows, Linux and Android |
 | [Content formats](docs/FORMATS.md) | every OMSI 2 file format |
 | [Architecture](docs/ARCHITECTURE.md) | crates, threading, renderer, roadmap |
 | [Routes](docs/ROUTES.md) | how the original runs timetables, chrono, HOF, IBIS |
@@ -184,10 +184,11 @@ Issues and pull requests are welcome - see [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Support
 
 openOMSI is made in free time. If you enjoy it and want to help it along, you can buy me a
-coffee - thank you!
+coffee or support it on Ko-fi - thank you!
 
 <p>
   <a href="https://buymeacoffee.com/usonskyyy"><img alt="Buy me a coffee" src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" height="48"></a>
+  <a href="https://ko-fi.com/usonance"><img alt="Support me on Ko-fi" src="https://storage.ko-fi.com/cdn/kofi2.png?v=3" height="48"></a>
 </p>
 
 ## License

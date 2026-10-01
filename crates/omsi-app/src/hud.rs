@@ -120,7 +120,7 @@ fn compose_row(img: &mut [u8], row: &[u8], width: u32, lh: u32, y0: u32) {
 /// `line` with the few characters the HUD font has no glyph for (DIN Narrow: `&` in line
 /// names like "5 & 5N", `_` in chrono folder names) written with ones it has.
 fn legible(font: &FontAtlas, line: &str) -> String {
-    let has = |c: char| font.font.glyph(c).is_some();
+    let has = |c: char| font.font.has_glyph(c);
     line.chars()
         .map(|c| match c {
             '&' if !has('&') => '+',

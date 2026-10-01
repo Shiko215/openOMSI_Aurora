@@ -12,6 +12,8 @@
 mod admin;
 mod discord;
 mod headtrack;
+#[cfg(windows)]
+mod openxr;
 #[cfg(target_os = "macos")]
 mod mac_hid;
 #[cfg(target_os = "android")]
@@ -62,6 +64,8 @@ mod camera_util;
 mod controllers;
 #[cfg(windows)]
 mod dinput;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod evdev_ff;
 mod cli;
 mod diagnostics;
 mod duty_start;
@@ -83,6 +87,7 @@ mod startup;
 mod traffic_link;
 mod tutorial;
 mod weather_setup;
+mod weather_cycle;
 mod world_load;
 
 // the interface's translations (locales/app.yml; the English text is the key)
@@ -94,7 +99,9 @@ const _LOCALES: &str = include_str!("../locales/app.yml");
 /// Show the interface in `code` (the settings' ENG / DEU / FRA / RUS).
 pub(crate) fn ui_language(code: &str) {
     omsi_ui::i18n::set_lookup(|lang, text| _rust_i18n_try_translate(lang, text).map(|t| t.into_owned()));
-    omsi_ui::i18n::set_language(omsi_launcher_lib::language_iso(code));
+    let iso = omsi_launcher_lib::language_iso(code);
+    omsi_ui::i18n::set_language(iso);
+    omsi_sim::vehicle_api::set_locale(iso);
 }
 
 use anyhow::{anyhow, Context, Result};
@@ -303,6 +310,16 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         args.situation = Some(tutorial::SITUATIONS[n - 1].to_string());
     }
     apply_situation(&mut args)?;
+    // `openomsi`: the official server, wherever its tunnel is today (see omsi_net::official)
+    if let Some(t) = args.lan_join.clone().filter(|t| omsi_net::official::is_alias(t)) {
+        match omsi_net::official::resolve_target(&t) {
+            Ok(url) => {
+                log::info!("LAN: the official server is at {url}");
+                args.lan_join = Some(url);
+            }
+            Err(e) => log::warn!("LAN: {e}"),
+        }
+    }
     // a duty starts at its trip, as in OMSI (not at the map's entry point); a joining
     // player's once the host's world is known (below): it was never placed at all, and
     // "Automatic" put it at the map's first entry point, the depot
@@ -393,6 +410,8 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         window: None,
         surface: None,
         renderer: None,
+        #[cfg(windows)]
+        vr: None,
         scene: None,
         camera: None,
         player: None,
@@ -428,24 +447,33 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         started: Instant::now(),
         total_frames: 0,
         mirror_budget: 1.0,
+        mirrors_seen: 2,
         mirror_turn: 0,
         hover_key: None,
         view,
         audio: None,
         ambience: None,
         cursor: (0.0, 0.0),
+        vr_cursor_physical: None,
+        vr_cursor_warp_pending: None,
+        window_focused: false,
         keys: Default::default(),
         door_key_triggers: Default::default(),
         last: Instant::now(),
         speed: 30.0,
         mouse_look: false,
+        buttons_held: (false, false),
+        both_drag: None,
+        vr_zoom_active: false,
         hover: None,
         hover_part: None,
+        hover_hand: false,
         input_script: parse_input_script(),
         shot: None,
         paused: false,
         game_menu: None,
         menu_top: None,
+        menu_scroll_drag: false,
         menu_more: false,
         plugin_keys: Vec::new(),
         clock_hold: 0.0,
@@ -478,9 +506,9 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         admin_list: None,
         list_kind: None,
         route_arrows: Default::default(),
-        game_keys: omsi_content::KeyboardCfg::load(&crate::startup::keyboard_cfg(&args_root_for_keys)).map(|k| k.game).unwrap_or_default(),
+        game_keys: omsi_content::KeyboardCfg::load(&crate::startup::keyboard_cfg(&args_root_for_keys)).map(|k| k.with_vr_defaults().game).unwrap_or_default(),
         own_keys: crate::startup::own_keys(&args_root_for_keys),
-        own_shift: crate::startup::own_bindings(&args_root_for_keys, 1),
+        own_shift: crate::startup::own_bindings(&args_root_for_keys, omsi_content::input::KEY_SHIFT),
         menu_prev_pause: false,
         info_bar: false,
         pending_time: None,
@@ -488,10 +516,13 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         autosave_t: 0.0,
         timetable: false,
         dragging: false,
+        html_pressed: None,
+        html_object_pressed: None,
         drag_delta: (0.0, 0.0),
         look: (0.0, 0.0),
         view_looks: Default::default(),
         look_view: String::new(),
+        cam_blend: Default::default(),
         view_zoom: Default::default(),
         orbit: ORBIT_DEFAULT,
         frames: 0,
@@ -501,6 +532,8 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         plugins: None,
         career: Default::default(),
         wetness: 0.0,
+        weather_blend: None,
+        weather_cycle: None,
         cursor_kind: 0,
         settings,
         lan: None,
@@ -508,6 +541,7 @@ pub(crate) fn make_app(mut args: Args, server_cfg: Option<server::ServerCfg>) ->
         spikes: 0,
         worst_ms: 0.0,
         governor: (0.0, 0, 0.0),
+        governor_low: 0,
         governor_wait_prev: 0.0,
         hidden_frames: 0,
         exiting: false,

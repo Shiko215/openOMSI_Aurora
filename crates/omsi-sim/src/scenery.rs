@@ -47,7 +47,7 @@ mod placement_tests {
         }));
         assert!(program.errors.is_empty(), "{:?}", program.errors);
         for name in ["BentenDaini_1", "BentenDaini_2", ""] {
-            let mut inst = SceneryInstance::new_with_strings(
+            let mut inst = SceneryInstance::new(
                 program.clone(), &[], crate::SimClock::default(), &[name.to_string()],
             );
             inst.update(0.0, &SceneryVars::default());
@@ -100,20 +100,18 @@ pub struct SceneryInstance {
     v_approach: Option<omsi_script::VarId>,
     v_switch: Option<omsi_script::VarId>,
     v_refresh: Option<omsi_script::VarId>,
+    pub html_textures: Vec<crate::htmltex::HtmlTexture>,
 }
 
 impl SceneryInstance {
-    /// `meshes`: (mesh definition, pivot) per rendered mesh.
-    pub fn new(program: Arc<Program>, meshes: &[(&MeshDef, Mat4)], clock: crate::SimClock) -> SceneryInstance {
-        Self::new_with_strings(program, meshes, clock, &[])
-    }
-
-    /// Map object strings follow the compiled stringvarnamelist order. Seed them
-    /// before init so scripts can derive texture filenames from placement data.
-    pub fn new_with_strings(program: Arc<Program>, meshes: &[(&MeshDef, Mat4)], clock: crate::SimClock, strings: &[String]) -> SceneryInstance {
+    /// `meshes`: (mesh definition, pivot) per rendered mesh; `strings`: the placed object's
+    /// strings from the map, which are its string variables in order, before the `{init}`
+    /// runs (Omsi.exe sub_7eea70 copies them into the object's string variables when it
+    /// is placed - a sign's label naming its picture, a display's stop).
+    pub fn new(program: Arc<Program>, meshes: &[(&MeshDef, Mat4)], clock: crate::SimClock, strings: &[String]) -> SceneryInstance {
         let mut state = State::new(&program);
-        for (dst, src) in state.str_vars.iter_mut().zip(strings) {
-            dst.clone_from(src);
+        for (v, s) in state.str_vars.iter_mut().zip(strings) {
+            v.clone_from(s);
         }
         let mut vm = Vm::new();
         let mut host = VehicleHost::new(clock);
@@ -142,6 +140,7 @@ impl SceneryInstance {
             visible_conds,
             mesh_transforms: vec![Mat4::IDENTITY; n],
             mesh_visible: vec![true; n],
+            html_textures: Vec::new(),
         }
     }
 
@@ -219,8 +218,75 @@ impl SceneryInstance {
         }
     }
 
+    /// Start the `[htmltexture]` pages of the object's model. `model_dir` is the folder of
+    /// the model config, `object_dir` the folder of the `.sco`.
+    pub fn init_html_textures(&mut self, defs: &[omsi_model::HtmlTextureDef], model_dir: &Path, object_dir: &Path) {
+        self.html_textures = crate::htmltex::scenery_pages(defs, model_dir, object_dir);
+    }
+
+    /// Give the pages the object's variables and time, apply what they did (variables,
+    /// triggers) and return their new pictures: (script texture index, width, height, RGBA).
+    pub fn update_html_textures(&mut self) -> Vec<(usize, u32, u32, Vec<u8>)> {
+        if self.html_textures.is_empty() {
+            return Vec::new();
+        }
+        let num: Vec<(String, f32)> = self.program.var_names.iter().enumerate().map(|(i, n)| (n.clone(), self.state.vars[i])).collect();
+        let strs: Vec<(String, String)> = self.program.str_var_names.iter().enumerate().map(|(i, n)| (n.clone(), self.state.str_vars[i].clone())).collect();
+        // (the basic API only: no vehicle, no depot)
+        let env = crate::vehicle_api::environment(&self.host.clock, &crate::vehicle_api::locale());
+        let departures = (!self.host.html_departures.is_empty()).then(|| crate::vehicle_api::departures(&self.host.html_departures));
+        let out = crate::htmltex::drive_pages(&mut self.html_textures, &num, &strs, None, &env, None, departures.as_ref());
+        for key in out.departure_wants {
+            self.host.want_departures(key);
+        }
+        self.apply_page_output(out.events, out.triggers);
+        out.frames
+    }
+
+    /// A press, release or move on page `script_index` (`u`/`v` 0..1 across it, `v` down
+    /// from the top). False when the object has no such page.
+    pub fn html_pointer(&mut self, script_index: usize, u: f32, v: f32, kind: crate::htmltex::PointerKind) -> bool {
+        match crate::htmltex::pointer_on(&mut self.html_textures, script_index, u, v, kind) {
+            Some((events, triggers)) => {
+                self.apply_page_output(events, triggers);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn apply_page_output(&mut self, events: Vec<(String, f32)>, triggers: Vec<String>) {
+        for (name, value) in events {
+            if !self.set_var(&name, value) {
+                log::debug!("htmltexture: the page sets {name}, which the object does not have");
+            }
+        }
+        for name in triggers {
+            if !self.trigger(&name) {
+                log::debug!("htmltexture: the page presses {name}, which the object does not have");
+            }
+        }
+    }
+
     /// Whether the script asks for the buses due at its stop (`GetArrBus*`).
     pub fn wants_arrivals(&self) -> bool {
         self.program.names.iter().any(|n| n.get(..9).map(|p| p.eq_ignore_ascii_case("getarrbus")).unwrap_or(false))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The map's strings of a placed object are its string variables, in order, before its
+    /// {init} runs; a script without that many string variables takes the first ones.
+    #[test]
+    fn the_map_strings_are_the_string_variables() {
+        let mut p = Program::default();
+        p.declare_str_var("A");
+        p.declare_str_var("B");
+        let inst = SceneryInstance::new(Arc::new(p), &[], crate::SimClock::default(), &["bss1\\14.jpg".into(), "x".into(), "ignored".into()]);
+        assert_eq!(inst.str_var("A"), "bss1\\14.jpg");
+        assert_eq!(inst.str_var("B"), "x");
     }
 }

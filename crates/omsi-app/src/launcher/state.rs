@@ -26,6 +26,9 @@ pub enum Msg {
     Installed(Result<core::install::Progress, String>),
     Join(serde_json::Value),
     Server { address: String, info: Result<omsi_net::ws::ServerInfo, String> },
+    /// A background job stopped on an error of its own (a panic): whatever it was loading
+    /// is not coming.
+    Crashed(String),
 }
 
 /// A server in the Multiplayer page's list (`~/.openomsi/servers.json`), as the player
@@ -52,6 +55,14 @@ fn host_status(code: &str) -> Result<omsi_net::ws::ServerInfo, String> {
     }
 }
 
+/// The list as saved, with the official server first when it is not in it.
+fn with_official(mut list: Vec<ServerEntry>) -> Vec<ServerEntry> {
+    if !list.iter().any(|s| omsi_net::official::is_alias(&s.address)) {
+        list.insert(0, ServerEntry { name: omsi_net::official::NAME.into(), address: omsi_net::official::ALIAS.into() });
+    }
+    list
+}
+
 fn servers_path() -> std::path::PathBuf {
     core::data_dir().join("servers.json")
 }
@@ -62,6 +73,8 @@ fn servers_path() -> std::path::PathBuf {
 pub struct Choice {
     pub bus: String,
     pub paint: String,
+    /// The number plate the player typed for the bus (empty: as the content says).
+    pub plate: String,
     pub hof: String,
     /// The depot file was chosen by hand (else it follows the map and the date).
     pub hof_manual: bool,
@@ -96,6 +109,7 @@ impl Default for Choice {
         Choice {
             bus: String::new(),
             paint: String::new(),
+            plate: String::new(),
             hof: String::new(),
             hof_manual: false,
             map: String::new(),
@@ -161,6 +175,10 @@ pub struct State {
     pub profile: Option<core::Profile>,
     pub settings: serde_json::Value,
     pub settings_dirty: f32,
+    /// `settings.cfg` as last read or written here: a game changes it too (its Options
+    /// in the pause menu), and the launcher's copy from before must not be written back
+    /// over that.
+    settings_file: Option<String>,
     pub keybindings: serde_json::Value,
     pub keybindings_error: String,
     pub instances: Vec<core::Instance>,
@@ -222,6 +240,7 @@ impl State {
             profile: None,
             settings,
             settings_dirty: 0.0,
+            settings_file: read_settings_file(),
             keybindings,
             keybindings_error: String::new(),
             instances: Vec::new(),
@@ -245,7 +264,7 @@ impl State {
             poll_t: 0.0,
             polling: false,
             second_armed: None,
-            servers: std::fs::read(servers_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default(),
+            servers: with_official(std::fs::read(servers_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()),
             server_info: Default::default(),
             server_asked: Default::default(),
             joined_server: None,
@@ -255,6 +274,12 @@ impl State {
         s.load_content();
         s.load_profiles();
         s.poll_now();
+        // (a phone runs the game in the launcher's process: a crash took both, and the
+        // launcher learns of it from the previous run's log)
+        #[cfg(target_os = "android")]
+        {
+            s.crash = crate::android::previous_run_crash();
+        }
         s
     }
 
@@ -269,7 +294,17 @@ impl State {
     fn spawn(&self, f: impl FnOnce() -> Msg + Send + 'static) {
         let tx = self.tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(f());
+            // (a job that panics - an odd file of some mod - sent nothing, and the page
+            // it was loading for said "loading" for ever: it says what went wrong instead)
+            let m = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|e| {
+                let why = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "an unknown error".into());
+                Msg::Crashed(why)
+            });
+            let _ = tx.send(m);
         });
     }
 
@@ -388,7 +423,9 @@ impl State {
         }
         self.choice.map = info.map.clone();
         self.choice.lan_mode = "join".into();
-        self.choice.lan_addr = address.to_string();
+        // (a server added by its bare address is joined where it answered: its web gateway)
+        let bare = omsi_net::ws::ws_url(address).is_none() && !omsi_net::official::is_alias(address);
+        self.choice.lan_addr = if bare && !info.reached_at.is_empty() { info.reached_at.clone() } else { address.to_string() };
         self.joined_server = Some(address.to_string());
         self.join = (true, format!("the server {}", info.name));
         self.join_checked = address.to_string();
@@ -429,6 +466,9 @@ impl State {
     }
 
     pub fn launch(&mut self) {
+        if !self.save_pending_settings() {
+            return;
+        }
         if !omsi_cfg::missing_original_essentials(std::path::Path::new(&self.config.root)).is_empty() {
             self.set_status("A session needs the original OMSI 2: choose its folder under Setup first.", true);
             return;
@@ -446,10 +486,20 @@ impl State {
             "join" => format!("join:{}", c.lan_addr.trim()),
             _ => "off".to_string(),
         };
+        // Joining: the host's map, as its status gives it (a code's host is asked when the
+        // code is typed). The game takes it from the host's welcome too, but only when that
+        // comes before the map is loaded: through a tunnel it came later, the game started
+        // on the map chosen here, and the players never met ("the host drives on X10 Berlin,
+        // you on Berlin-Spandau"). A map not installed here comes with the host's mods.
+        let host_map = (c.lan_mode == "join")
+            .then(|| self.joined_server.clone().unwrap_or_else(|| c.lan_addr.clone()))
+            .and_then(|k| self.server_info.get(&k).and_then(|x| x.1.as_ref().ok()).map(|i| i.map.trim().replace('\\', "/")))
+            .filter(|m| m.to_ascii_lowercase().contains("maps/"));
         core::Duty {
-            map: c.map.clone(),
+            map: host_map.unwrap_or_else(|| c.map.clone()),
             bus: c.bus.clone(),
             paint: Some(c.paint.clone()).filter(|p| !p.is_empty()),
+            plate: Some(c.plate.clone()).filter(|p| !p.trim().is_empty()),
             hof: Some(c.hof.clone()).filter(|p| !p.is_empty()),
             entry: Some(c.entry),
             line: if c.free { None } else { c.line.clone() },
@@ -485,6 +535,9 @@ impl State {
 
     /// Continue the situation the game left on the chosen map (`laststn.osn`).
     pub fn launch_last_situation(&mut self) {
+        if !self.save_pending_settings() {
+            return;
+        }
         let Some(file) = core::last_situation(&self.choice.map) else {
             self.set_status("No situation left on this map yet", true);
             return;
@@ -498,11 +551,46 @@ impl State {
 
     /// Start one of OMSI's tutorials (1..4).
     pub fn launch_tutorial(&mut self, n: usize) {
+        if !self.save_pending_settings() {
+            return;
+        }
         let mut d = self.duty();
         d.tutorial = Some(n);
         d.lan = Some("off".into());
         self.set_status("Starting the tutorial…", false);
         self.spawn(move || Msg::Launched(core::launch(&d).map_err(|e| format!("{e:#}"))));
+    }
+
+    /// Settings a game changed while it ran: taken over, unless the launcher's own changes
+    /// wait to be saved (those win, as the later ones).
+    fn reload_changed_settings(&mut self) {
+        if self.settings_dirty > 0.0 {
+            return;
+        }
+        let now = read_settings_file();
+        if now.is_some() && now != self.settings_file {
+            if let Ok(v) = core::get_settings() {
+                self.settings = v;
+            }
+            self.settings_file = now;
+        }
+    }
+
+    fn save_pending_settings(&mut self) -> bool {
+        if self.settings_dirty <= 0.0 {
+            return true;
+        }
+        match core::save_settings(&self.settings) {
+            Ok(()) => {
+                self.settings_dirty = 0.0;
+                self.settings_file = read_settings_file();
+                true
+            }
+            Err(e) => {
+                self.set_status(format!("Could not save settings: {e:#}"), true);
+                false
+            }
+        }
     }
 
     /// Something of the duty changed: remember it (soon) and refresh what depends on it.
@@ -519,6 +607,7 @@ impl State {
         if self.poll_t <= 0.0 {
             self.poll_t = 2.5;
             self.poll_now();
+            self.reload_changed_settings();
         }
         if self.choice_dirty > 0.0 {
             self.choice_dirty -= dt;
@@ -532,7 +621,10 @@ impl State {
             self.settings_dirty -= dt;
             if self.settings_dirty <= 0.0 {
                 match core::save_settings(&self.settings) {
-                    Ok(()) => self.set_status("Settings saved.", false),
+                    Ok(()) => {
+                        self.settings_file = read_settings_file();
+                        self.set_status("Settings saved.", false)
+                    }
                     Err(e) => self.set_status(format!("{e:#}"), true),
                 }
             }
@@ -546,7 +638,30 @@ impl State {
 
     fn handle(&mut self, m: Msg) {
         match m {
+            Msg::Crashed(why) => {
+                log::error!("launcher: a background job stopped: {why}");
+                self.loading_content = false;
+                self.loading_lines = false;
+                self.set_status(format!("Reading the content stopped on an error: {why}"), true);
+            }
             Msg::Server { address, info } => {
+                // the host of the code typed in: its map is the one the duty is chosen on
+                // (installed here: the line, tour and entry point of another map go)
+                if self.choice.lan_mode == "join" && self.joined_server.is_none() && address == self.choice.lan_addr {
+                    if let Ok(i) = &info {
+                        let theirs = i.map.trim().replace('\\', "/");
+                        if let Some((file, name)) = self.maps.iter().find(|m| m.file.eq_ignore_ascii_case(&theirs)).map(|m| (m.file.clone(), m.name.clone())) {
+                            if !self.choice.map.eq_ignore_ascii_case(&file) {
+                                self.choice.map = file;
+                                self.choice.line = None;
+                                self.choice.tour = None;
+                                self.choice.entry = 0;
+                                self.touched();
+                                self.set_status(format!("The host drives on {name}: that map is chosen"), false);
+                            }
+                        }
+                    }
+                }
                 self.server_info.insert(address, (Instant::now(), info));
             }
             Msg::Content(Ok((maps, vehicles, weathers))) => {
@@ -852,8 +967,13 @@ impl State {
     pub fn first_trip(&self) -> Option<usize> {
         let t = self.tour()?;
         let now = self.choice.time as f64 * 60.0;
-        t.trips.iter().position(|x| x.departure >= now - 120.0).or(if t.trips.is_empty() { None } else { Some(t.trips.len() - 1) })
+        trip_index_at(t, now)
     }
+}
+
+/// The trip a tour starts with at `now`, shared by the route preview and the launch choice.
+pub(super) fn trip_index_at(tour: &core::TourInfo, now: f64) -> Option<usize> {
+    tour.trips.iter().position(|x| x.departure >= now - 120.0).or(if tour.trips.is_empty() { None } else { Some(tour.trips.len() - 1) })
 }
 
 pub fn hhmm(seconds: f64) -> String {
@@ -900,14 +1020,28 @@ pub fn root_problem(root: &str) -> String {
 pub fn crash_of(log: &std::path::Path) -> Option<(String, String)> {
     let text = std::fs::read(log).ok()?;
     let text = String::from_utf8_lossy(&text[text.len().saturating_sub(64 * 1024)..]).to_string();
-    let lines: Vec<&str> = text.lines().collect();
+    let all: Vec<&str> = text.lines().collect();
+    // (the run itself only: an error the launcher logged before the game started - a
+    // preview's picture left out - titled the report of a game that died much later, and
+    // the phone's "died compiling a shader" hint never showed, #381, #331)
+    let lines: Vec<&str> = match all.iter().rposition(|l| l.contains("starting the game:")) {
+        Some(k) => all[k..].to_vec(),
+        None => all.clone(),
+    };
+    // (an error the game got over - "the game goes on", a part of the picture left out -
+    // is no crash)
+    let recovered = |l: &str| l.contains("the game goes on") || l.contains("left out") || l.contains("could not be recorded");
     // (a lost graphics device ends the game in order - it saves the run - but it is a crash
     // for the player all the same: the driver gave up)
+    // (one the game got over by starting again with safer graphics is no crash)
+    if lines.iter().any(|l| l.contains("starting again with safer graphics")) {
+        return None;
+    }
     let lost = lines.iter().rposition(|l| l.contains("the graphics device was lost"));
     if lost.is_none() && lines.iter().any(|l| l.contains("game ends")) {
         return None;
     }
-    let at = lost.or_else(|| lines.iter().rposition(|l| l.contains("the game stopped on an error") || l.contains(" ERROR ")))?;
+    let at = lost.or_else(|| lines.iter().rposition(|l| l.contains("the game stopped on an error") || (l.contains(" ERROR ") && !recovered(l))))?;
     let first = lines[at].split_once("] ").map(|x| x.1).unwrap_or(lines[at]).trim();
     // (a panic's message is on the following lines)
     let mut what = first.to_string();
@@ -918,8 +1052,23 @@ pub fn crash_of(log: &std::path::Path) -> Option<(String, String)> {
         what.push(' ');
         what.push_str(l.trim());
     }
-    let tail = lines[lines.len().saturating_sub(150)..].join("\n");
+    let tail = all[all.len().saturating_sub(150)..].join("\n");
     Some((what.chars().take(600).collect(), tail))
+}
+
+#[cfg(test)]
+mod choice_tests {
+    /// `launcher-duty.json` from before the number plate field: the missing key falls back to
+    /// the default (no plate), and a typed plate survives a round trip.
+    #[test]
+    fn an_old_duty_file_loads_and_a_typed_plate_is_kept() {
+        let old: super::Choice = serde_json::from_str(r#"{"bus":"Vehicles/x.bus","map":"maps/x/global.cfg"}"#).unwrap();
+        assert_eq!(old.plate, "");
+        let mut c = super::Choice::default();
+        c.plate = "B-AB 1234".into();
+        let back: super::Choice = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.plate, "B-AB 1234");
+    }
 }
 
 #[cfg(test)]
@@ -937,6 +1086,13 @@ mod crash_tests {
         assert!(super::crash_of(&p).is_none());
         std::fs::write(&p, "[t ERROR omsi_render] the graphics device was lost (Unknown): Unexpected error variant\n[t INFO openomsi_game::app_events] game ends\n").unwrap();
         assert!(super::crash_of(&p).unwrap().0.contains("device was lost"));
+        // an error before the game started, or one it got over, is not the crash
+        std::fs::write(&p, "[t ERROR omsi_render] a part of the picture could not be recorded (left out)\n[t INFO x] starting the game: omsi\n[t INFO omsi_render] renderer: compiling the sky and clouds shaders\n").unwrap();
+        assert!(super::crash_of(&p).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+fn read_settings_file() -> Option<String> {
+    std::fs::read_to_string(core::data_dir().join("settings.cfg")).ok()
 }

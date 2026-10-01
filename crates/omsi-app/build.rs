@@ -19,6 +19,12 @@ fn main() {
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
     windows_icon();
+    // (the executable exports the two switchable-graphics hints of main.rs, see there)
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        for sym in ["NvOptimusEnablement", "AmdPowerXpressRequestHighPerformance"] {
+            println!("cargo:rustc-link-arg-bin=openomsi=/EXPORT:{sym},DATA");
+        }
+    }
 }
 
 /// `MAJOR.MINOR` from the VERSION file, then the number of commits since that file last

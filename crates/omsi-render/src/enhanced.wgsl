@@ -52,6 +52,15 @@ fn to_cube(d: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(d.x, d.z, d.y);
 }
 
+// What a raindrop on a pane shows (`rain_light`): the sky probe that way, blurred a little
+// by the drop's small lens, and low down the street's light in place of the probe's
+// horizon (see the reflections in `shade_enhanced`).
+fn rain_env_enhanced(d: vec3<f32>, lod: f32) -> vec3<f32> {
+    let e = textureSampleLevel(t_probe, s_lin, to_cube(d), lod).rgb * enh.fog_color.w;
+    let surround = enh.fog_color.rgb * (0.25 / 0.9);
+    return mix(surround, e, smoothstep(-0.05, 0.35, d.z));
+}
+
 // A fixed, deterministic PCF kernel (shader.wgsl's SHADOW_OFFSETS). The old PCSS blocker
 // search was unstable for alpha-tested foliage: a few leaves entering or leaving its
 // 12-sample search changed the penumbra radius, producing checkerboard patches and
@@ -252,8 +261,9 @@ fn perturb_normal(n: vec3<f32>, p: vec3<f32>, uv: vec2<f32>, tn: vec3<f32>) -> v
     return safe_normal(t * k * tn.x + b * k * tn.y + n * max(tn.z, 0.05));
 }
 
-// The enhanced pass's two targets: the picture, and the screen mask (1 on the bus's own
-// screens, carried by the coverage of what is drawn over them; see MASK_FORMAT).
+// The enhanced pass's two targets: the picture, and the screen mask (r: 1 on the bus's own
+// screens, carried by the coverage of what is drawn over them; g: 1 on an LED panel's own
+// dots, see MASK_FORMAT).
 struct EnhancedOut {
     @location(0) color: vec4<f32>,
     @location(1) mask: vec4<f32>,
@@ -263,26 +273,36 @@ struct EnhancedOut {
 fn fs_enhanced(in: VsOut) -> EnhancedOut {
     let c = shade_enhanced(in);
     let screen = material.flags.x > 0.5;
+    // an LED panel's dots stay in the glow's source (`post.wgsl`), the other screens'
+    // letters stay out of it
+    let led = select(0.0, 1.0, material.emissive.w < -1.5);
     var out: EnhancedOut;
     out.color = c;
-    out.mask = vec4<f32>(select(0.0, 1.0, screen), 0.0, 0.0, select(c.a, 1.0, screen));
+    out.mask = vec4<f32>(select(0.0, 1.0, screen), led, 0.0, select(c.a, 1.0, screen));
     return out;
 }
 
 fn shade_enhanced(in: VsOut) -> vec4<f32> {
     if (material.emissive.w > 1.5) {
-        // a pane's film of water: drops, not the sliding texture (see `rain_drops`), lit by
-        // the sky they mirror
-        let wet = in.params.x;
-        let d = rain_drops(in.world, in.uv - in.params.zw, safe_normal(in.normal), wet, camera.post.y);
-        let light = (sh_irradiance(vec3<f32>(0.0, 0.0, 1.0)) * 0.6 + enh.sun.rgb * 0.08) / PI;
+        // a pane's film of water: drops, not the sliding texture (see `rain_glass`), each a
+        // lens that mirrors the sky probe and shows it upside down through itself
         let v = camera.cam_pos.xyz - in.world;
+        let vn = normalize(v);
+        let in_cab = inside_vehicle(camera.cam_pos.xyz) * near_player_vehicle(in.world) > 0.5;
+        let g = rain_glass(in.world, in.uv - in.params.zw, in.normal, in.params.x, camera.post.y, in_cab);
+        let through = rain_through(g, vn);
+        let valid = dot(through, through) > 1e-4;
+        // (the picture behind is as the HDR pass drew it: exposed already)
+        let seen = select(vec3<f32>(0.0), rain_behind(in.world, through, rain_env_enhanced(normalize(select(g.out, through, valid)), 2.0), 1.0 / max(enh.exposure.x, 1e-6)), valid);
+        let mirrored = rain_env_enhanced(reflect(-vn, g.n), 1.0);
+        let d = rain_light(g, vn, through, mirrored, seen, sh_irradiance(g.out) / PI * 0.9, enh.sun.rgb / PI);
         let aer = air(-normalize(v), fog_distance(in.world), camera.cam_pos.z - enh.fog.z, in.world.z - enh.fog.z);
         // Drops a few pixels across are a pane's sparkle close up; further off each
         // darker rim was a black fleck, and a bus seen from the pavement in the rain wore
-        // windows peppered black. They fade out over the first dozen metres.
-        let near = 1.0 - smoothstep(4.0, 12.0, length(v));
-        return vec4<f32>(d.rgb * light * enh.exposure.x * 2.0 * aer.a, d.a * near);
+        // windows peppered black. Drops smaller than a pixel give way to the mist now
+        // (`rain_dome`), and the rest fade out over the first fifteen metres.
+        let near = 1.0 - smoothstep(5.0, 15.0, length(v));
+        return vec4<f32>(d.rgb * enh.exposure.x * aer.a, d.a * near);
     }
     // --- the surface's texture and alpha, exactly as the vanilla pass reads them
     let terrain = material.extra.x > 0.5;
@@ -290,14 +310,22 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
     if (terrain) {
         duv = in.uv * material.extra.z;
     }
-    var tex = textureSample(t_diffuse, s_diffuse, duv);
+    var tex = diffuse_border(textureSample(t_diffuse, s_diffuse, duv), duv);
     let diffuse_a = tex.a;
+    // (without the [texcoordtransX/Y] offset: the transmap, night map and light map stay
+    // in place, see fs_main)
+    let buv = in.uv - in.params.zw;
     if (terrain && material.extra.y > 0.0) {
         let det = textureSample(t_light, s_diffuse, in.uv * material.extra.y);
         tex = vec4<f32>(clamp(tex.rgb * det.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), tex.a);
     }
     if (material.params.z > 0.5) {
-        let tm = textureSample(t_trans, s_diffuse, in.uv);
+        // (an LED panel with the mip path switched off - `Lighting::led_mips` - takes its
+        // `\S:n` mask at full resolution: its dots stay dots when the panel is small)
+        var tm = textureSample(t_trans, s_diffuse, buv);
+        if (material.emissive.w < -1.5 && enh.led.y < 0.5) {
+            tm = textureSampleLevel(t_trans, s_diffuse, buv, 0.0);
+        }
         tex.a = select(1.0, tm.a, material.params.w > 0.5);
         if (terrain && material.params.x > 1.5) {
             let lum = dot(tex.rgb, vec3<f32>(0.333, 0.333, 0.333));
@@ -306,17 +334,19 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
         }
     }
     let mode = material.params.x;
-    // Keep the cutoff identical to the camera depth prepass and shadow caster, but feed
-    // alpha-to-coverage a continuous edge. A hard comparison on a mip-filtered foliage card
-    // turns one texel of the silhouette on/off as the camera moves; that is the white
-    // sparkle and crawling outline seen on trees and fences in Enhanced. The 4x MSAA scene
-    // pipeline converts this ramp to stable coverage while fully opaque texels remain 1.
+    // Keep the filtered fractional coverage, but tighten its transition around the cutout
+    // edge before MSAA turns it into sample coverage. The MSAA depth prepass skips these
+    // draws so uncovered samples keep the depth and colour of the scene behind them.
     if (ALPHA_TEST && mode > 0.5 && mode < 1.5) {
-        let aa = max(fwidth(tex.a) * 0.5, 1.0 / 255.0);
-        if (tex.a < 0.5 - aa) {
+        if (ALPHA_TO_COVERAGE) {
+            let aa = max(fwidth(tex.a) * 0.5, 1.0 / 255.0);
+            if (tex.a < 0.5 - aa) {
+                discard;
+            }
+            tex.a = smoothstep(0.5 - aa, 0.5 + aa, tex.a);
+        } else if (tex.a < 0.5) {
             discard;
         }
-        tex.a = smoothstep(0.5 - aa, 0.5 + aa, tex.a);
     }
     var alpha = tex.a * material.color.a;
     if (mode < 0.5) {
@@ -365,14 +395,17 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
     let glass = mode > 1.5 && material.bump.z > 0.5 &&
         (has_env || material.params.z > 0.5 || material.emissive.w > 0.5);
     let painted_transmap = material.params.z > 0.5 && !glass;
-    let painted_body = mode < 1.5 || painted_transmap;
     // An envmap on opaque vehicle paint is legacy material data, not a request to make
     // the whole body behave like glass. Keep the diffuse/sun response, but use the
     // ordinary rough dielectric path for the body.
     // Foliage and other alpha-tested assets are diffuse silhouettes, not polished surfaces.
     // Letting the generic probe term reflect them creates white sparkles at grazing angles;
     // the photographed envmap is reserved for materials that explicitly request it.
-    let reflective_env = has_env && !painted_body && !thin;
+    // (opaque materials reflect as well - chrome handrails, bumpers and wheel trims are
+    // opaque with a sphere map, and left out they showed no reflection at all in the
+    // enhanced picture, #266 - but through the clear-coat path below: metal only where a
+    // mask of its own says so)
+    let reflective_env = has_env && !painted_transmap && !thin;
     // see-through glass is seen from either side: from inside the bus its normal points
     // away (the vanilla pass takes the angle either way round too); taken as it is, the
     // grazing Fresnel turned the whole windscreen into a milky mirror
@@ -419,9 +452,10 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
         // the pane instead of leaving a flat pale surface at normal incidence.
         rough = 0.04;
         // the pane's [matl_envmap] factor says how much it mirrors (its alpha is its
-        // transparency, never a mask): 0.4 on the Scania's panes, which the fixed 0.08
-        // left looking like empty frames
-        f0 = vec3<f32>(clamp(0.06 + 0.2 * min(material.params2.y, 1.0), 0.08, 0.26));
+        // transparency, never a mask): from glass's own 4 % up to 12 % for a factor of 1
+        // (0.4 on the Scania's panes). Up to 26 % as before, every window of every bus
+        // was a mirror - far more than the original's panes reflect (issue #176).
+        f0 = vec3<f32>(clamp(0.04 + 0.08 * min(material.params2.y, 1.0), 0.04, 0.12));
     } else if (reflective_env) {
         // Paint reflects its few per cent through a smooth clear coat; much more than a few
         // per cent is polished metal - but only where the model says so with a mask of its
@@ -429,10 +463,11 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
         // no mask, which OMSI takes as "reflect the sphere map fully" and not as chrome:
         // read as metalness it made a Golf's bonnet a mirror, in which the envmap photo's
         // trees stood as contour lines across the paint at close range.
-        let masked = material.params2.w > 0.5;
-        metal = select(0.0, smoothstep(0.3, 0.85, refl), masked);
+        let masked = (u32(material.params2.w + 0.5) & 1u) != 0u;
+        let metal_ok = (u32(material.params2.w + 0.5) & 4u) != 0u;
+        metal = select(0.0, smoothstep(0.3, 0.85, refl), masked || metal_ok);
         f0 = mix(vec3<f32>(clamp(refl, 0.02, 0.08)), mix(albedo, vec3<f32>(1.0), 0.4) * refl, metal);
-        rough = mix(max(0.3 - 0.12 * smoothstep(0.0, 0.25, refl), select(0.22, 0.0, masked)), 0.14, metal);
+        rough = mix(max(0.3 - 0.12 * smoothstep(0.0, 0.25, refl), select(0.22, 0.0, masked || metal_ok)), 0.14, metal);
     } else if (!thin && material.specular.w > 0.0 && dot(material.specular.rgb, vec3<f32>(1.0)) > 0.05) {
         // the o3d material's Blinn-Phong power as GGX roughness
         rough = clamp(sqrt(sqrt(2.0 / (material.specular.w + 2.0))), 0.4, 0.9);
@@ -671,7 +706,14 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
     let spec_occ = clamp(pow(nv + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao, 0.0, 1.0);
     // (a PBR set's roughness or metalness map says how it reflects: the probe, as for an envmap)
     let pbr_reflects = (material.pbr.z > 0.5 || material.pbr.w > 0.5) && !terrain;
-    var reflection = select(vec3<f32>(0.0), env * env_brdf(f0, rough, nv) * spec_occ, reflective_env || glass || pbr_reflects);
+    // (a wet road mirrors the sky probe as well; and what reflects nothing keeps the light
+    // the Fresnel term took off its ambient above - at a grazing angle that term is near 1,
+    // and the far road and ground went dark with no reflection in its place, #374)
+    let reflects = reflective_env || glass || pbr_reflects || wet_road > 0.0;
+    var reflection = select(vec3<f32>(0.0), env * env_brdf(f0, rough, nv) * spec_occ * select(1.0, wet_road, !(reflective_env || glass || pbr_reflects)), reflects);
+    if (!reflects) {
+        ambient = e_amb * sf.albedo / PI;
+    }
     if (glass) {
         // Transparent bus panes need a readable outside reflection from the driver's
         // viewpoint; opaque paint must never receive this boost.
@@ -688,7 +730,8 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
     // grew with the night and whitened the saloon)
     // (the lamps' light does not reach into the gaps under the seats and round the
     // handrails either: without the ambient occlusion on it they glowed through there)
-    let cabin = sf.albedo * interior_lamps(in.world, n, in.params2.z) * mix(1.0, ao, 0.85);
+    let cabin_light = interior_lamps(in.world, n, in.params2.z);
+    let cabin = sf.albedo * cabin_light * mix(1.0, ao, 0.85);
     var rgb = (direct + ambient + lamps) * pre + cabin;
     var emit = tex.rgb * material.emissive.rgb * max(enh.exposure.z * 2.0, 0.8);
     // (the tile light map on the splines and [LightMapMapping] objects is the vanilla
@@ -696,7 +739,7 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
     // other surface - added on top it lit the roads twice, with a hard edge where a road
     // met a square that is an object)
     if (material.extra.w > 0.5) {
-        let nuv = select(duv, vec2<f32>(in.uv.x, 1.0 - in.uv.y), terrain);
+        let nuv = select(buv, vec2<f32>(in.uv.x, 1.0 - in.uv.y), terrain);
         let switched = material.extra.w > 1.5;
         let night = select(camera.sun_color.w, 1.0, switched);
         // (a switched one is the display's own state: not dimmed with the instance's night
@@ -712,11 +755,25 @@ fn shade_enhanced(in: VsOut) -> vec4<f32> {
         }
     }
     if (material.params2.x > 0.5 && !terrain) {
-        // [matl_lightmap]: the cabin lamps and displays, visible by day as well
-        let lm = textureSample(t_light, s_diffuse, duv).rgb;
-        emit = emit + tex.rgb * lm * clamp(in.params2.x, 0.0, 1.0) * max(enh.exposure.z * 2.0, 0.6);
+        // [matl_lightmap]: laid onto the light with ADDSMOOTH in Omsi.exe (see the vanilla
+        // shader), so it adds what the surface's own light leaves: little by day, fully at
+        // night, and less where the saloon lamps light the surface already. (As an emission
+        // at 0.6 of the texture by day and on top of the lamps at night, a switched-on
+        // cabin's light-mapped parts were flat white.)
+        let lm = textureSample(t_light, s_diffuse, buv).rgb;
+        let night = clamp(camera.sun_color.w, 0.0, 1.0);
+        let left = (vec3<f32>(1.0) - clamp(cabin_light, vec3<f32>(0.0), vec3<f32>(1.0))) * (0.12 + 0.88 * night);
+        emit = emit + tex.rgb * lm * left * clamp(in.params2.x, 0.0, 1.0) * max(enh.exposure.z * 2.0, 0.6);
     }
-    if (material.emissive.w < -0.5) {
+    if (material.emissive.w < -1.5) {
+        // an LED panel (see MaterialExtra::led): the lit dots - the alpha the `\S:n` script
+        // texture carries, in the colour of the panel's own texture - are the panel's own
+        // light, drawn as bright as the settings ask for (`Led glow`, 16 levels, 0 = off).
+        // The glow takes them where it leaves every other screen out of its source
+        // (`post.wgsl`) and blooms a halo around the panel. (Kept at their own brightness
+        // however the metering treats the scene, as a display's text is.)
+        emit = emit + tex.rgb * enh.led.x * alpha * max(enh.exposure.z * 2.0, 0.8);
+    } else if (material.emissive.w < -0.5) {
         // a display's text (see MaterialExtra::display)
         emit = emit + tex.rgb * 0.35 * max(enh.exposure.z * 2.0, 0.8);
     }

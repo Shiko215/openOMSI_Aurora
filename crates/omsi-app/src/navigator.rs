@@ -35,6 +35,7 @@ use crate::traffic::Traffic;
 // --- colours (sRGB) -------------------------------------------------------------------
 
 // neutral dark, half transparent, calm
+const NAV_REDRAW_S: f32 = 1.0 / 30.0;
 const PANEL: Color = Color::rgba(10, 10, 10, 0.70);
 const BAR: Color = Color::rgba(0, 0, 0, 0.35);
 const ROAD_CASING: Color = Color::rgba(30, 30, 30, 0.9);
@@ -183,6 +184,7 @@ struct Roads {
 }
 
 pub struct Navigator {
+    drawn_at: f32,
     pub enabled: bool,
     /// The next stops with their times under the map (Shift+N cycles map, map and
     /// schedule, off).
@@ -240,7 +242,7 @@ pub struct Navigator {
     shown: f32,
     /// The trip's next stops (place, name, the bus's heading there) and where the bus is,
     /// for the route arrows.
-    stop_spots: Vec<(DVec3, String, f64)>,
+    stop_spots: Vec<(DVec3, String, f64, i64)>,
     bus_at: DVec3,
     next_turn: Option<(i32, f32, f64, Option<String>)>,
     /// The street the bus is on.
@@ -294,6 +296,7 @@ fn ease(dt: f32, tau: f32) -> f64 {
 impl Navigator {
     pub fn new(enabled: bool, opacity: f32, corner: &str) -> Navigator {
         Navigator {
+            drawn_at: f32::MIN,
             enabled,
             schedule: false,
             speed_avg: 8.0,
@@ -761,7 +764,7 @@ impl Navigator {
         };
         self.follow(f);
         self.bus_at = f.bus;
-        self.stop_spots = f.stops.iter().take(3).map(|st| (st.position, st.name.clone(), f.heading)).collect();
+        self.stop_spots = f.stops.iter().take(3).map(|st| (st.position, st.name.clone(), f.heading, st.object_id)).collect();
         if omsi_cfg::env::var_os("OMSI_DEBUG_NAV").is_some() && (self.time % 1.0) < f.dt {
             log::info!("navigator: route {} lanes (complete {}, provisional {}, at {}, on it {}, off for {:.1} s), {} stops ahead, next {:?}, key {:?}", self.route.lanes.len(), self.route.complete, self.route.provisional, self.route.progress, self.route.on_route, self.route.off_for, f.stops.len(), f.stops.first().map(|s| (s.name.clone(), s.position.x.round(), s.position.y.round())), self.route.key);
         }
@@ -823,9 +826,10 @@ impl Navigator {
         let y0 = if top { margin } else { sh - margin - ph };
 
         if self.gpu.is_none() {
-            self.gpu = Some(Gpu::new(&renderer.device, renderer.format(), 4, self.atlas.size));
+            self.gpu = Some(Gpu::new(&renderer.device, renderer.format(), 1, self.atlas.size));
         }
-        if self.target.map(|t| (t.1, t.2) != (w, h)).unwrap_or(true) {
+        let resized = self.target.map(|t| (t.1, t.2) != (w, h)).unwrap_or(true);
+        if resized {
             if let Some((t, _, _)) = self.target.take() {
                 renderer.free_texture(scene, t);
                 scene.premultiplied.remove(&t);
@@ -836,7 +840,10 @@ impl Navigator {
         }
         let (tex, _, _) = self.target.unwrap();
         let Some(view) = renderer.texture_view(scene, tex) else { return };
-        self.draw(renderer, &view, (w, h), map_h, f);
+        if resized || self.city.open || self.time - self.drawn_at >= NAV_REDRAW_S {
+            self.drawn_at = self.time;
+            self.draw(renderer, &view, (w, h), map_h, f);
+        }
         // (the small navigator steps aside while the city map is open)
         if !self.city.open {
             scene.overlays.push((tex, [x0, y0, x0 + pw, y0 + ph]));
@@ -1645,7 +1652,7 @@ pub(crate) fn way_back(net: &Network, bus: DVec3, heading: f64, ahead: &[usize],
     impl Eq for Node {}
     impl Ord for Node {
         fn cmp(&self, o: &Self) -> Ordering {
-            o.0.partial_cmp(&self.0).unwrap_or(Ordering::Equal)
+            o.0.total_cmp(&self.0)
         }
     }
     impl PartialOrd for Node {
@@ -1739,7 +1746,8 @@ impl Navigator {
     /// (`L`, `R`, or `dn` for straight on), and the stops of the trip ahead with their
     /// names (`busstop`). Each: a key that stays the same while it is ahead, the place,
     /// the heading, the kind and its text.
-    pub fn arrow_spots(&self, traffic: Option<&Network>, reach: f64) -> Vec<(u64, DVec3, f64, &'static str, String)> {
+    /// `stop_pose` gives a stop object's place and heading where its tile is loaded.
+    pub fn arrow_spots(&self, traffic: Option<&Network>, reach: f64, stop_pose: &dyn Fn(i64) -> Option<(DVec3, f64)>) -> Vec<(u64, DVec3, f64, &'static str, String)> {
         let mut out = Vec::new();
         if !self.arrows {
             return out;
@@ -1780,10 +1788,15 @@ impl Navigator {
             prev_end = Some(h1);
             acc += len as f64;
         }
-        for (k, (p, name, h)) in self.stop_spots.iter().enumerate() {
-            let d = (*p - self.bus_at).truncate().length();
+        // The stop's helper: Omsi.exe puts `routearrows_busstop.sco` on the stop object
+        // itself, at its place and with its rotation (0x61fc04: the station record's
+        // position +0x3c and quaternion +0x54) - where and how the mapper set the stop down,
+        // not turned to the bus as it comes.
+        for (k, (p, name, h, id)) in self.stop_spots.iter().enumerate() {
+            let (p, h) = stop_pose(*id).unwrap_or((*p, *h));
+            let d = (p - self.bus_at).truncate().length();
             if d < reach && k < 2 {
-                out.push(((1u64 << 40) + p.x.to_bits().rotate_left(7) ^ p.y.to_bits(), *p, *h, "busstop", name.clone()));
+                out.push(((1u64 << 40) + p.x.to_bits().rotate_left(7) ^ p.y.to_bits() ^ h.to_bits(), p, h, "busstop", name.clone()));
             }
         }
         out
@@ -1890,7 +1903,7 @@ impl Navigator {
         self.city.rect = [x0, y0, x0 + w, y0 + h];
         let (tw, th) = (w as u32, h as u32);
         if self.gpu.is_none() {
-            self.gpu = Some(Gpu::new(&renderer.device, renderer.format(), 4, self.atlas.size));
+            self.gpu = Some(Gpu::new(&renderer.device, renderer.format(), 1, self.atlas.size));
         }
         if self.city.target.map(|t| (t.1, t.2) != (tw, th)).unwrap_or(true) {
             if let Some((t, _, _)) = self.city.target.take() {

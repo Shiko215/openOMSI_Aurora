@@ -82,6 +82,7 @@ enum Role {
     Wheel(f32, f32),
     Throttle,
     Brake,
+    Clutch,
     /// Walking or flying the free camera (W A S D from the stick).
     Stick,
     /// A switch of the cockpit held by the finger.
@@ -128,6 +129,9 @@ pub struct Touch {
     wheel_r: f32,
     throttle_r: Rect,
     brake_r: Rect,
+    /// A manual gearbox's clutch pedal (zero-sized when the settings work the clutch).
+    clutch_r: Rect,
+    clutch: f32,
     stick_c: Vec2,
     stick_r: f32,
     /// Physical pixels per point of the layout.
@@ -164,6 +168,8 @@ impl Touch {
             wheel_r: 1.0,
             throttle_r: Rect::new(0.0, 0.0, 0.0, 0.0),
             brake_r: Rect::new(0.0, 0.0, 0.0, 0.0),
+            clutch_r: Rect::new(0.0, 0.0, 0.0, 0.0),
+            clutch: 0.0,
             stick_c: Vec2::ZERO,
             stick_r: 1.0,
             u: 1.0,
@@ -277,20 +283,71 @@ impl App {
             t.throttle_r = Rect::new(w - pad - 64.0 * u, h - pad - th, 64.0 * u, th);
             let bh = 112.0 * u;
             t.brake_r = Rect::new(t.throttle_r.x - 14.0 * u - 80.0 * u, h - pad - bh, 80.0 * u, bh);
-            // the gearbox above the pedals: an automatic's R N D, else a manual's - N +
-            let gears: Vec<(&'static str, &'static str)> = if has("automatic_D") {
+            // the gearbox above the pedals: an automatic's R N D, a sequential lever's - N +,
+            // else a manual's whole gate - R, N and every gear its script has (`kw_s_1` ...),
+            // in two rows as the H of the lever (R 1 3 5 over N 2 4 6)
+            const MANUAL: [(&str, &str); 10] = [("kw_s_R", "R"), ("kw_s_N", "N"), ("kw_s_1", "1"), ("kw_s_2", "2"), ("kw_s_3", "3"), ("kw_s_4", "4"), ("kw_s_5", "5"), ("kw_s_6", "6"), ("kw_s_7", "7"), ("kw_s_8", "8")];
+            // (the kind of gearbox by what the bus's own scripts answer to: every key of
+            // the keyboard layout is bound whatever the bus, the automatic's D included)
+            let scripted = |name: &str| p.vehicle.ty.program.trigger(name).is_some();
+            // (a manual's scripts answer to the gear keys; the LiAZ's KPP has - and + too, and
+            // triggers up to 10 whatever its box has: `antrieb_number_gears` says how many)
+            // (a dashboard script answers to the automatic's keys for its own display on a
+            // manual bus as well - the Sprinter W906 MT showed R N D, #279: a gearbox
+            // script that reads the clutch pedal is a manual one)
+            let program = &p.vehicle.ty.program;
+            let manual = program.manual_gearbox();
+            let count = p.vehicle.ty.program.constant("antrieb_number_gears").map(|n| n.round() as usize).filter(|n| (1..=8).contains(n));
+            let gears: Vec<(&'static str, &'static str)> = if manual {
+                MANUAL.iter().copied().enumerate().filter(|(k, (a, _))| {
+                    matches!(*a, "kw_s_N") || (scripted(a) && count.is_none_or(|n| *k < n + 2))
+                }).map(|(_, g)| g).collect()
+            } else if has("automatic_D") {
                 vec![("automatic_R", "R"), ("automatic_N", "N"), ("automatic_D", "D")]
             } else if has("kw_s_plus") {
                 vec![("kw_s_minus", "−"), ("kw_s_N", "N"), ("kw_s_plus", "+")]
             } else {
                 vec![("kw_s_R", "R"), ("kw_s_N", "N"), ("kw_s_1", "1")]
             };
-            let gw = (t.throttle_r.right() - t.brake_r.x) / 3.0;
-            let gy = t.throttle_r.y - 10.0 * u - 40.0 * u;
-            for (k, (action, letter)) in gears.iter().enumerate() {
-                let on = t.gear == Some(*letter) && matches!(*letter, "R" | "N" | "D");
-                push(&mut b, Btn::Gear(action, letter), Rect::new(t.brake_r.x + gw * k as f32 + 3.0 * u, gy, gw - 6.0 * u, 40.0 * u), "", letter, on, false);
+            // (the top of the gearbox: the doors go above it)
+            let gy;
+            if manual && gears.len() > 3 {
+                // the gear engaged, as the lever's script has it
+                let engaged = p.vehicle.var("antrieb_getr_aktugang").or_else(|| p.vehicle.var("antrieb_getr_gang")).map(|g| g.round() as i32);
+                let label_of = |g: i32| match g {
+                    -1 => "R",
+                    0 => "N",
+                    g => MANUAL.get(g as usize + 1).map(|x| x.1).unwrap_or(""),
+                };
+                let cols = gears.len().div_ceil(2);
+                let gw = (t.throttle_r.right() - t.brake_r.x) / cols as f32;
+                let gh = 36.0 * u;
+                let top = t.throttle_r.y - 10.0 * u - 2.0 * gh - 6.0 * u;
+                gy = top;
+                for (k, (action, letter)) in gears.iter().enumerate() {
+                    let (col, row) = (k / 2, k % 2);
+                    let on = match engaged {
+                        Some(g) => label_of(g) == *letter,
+                        None => t.gear == Some(*letter),
+                    };
+                    push(&mut b, Btn::Gear(action, letter), Rect::new(t.brake_r.x + gw * col as f32 + 3.0 * u, top + row as f32 * (gh + 6.0 * u), gw - 6.0 * u, gh), "", letter, on, false);
+                }
+            } else {
+                let gw = (t.throttle_r.right() - t.brake_r.x) / 3.0;
+                gy = t.throttle_r.y - 10.0 * u - 40.0 * u;
+                for (k, (action, letter)) in gears.iter().enumerate() {
+                    let on = t.gear == Some(*letter) && matches!(*letter, "R" | "N" | "D");
+                    push(&mut b, Btn::Gear(action, letter), Rect::new(t.brake_r.x + gw * k as f32 + 3.0 * u, gy, gw - 6.0 * u, 40.0 * u), "", letter, on, false);
+                }
             }
+            // a manual without the automatic clutch of the settings: its clutch pedal, left of
+            // the brake's buttons
+            t.clutch_r = if manual && !self.settings.auto_clutch {
+                let ch = 112.0 * u;
+                Rect::new(t.brake_r.x - 14.0 * u - 50.0 * u - 14.0 * u - 64.0 * u, h - pad - ch, 64.0 * u, ch)
+            } else {
+                Rect::new(0.0, 0.0, 0.0, 0.0)
+            };
             // the brakes left of the brake pedal
             let br = 25.0 * u;
             let bx = t.brake_r.x - 14.0 * u - br;
@@ -364,7 +421,7 @@ impl App {
         }
     }
 
-    fn finger_down(&mut self, event_loop: &ActiveEventLoop, id: u64, p: Vec2) {
+    pub(crate) fn finger_down(&mut self, event_loop: &ActiveEventLoop, id: u64, p: Vec2) {
         self.touch.fingers.retain(|f| f.id != id);
         let menu_mode = self.game_menu.is_some() || self.chooser.is_some() || self.navigator.as_ref().is_some_and(|n| n.map_open());
         let t = &self.touch;
@@ -380,6 +437,8 @@ impl App {
             Role::Throttle
         } else if self.player.is_some() && t.stick_r == 0.0 && !t.hidden && t.brake_r.pad(6.0 * t.u, 6.0 * t.u).contains(p) {
             Role::Brake
+        } else if self.player.is_some() && t.stick_r == 0.0 && !t.hidden && t.clutch_r.w > 0.0 && t.clutch_r.pad(6.0 * t.u, 6.0 * t.u).contains(p) {
+            Role::Clutch
         } else if self.player.is_some() && t.stick_r == 0.0 && !t.hidden && !t.tilt && p.distance(t.wheel_c) <= t.wheel_r * 1.15 {
             {
                 let d = p - t.wheel_c;
@@ -421,7 +480,7 @@ impl App {
         }
     }
 
-    fn finger_move(&mut self, id: u64, p: Vec2) {
+    pub(crate) fn finger_move(&mut self, id: u64, p: Vec2) {
         let u = self.touch.u;
         let Some(k) = self.touch.fingers.iter().position(|f| f.id == id) else { return };
         let last = self.touch.fingers[k].pos;
@@ -511,7 +570,7 @@ impl App {
         }
     }
 
-    fn finger_up(&mut self, event_loop: &ActiveEventLoop, id: u64, p: Vec2, cancelled: bool) {
+    pub(crate) fn finger_up(&mut self, event_loop: &ActiveEventLoop, id: u64, p: Vec2, cancelled: bool) {
         let Some(k) = self.touch.fingers.iter().position(|f| f.id == id) else { return };
         let f = self.touch.fingers.remove(k);
         if self.touch.fingers.iter().filter(|f| matches!(f.role, Role::Look | Role::Mouse)).count() < 2 {
@@ -528,6 +587,7 @@ impl App {
             Role::Wheel(..) => self.touch.steering = self.touch.fingers.iter().any(|f| matches!(f.role, Role::Wheel(..))),
             Role::Throttle => self.touch.throttle = 0.0,
             Role::Brake => self.touch.brake = 0.0,
+            Role::Clutch => self.touch.clutch = 0.0,
             Role::Stick => {
                 self.touch.stick_at = None;
                 self.stick_keys(Vec2::ZERO);
@@ -567,6 +627,9 @@ impl App {
             match f.role {
                 Role::Throttle => t.throttle = depth(t.throttle_r, f.pos.y),
                 Role::Brake => t.brake = depth(t.brake_r, f.pos.y),
+                // (the clutch pushed in most of the way is in: the gearboxes want it at 1
+                // to take a gear, see `pedal_ends`, and a thumb seldom sits at the top edge)
+                Role::Clutch => t.clutch = if depth(t.clutch_r, f.pos.y) >= 0.75 { 1.0 } else { depth(t.clutch_r, f.pos.y) },
                 _ => {}
             }
         }
@@ -648,7 +711,7 @@ impl App {
                 // driver → outside → passenger → driver (on foot: back to the bus)
                 self.view = match self.view.as_str() {
                     "driver" => "outside",
-                    "outside" if self.player.as_ref().is_some_and(|p| !p.vehicle.ty.def.cameras_pax.is_empty()) => "pax",
+                    "outside" if self.player.as_ref().is_some_and(|p| p.pax_camera_count() > 0) => "pax",
                     _ => "driver",
                 }
                 .into();
@@ -693,18 +756,11 @@ impl App {
                 self.vehicle_action(action, true);
                 self.vehicle_action(action, false);
             }
-            Btn::BlinkLeft => {
-                self.tap_key(event_loop, KeyCode::KeyZ, false, true);
-                self.tap_key(event_loop, KeyCode::KeyZ, false, false);
-            }
-            Btn::BlinkRight => {
-                self.tap_key(event_loop, KeyCode::KeyC, false, true);
-                self.tap_key(event_loop, KeyCode::KeyC, false, false);
-            }
-            Btn::Hazard => {
-                self.tap_key(event_loop, KeyCode::KeyX, false, true);
-                self.tap_key(event_loop, KeyCode::KeyX, false, false);
-            }
+            // (the lever itself, not the Z / C / X keys: those are the simple layouts' only,
+            // and with OMSI's keys chosen the phone's indicator buttons did nothing)
+            Btn::BlinkLeft => self.blinker(1),
+            Btn::BlinkRight => self.blinker(2),
+            Btn::Hazard => self.blinker(3),
             Btn::Horn => self.vehicle_action("horn", down),
             Btn::Engine => self.vehicle_action("kw_m_enginestart", down),
             Btn::Battery => {
@@ -776,6 +832,7 @@ impl App {
             }
         }
         let (steer, thr, brk, active) = (steer_curve(t.steer), t.throttle, t.brake, t.steering || t.tilt || t.steer != 0.0);
+        let clu = t.clutch;
         if let Some(p) = self.player.as_mut() {
             let a = &mut p.analog;
             if active {
@@ -786,6 +843,9 @@ impl App {
             }
             if brk > 0.0 {
                 a.brake = Some(a.brake.unwrap_or(0.0).max(brk));
+            }
+            if clu > 0.0 {
+                a.clutch = Some(a.clutch.unwrap_or(0.0).max(clu));
             }
         }
     }
@@ -832,11 +892,14 @@ impl App {
             } else {
                 pt.text(atlas, fonts, "TILT", 14.0 * u, Weight::Bold, t.wheel_c, Align::Center, DIM);
             }
-            for (r, v, name) in [(t.brake_r, t.brake, "BRAKE"), (t.throttle_r, t.throttle, "GAS")] {
+            for (r, v, name) in [(t.clutch_r, t.clutch, "CLUTCH"), (t.brake_r, t.brake, "BRAKE"), (t.throttle_r, t.throttle, "GAS")] {
+                if r.w <= 0.0 {
+                    continue;
+                }
                 pt.rounded(r, 12.0 * u, PANEL_BG);
                 if v > 0.0 {
                     let fill = Rect::new(r.x, r.bottom() - r.h * v, r.w, r.h * v);
-                    pt.rounded(fill, 12.0 * u, if name == "GAS" { Color::rgba(104, 190, 118, 0.75) } else { Color::rgba(222, 78, 68, 0.75) });
+                    pt.rounded(fill, 12.0 * u, match name { "GAS" => Color::rgba(104, 190, 118, 0.75), "CLUTCH" => Color::rgba(90, 150, 230, 0.75), _ => Color::rgba(222, 78, 68, 0.75) });
                 }
                 pt.rounded_border(r, 12.0 * u, 2.0 * u, Color::rgba(230, 230, 230, 0.35));
                 // the pedal's ribs

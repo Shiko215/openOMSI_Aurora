@@ -119,13 +119,24 @@ pub(crate) fn items(app: &App, kind: &ListKind) -> Vec<(String, String)> {
             out.push((format!("{}: {}", tr("Navigator"), tr(on_off(app.navigator.as_ref().is_some_and(|n| n.enabled)))), "navigator".into()));
             out.push((format!("{}: {}", tr("Sun shadows"), tr(on_off(s.shadows))), "shadows".into()));
             out.push((format!("{}: {}", tr("Head movement"), tr(on_off(s.head_movement))), "head".into()));
+            out.push((format!("{}: {}", tr("Camera glides between viewpoints"), tr(on_off(s.driverview_smooth))), "cam_smooth".into()));
             out.push((format!("{}: {}", tr("Collisions with objects"), tr(on_off(s.collision_objects))), "coll_objects".into()));
             out.push((format!("{}: {}", tr("Collisions with vehicles"), tr(on_off(s.collision_vehicles))), "coll_vehicles".into()));
             out.push((format!("{}: {}", tr("Steering with the mouse"), tr(on_off(app.mouse_drive))), "mouse".into()));
+            // (how far the wheel turns for the cursor's way across the window: 100% is OMSI's)
+            let sens = format!("{:.0}%", s.mouse_sens * 100.0);
+            out.push((format!("{} + ({})", tr("Mouse steering sensitivity"), sens), "mouse_sens 0.1".into()));
+            out.push((format!("{} - ({})", tr("Mouse steering sensitivity"), sens), "mouse_sens -0.1".into()));
             out.push((format!("{}: {}", tr("Frame rate"), tr(on_off(s.show_fps))), "fps".into()));
             out.push((format!("{}: {}", tr("Camera collisions"), tr(on_off(s.camera_collision))), "camcoll".into()));
+            out.push((format!("{}: {}", tr("View turns with steering"), tr(on_off(s.steer_look))), "steer_look".into()));
+            out.push((format!("{}: {}", tr("Driver's hands in the cab view"), tr(on_off(s.hands_in_cab))), "hands_in_cab".into()));
             out.push((format!("{}: {}", tr("Force feedback and vibration"), tr(on_off(s.ff_enabled))), "ff".into()));
-            out.push((format!("{}: {}", tr("Keyboard pedals stay where they are"), tr(on_off(s.pedal_hold))), "pedal_hold".into()));
+            out.push((format!("{}: {}", tr("Keyboard brake stays on until the throttle"), tr(on_off(s.brake_hold))), "brake_hold".into()));
+            out.push((format!("{}: {}", tr("Automatic clutch"), tr(on_off(s.auto_clutch))), "auto_clutch".into()));
+            // (the LED panels' dots glow, and whether their mask keeps its mip chain)
+            out.push((format!("{}: {}/15", tr("LED glow"), s.led_glow), "led_glow".into()));
+            out.push((format!("{}: {}", tr("LED masks keep their mipmaps"), tr(on_off(s.led_mips))), "led_mips".into()));
             out.push((format!("{} (opentrack UDP {}): {}", tr("Head tracking"), s.head_tracking_port, tr(on_off(s.head_tracking))), "headtrack".into()));
             out.push((format!("{}: x{}", tr("Throttle pedal strength"), s.pedal_throttle), "pedal_t".into()));
             out.push((format!("{}: x{}", tr("Brake pedal strength"), s.pedal_brake), "pedal_b".into()));
@@ -297,6 +308,10 @@ pub(crate) fn run(app: &mut App, kind: &ListKind, action: &str) -> Option<ListKi
                     s.head_movement = !s.head_movement;
                     Some(("head_movement", (s.head_movement as u8).to_string()))
                 }
+                "cam_smooth" => {
+                    s.driverview_smooth = !s.driverview_smooth;
+                    Some(("driverview_smooth", (s.driverview_smooth as u8).to_string()))
+                }
                 // (at once: stuck under a bridge a map made too low, the bus drives on)
                 "coll_objects" => {
                     s.collision_objects = !s.collision_objects;
@@ -313,6 +328,13 @@ pub(crate) fn run(app: &mut App, kind: &ListKind, action: &str) -> Option<ListKi
                 }
                 "mouse" => {
                     app.mouse_drive = !app.mouse_drive;
+                    if !app.mouse_drive {
+                        crate::player::keep_wheel(app.player.as_mut());
+                    }
+                    #[cfg(windows)]
+                    if !app.mouse_drive {
+                        app.reset_vr_pointer();
+                    }
                     app.mouse_steer = (app.player.as_ref().map(|p| p.vehicle.physics.controls.steering).unwrap_or(0.0), 1.0);
                     app.mouse_pedals = app.player.as_ref().map(|p| (p.vehicle.physics.controls.throttle, p.vehicle.physics.controls.brake)).unwrap_or((0.0, 0.0));
                     None
@@ -329,6 +351,14 @@ pub(crate) fn run(app: &mut App, kind: &ListKind, action: &str) -> Option<ListKi
                     s.camera_collision = !s.camera_collision;
                     Some(("camera_collision", (s.camera_collision as u8).to_string()))
                 }
+                "steer_look" => {
+                    s.steer_look = !s.steer_look;
+                    Some(("steer_look", (s.steer_look as u8).to_string()))
+                }
+                "hands_in_cab" => {
+                    s.hands_in_cab = !s.hands_in_cab;
+                    Some(("hands_in_cab", (s.hands_in_cab as u8).to_string()))
+                }
                 "pedal_t" => {
                     s.pedal_throttle = next_step(&PEDAL, s.pedal_throttle);
                     Some(("pedal_throttle", s.pedal_throttle.to_string()))
@@ -337,6 +367,11 @@ pub(crate) fn run(app: &mut App, kind: &ListKind, action: &str) -> Option<ListKi
                     s.pedal_brake = next_step(&PEDAL, s.pedal_brake);
                     Some(("pedal_brake", s.pedal_brake.to_string()))
                 }
+                "mouse_sens" => {
+                    let d: f32 = arg.trim().parse().unwrap_or(0.0);
+                    s.mouse_sens = ((s.mouse_sens + d) * 10.0).round().clamp(1.0, 30.0) / 10.0;
+                    Some(("mouse_sens", s.mouse_sens.to_string()))
+                }
                 "seat" => {
                     let mut it = arg.split_whitespace();
                     let k: usize = it.next().and_then(|x| x.parse().ok()).unwrap_or(0).min(2);
@@ -344,13 +379,29 @@ pub(crate) fn run(app: &mut App, kind: &ListKind, action: &str) -> Option<ListKi
                     s.seat[k] = ((s.seat[k] + d) * 100.0).round().clamp(-150.0, 150.0) / 100.0;
                     Some((["seat_x", "seat_y", "seat_z"][k], s.seat[k].to_string()))
                 }
-                "pedal_hold" => {
-                    s.pedal_hold = !s.pedal_hold;
-                    Some(("pedal_hold", (s.pedal_hold as u8).to_string()))
+                "brake_hold" => {
+                    s.brake_hold = !s.brake_hold;
+                    Some(("brake_hold", (s.brake_hold as u8).to_string()))
+                }
+                "auto_clutch" => {
+                    s.auto_clutch = !s.auto_clutch;
+                    if let Some(p) = app.player.as_mut() {
+                        p.vehicle.host.auto_clutch = if s.auto_clutch { 1.0 } else { 0.0 };
+                    }
+                    Some(("auto_clutch", (s.auto_clutch as u8).to_string()))
                 }
                 "ff" => {
                     s.ff_enabled = !s.ff_enabled;
                     Some(("ff_enabled", (s.ff_enabled as u8).to_string()))
+                }
+                // the 16 levels run on, off after 15
+                "led_glow" => {
+                    s.led_glow = (s.led_glow + 1) % 16;
+                    Some(("led_glow", s.led_glow.to_string()))
+                }
+                "led_mips" => {
+                    s.led_mips = !s.led_mips;
+                    Some(("led_mips", (s.led_mips as u8).to_string()))
                 }
                 "seat_reset" => {
                     s.seat = [0.0; 3];
@@ -479,9 +530,12 @@ fn natural(a: &str, b: &str) -> std::cmp::Ordering {
 fn remember_setting(key: &str, value: &str) {
     let Ok(mut v) = omsi_launcher_lib::get_settings() else { return };
     let parsed: serde_json::Value = value.parse::<f64>().map(serde_json::Value::from).unwrap_or_else(|_| serde_json::Value::from(value));
-    let parsed = match (key, &parsed) {
-        ("navigator" | "shadows" | "head_movement" | "show_fps", serde_json::Value::Number(n)) => serde_json::Value::Bool(n.as_f64().unwrap_or(0.0) > 0.5),
-        ("time_speed", _) => serde_json::Value::from(value),
+    // a switch goes in as true/false, as the launcher's own values are: written as 1 it
+    // was read as not set and saved back as its default (the pause menu's options were
+    // lost with the next game)
+    let parsed = match (&v[key], &parsed) {
+        (serde_json::Value::Bool(_), serde_json::Value::Number(n)) => serde_json::Value::Bool(n.as_f64().unwrap_or(0.0) > 0.5),
+        _ if key == "time_speed" => serde_json::Value::from(value),
         _ => parsed,
     };
     v[key] = parsed;
@@ -522,16 +576,12 @@ fn switch_driver(app: &mut App, name: &str) {
 
 /// The fleet numbers of the bus's `[number]` list with their registrations.
 fn fleet_numbers(v: &omsi_sim::VehicleInstance) -> Vec<(String, String)> {
-    let Some(list) = v.ty.def.number_file.as_ref() else { return Vec::new() };
-    let Ok(nl) = omsi_vehicle::vehicle::NumberList::load(&omsi_cfg::resolve_path(v.ty.def.dir(), list)) else { return Vec::new() };
-    nl.numbers
-        .iter()
-        .map(|n| {
-            let reg = match &v.ty.def.registration_automatic {
-                Some((pre, post)) => format!("{pre}{n}{post}"),
-                None => String::new(),
-            };
-            (n.clone(), reg)
+    let def = &v.ty.def;
+    def.numbers_with_plates()
+        .into_iter()
+        .map(|(n, _)| {
+            let reg = if def.registration_mode == 1 { String::new() } else { def.chosen_plate_of_number(&n) };
+            (n, reg)
         })
         .collect()
 }

@@ -24,12 +24,15 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy)]
 pub struct IndexedSpline {
     pub length: f64,
+    /// The chain distance stored in the last `[spline]` field (tile version 11+).
+    /// `None` for older tiles, where that field is not present.
+    pub map_chain_offset: Option<f64>,
     pub prev: i64,
     pub next: i64,
 }
 
-/// What the map holds outside the loaded tiles: its splines (lengths and links), the spline
-/// every `[splineAttachement]` row starts on, and where every object stands.
+/// What the map holds outside the loaded tiles: its splines (lengths, chain offsets and links),
+/// the spline every `[splineAttachement]` row starts on, and where every object stands.
 #[derive(Default)]
 pub struct MapIndex {
     pub splines: HashMap<i64, IndexedSpline>,
@@ -50,6 +53,22 @@ pub struct MapIndex {
     pub covers: HashMap<(i32, i32), [f64; 4]>,
     pub tiles_read: usize,
     pub tiles_failed: usize,
+    /// Object id → how many passengers get off at it, as Omsi.exe weighs a `[busstop]`'s
+    /// strings (see [`stop_exit_weight`]); only objects that carry strings.
+    pub stop_weights: HashMap<i64, f32>,
+}
+
+/// How many passengers get off at a bus stop, as Omsi.exe reads the stop object's strings
+/// when it sets the station up (0x620058): `pass_enter_max` (string 1, else 1) and
+/// `pass_enter_min` (string 2, else 0) rounded, and `pass_exit` (string 3) rounded - or,
+/// without it, the mean of the two - never below 0. A boarding passenger draws where to get
+/// off among the stops ahead by these numbers (0x61baa8), so a stop with twice the number
+/// takes twice the riders; the stock maps put 10 on every stop.
+pub fn stop_exit_weight(strings: &[String]) -> f32 {
+    let num = |i: usize| strings.get(i).map(|s| s.trim()).filter(|s| !s.is_empty()).and_then(|s| s.replace(',', ".").parse::<f64>().ok()).filter(|v| v.is_finite()).map(|v| v.round() as f32);
+    let max = num(1).unwrap_or(1.0);
+    let min = num(2).unwrap_or(0.0);
+    num(3).unwrap_or((min + max) / 2.0).max(0.0)
 }
 
 impl MapIndex {
@@ -70,7 +89,22 @@ impl MapIndex {
                 let mut part = MapIndex::default();
                 let mut rows: RowParts = Default::default();
                 for s in tile.splines.iter().filter(|s| !s.deleted) {
-                    part.splines.insert(s.id, IndexedSpline { length: s.length, prev: s.prev_id, next: s.next_id });
+                    let map_chain_offset = if tile.version >= 11 || tile.version == 0 {
+                        let offset = if s.tex_offset.is_finite() && s.tex_offset > 0.0 {
+                            s.tex_offset
+                        } else {
+                            0.0
+                        };
+                        Some(offset)
+                    } else {
+                        None
+                    };
+                    part.splines.insert(s.id, IndexedSpline {
+                        length: s.length,
+                        map_chain_offset,
+                        prev: s.prev_id,
+                        next: s.next_id,
+                    });
                 }
                 for a in &tile.spline_attachments {
                     let Some(s) = tile.splines.get(a.spline_index.max(0) as usize) else { continue };
@@ -95,6 +129,12 @@ impl MapIndex {
                 for o in &tile.objects {
                     let ground = terrain.as_ref().map(|t| t.sample(o.pos[0].clamp(0.0, tile_size()) as f32, o.pos[1].clamp(0.0, tile_size()) as f32) as f64).unwrap_or(0.0);
                     part.objects.insert(o.id, ((*tx, *ty), DVec3::new(origin.x + o.pos[0], origin.y + o.pos[1], o.pos[2] + ground), o.rot));
+                    if o.extra.len() >= 2 {
+                        part.stop_weights.insert(o.id, stop_exit_weight(&o.extra));
+                    }
+                }
+                for a in tile.spline_attachments.iter().filter(|a| a.repeater.is_none() && a.strings.len() >= 2) {
+                    part.stop_weights.insert(a.id, stop_exit_weight(&a.strings));
                 }
                 // an object put on a spline (`[splineAttachement]`: an entry point or a stop
                 // on the road): where the row's first object stands on its own spline - enough
@@ -123,6 +163,7 @@ impl MapIndex {
                         index.objects.insert(id, v);
                     }
                     index.covers.extend(p.covers);
+                    index.stop_weights.extend(p.stop_weights);
                     for (f, (n, t)) in p.files {
                         index.files.entry(f).or_insert((0, t)).0 += n;
                     }
@@ -268,12 +309,18 @@ pub struct Pose {
 
 impl Pose {
     /// The pose of an object hanging on attachment point `attach` of this pose, turned by
-    /// its own heading/pitch/bank `own`.
+    /// its own heading/pitch/bank `own`, as Omsi.exe puts it there (0x79d4c4..0x79d689): the
+    /// point's place turned with the parent, and for the turn the D3DX quaternion product
+    /// point x own x parent - the point's rotation, then the object's own (bank, pitch,
+    /// heading), then the parent's, all taken as rotations of the world axes. For the
+    /// usual turns about the vertical this is the plain hierarchy; with a tilt in more than
+    /// one of them it is what the original shows.
     pub fn attached(&self, attach: &Mat4, own: [f64; 3]) -> Pose {
         let local = attach.transform_point3(Vec3::ZERO);
         let pos = self.pos + self.rot.transform_vector3(local).as_dvec3();
         let (_, r, _) = attach.to_scale_rotation_translation();
-        let rot = self.rot * Mat4::from_quat(r) * omsi_geometry::object_rotation(own);
+        let (_, parent, _) = self.rot.to_scale_rotation_translation();
+        let rot = Mat4::from_quat((omsi_geometry::object_rotation_ypr(own).to_scale_rotation_translation().1 * r * parent).normalize());
         Pose { pos, rot }
     }
 
@@ -321,14 +368,14 @@ pub fn chain_distance(index: &MapIndex, from: i64, to: i64, limit: f64) -> Optio
     }
 }
 
-/// How far the start of spline `id` lies from the start of its chain: the length of the
-/// splines before it, following the `prev` links back (and the direction flips where two
-/// splines meet end to end) until the chain begins or comes round to a spline already
-/// passed. A row's start distance counts from there: with it, 176 of the 180 repeaters of
-/// Berlin-Spandau that can be checked start at the object the map names (165 counting from
-/// the master's own spline), and the buffer stops stand a few metres before their track
-/// ends instead of in the middle of the rails.
+/// How far the start of spline `id` lies from the start of its chain. OMSI stores this in the
+/// last `[spline]` field in tile version 11 and newer; that value is authoritative because
+/// `prev`/`next` links can be stale. Older tiles do not store it, so reconstruct it by walking
+/// the links (flipping direction where two splines meet end to end).
 pub fn chain_offset(index: &MapIndex, id: i64) -> f64 {
+    if let Some(offset) = index.splines.get(&id).and_then(|s| s.map_chain_offset) {
+        return offset;
+    }
     let mut cur = id;
     let mut forward = true;
     let mut acc = 0.0;
@@ -441,18 +488,20 @@ fn place_on(att: &SplineAttachment, spline: &MapSpline, origin: DVec2, index: Op
             // the row's right is the spline's left
             let (u, side, turn) = if backwards { (len - along, -x, 180.0) } else { (along, x, 0.0) };
             let pos = curve.offset_point(u, side, h);
-            let heading = curve.heading_at(u) + turn + att.rot[0];
-            let (mut pitch, mut bank) = (att.rot[1], att.rot[2]);
-            if att.tilt {
-                let sign = if backwards { -1.0 } else { 1.0 };
-                pitch += sign * curve.slope_at(u).atan().to_degrees();
-                // (the original: the cant's angle, atan of the percentage, and only
-                // for an object standing within the half cant width)
-                if side.abs() < curve.half_cant_width {
-                    bank += sign * (curve.cant_at(u) / 100.0).atan().to_degrees();
-                }
-            }
-            out.push(RowObject { index: j, pose: Pose { pos, rot: omsi_geometry::object_rotation([heading, pitch, bank]) } });
+            let pitch = if att.tilt { curve.slope_at(u).atan().to_degrees() } else { 0.0 };
+            // The cant lifts only within the spline type's half cant width.
+            let bank = if att.tilt && side.abs() < curve.half_cant_width {
+                (curve.cant_at(u) / 100.0).atan().to_degrees()
+            } else { 0.0 };
+            let mut own = omsi_geometry::map_rotation(att.rot);
+            own[0] += turn;
+            // Tangential objects turn in the spline's inclined frame. Adding the
+            // spline's pitch/bank to the object's Euler angles instead tilts a
+            // sideways railing across the road, and a reversed object downhill.
+            // The half turn of a backwards chain belongs to that same local frame.
+            let rot = omsi_geometry::object_rotation([curve.heading_at(u), pitch, bank])
+                * omsi_geometry::object_rotation(own);
+            out.push(RowObject { index: j, pose: Pose { pos, rot } });
         }
         if interval <= 0.0 {
             break;
@@ -927,20 +976,108 @@ mod tests {
         assert!(row_objects(&row(0.0, 0.0, 102.0, None), &dead_end, DVec2::ZERO, None).is_empty());
     }
 
+    #[test]
+    fn tangential_row_rotates_within_the_spline_plane() {
+        let s = MapSpline {
+            heading: 37.0, radius: 100.0, grad_start: 15.0, grad_end: -5.0,
+            cant_start: 7.0, cant_end: 3.0, ..spline(1, 0, 0, 80.0)
+        };
+        let curve = SplineCurve::from_map(&s, DVec2::ZERO);
+        let u = 25.0;
+        let pitch = curve.slope_at(u).atan();
+        let bank = (curve.cant_at(u) / 100.0).atan();
+        let heading = curve.heading_at(u).to_radians();
+        // An object's normal must not change when it is turned on that surface.
+        let normal = DVec3::new(bank.sin() * pitch.cos(), -pitch.sin(), bank.cos() * pitch.cos());
+        let expected = DVec3::new(
+            normal.x * heading.cos() + normal.y * heading.sin(),
+            -normal.x * heading.sin() + normal.y * heading.cos(), normal.z,
+        ).as_vec3();
+        for own_heading in [0.0, 90.0, 180.0, -90.0, 27.0] {
+            let att = SplineAttachment { tilt: true, rot: [own_heading, 0.0, 0.0], ..row(0.0, 0.0, u, None) };
+            let objects = row_objects(&att, &s, DVec2::ZERO, None);
+            assert_eq!(objects.len(), 1);
+            let rot = objects[0].pose.rot;
+            assert!((rot.transform_vector3(Vec3::Z) - expected).length() < 1e-6, "heading {own_heading}");
+            for axis in [Vec3::X, Vec3::Y] {
+                assert!(rot.transform_vector3(axis).dot(expected).abs() < 1e-6, "heading {own_heading}");
+            }
+        }
+    }
+
+    #[test]
+    fn tangential_row_keeps_its_frame_when_the_spline_runs_backwards() {
+        let s = MapSpline { heading: 31.0, grad_start: 12.0, grad_end: 12.0,
+            cant_start: 5.0, cant_end: 5.0, ..spline(1, 0, 0, 80.0) };
+        let curve = SplineCurve::from_map(&s, DVec2::ZERO);
+        let reverse = MapSpline { pos: curve.end_point().to_array(), heading: s.heading + 180.0,
+            grad_start: -12.0, grad_end: -12.0, cant_start: -5.0, cant_end: -5.0, ..s.clone() };
+        // Include the object's own pitch/bank: the spline frame must compose with
+        // these too, and children inherit the resulting complete rotation.
+        let att = SplineAttachment { tilt: true, rot: [90.0, 3.0, -2.0], ..row(0.0, 0.0, 20.0, None) };
+        let forward = row_objects(&att, &s, DVec2::ZERO, None)[0].pose;
+        let start = RowStart { s: 20.0, j: 0, backwards: true, d0: 20.0, acc: 0.0 };
+        let backward = place_on(&att, &reverse, DVec2::ZERO, None, start)[0].pose;
+        assert!((forward.pos - backward.pos).length() < 1e-8);
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            assert!((forward.rot.transform_vector3(axis) - backward.rot.transform_vector3(axis)).length() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn upright_row_and_objects_outside_cant_width_keep_their_placement_rules() {
+        let s = MapSpline { heading: 65.0, grad_start: 10.0, grad_end: 10.0,
+            cant_start: 20.0, cant_end: 20.0, ..spline(1, 0, 0, 80.0) };
+        let att = SplineAttachment { rot: [90.0, 3.0, -2.0], ..row(0.0, 0.0, 20.0, None) };
+        let upright = row_objects(&att, &s, DVec2::ZERO, None)[0].pose;
+        let expected = omsi_geometry::object_rotation([155.0, -3.0, 2.0]);
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            assert!((upright.rot.transform_vector3(axis) - expected.transform_vector3(axis)).length() < 1e-6);
+        }
+        let outside = SplineAttachment { tilt: true, offset: [11.0, 0.25, 20.0], rot: [90.0, 0.0, 0.0], ..att };
+        let pose = row_objects(&outside, &s, DVec2::ZERO, None)[0].pose;
+        let right = SplineCurve::dir(s.heading + 90.0).as_vec2().extend(0.0);
+        assert!(pose.rot.transform_vector3(Vec3::Z).dot(right).abs() < 1e-6,
+            "beyond the half cant width, the row follows only the longitudinal slope");
+        assert!((pose.pos.z - 10.25).abs() < 1e-8, "the position still includes the cant's clamped height");
+    }
+
+    #[test]
+    fn tangential_railing_follows_the_praha_spline() {
+        // Placement of railing 26386 on spline 24096, Praha 200 tile 2623/10579.
+        // Its mesh runs along local X, so the map turns it 90 degrees to the road.
+        let s = MapSpline { id: 24096, pos: [163.9941, 44.16156, 270.8004],
+            heading: -90.15699, length: 46.00197, grad_start: -0.5, grad_end: -0.5,
+            tex_offset: 771.2027, ..Default::default() };
+        let att = SplineAttachment { id: 26386, offset: [-0.0584662628010295, 0.279999999041864, 785.154450166645],
+            rot: [90.0000020235813, 0.0, 0.0], tilt: true, ..Default::default() };
+        let mut index = MapIndex::default();
+        index.splines.insert(s.id, IndexedSpline { length: s.length, map_chain_offset: Some(s.tex_offset), prev: 0, next: 0 });
+        let objects = row_objects(&att, &s, DVec2::ZERO, Some(&index));
+        assert_eq!(objects.len(), 1);
+        let direction = SplineCurve::dir(s.heading);
+        let tangent = DVec3::new(direction.x, direction.y, -0.005).normalize().as_vec3();
+        assert!((-objects[0].pose.rot.transform_vector3(Vec3::X) - tangent).length() < 1e-6,
+            "the railing must descend along the kerb, not lean across it");
+    }
+
     /// The chain of the Spandau buffer stop 3212811: a dead-end track of 250 m behind 600 m
     /// of predecessors, one of them joined end to end.
     fn buffer_stop_chain() -> MapIndex {
         let mut ix = MapIndex::default();
-        ix.splines.insert(10, IndexedSpline { length: 400.0, prev: 0, next: 11 });
+        ix.splines.insert(10, IndexedSpline { length: 400.0, map_chain_offset: Some(0.0), prev: 0, next: 11 });
         // spline 11 runs against the chain: its end meets 10, its start meets 12
-        ix.splines.insert(11, IndexedSpline { length: 200.0, prev: 12, next: 10 });
-        ix.splines.insert(12, IndexedSpline { length: 250.0, prev: 11, next: 0 });
+        ix.splines.insert(11, IndexedSpline { length: 200.0, map_chain_offset: Some(250.0), prev: 12, next: 10 });
+        ix.splines.insert(12, IndexedSpline { length: 250.0, map_chain_offset: Some(600.0), prev: 11, next: 0 });
         ix
     }
 
     #[test]
     fn row_start_counts_from_the_chain_start() {
-        let ix = buffer_stop_chain();
+        let mut ix = buffer_stop_chain();
+        // Berlin's map links can be stale: keep the authored chain distance even when the
+        // segment no longer points back to the spline that the distance includes.
+        ix.splines.get_mut(&12).unwrap().prev = 0;
         assert_eq!(chain_offset(&ix, 10), 0.0);
         assert_eq!(chain_offset(&ix, 12), 600.0);
         // a row on spline 11 runs its way, from the joint with 12: the chain before it is 12
@@ -952,9 +1089,9 @@ mod tests {
         assert!((objs[0].pose.pos.y - 245.3).abs() < 1e-6, "{:?}", objs[0].pose.pos);
         // a loop has no start: the walk stops where it comes round
         let mut ring = MapIndex::default();
-        ring.splines.insert(1, IndexedSpline { length: 10.0, prev: 3, next: 2 });
-        ring.splines.insert(2, IndexedSpline { length: 20.0, prev: 1, next: 3 });
-        ring.splines.insert(3, IndexedSpline { length: 30.0, prev: 2, next: 1 });
+        ring.splines.insert(1, IndexedSpline { length: 10.0, map_chain_offset: None, prev: 3, next: 2 });
+        ring.splines.insert(2, IndexedSpline { length: 20.0, map_chain_offset: None, prev: 1, next: 3 });
+        ring.splines.insert(3, IndexedSpline { length: 30.0, map_chain_offset: None, prev: 2, next: 1 });
         assert_eq!(chain_offset(&ring, 1), 50.0);
     }
 
@@ -995,10 +1132,10 @@ mod tests {
     #[test]
     fn repeater_continues_the_row() {
         let mut ix = MapIndex::default();
-        ix.splines.insert(1, IndexedSpline { length: 100.0, prev: 0, next: 2 });
-        ix.splines.insert(2, IndexedSpline { length: 50.0, prev: 1, next: 3 });
+        ix.splines.insert(1, IndexedSpline { length: 100.0, map_chain_offset: None, prev: 0, next: 2 });
+        ix.splines.insert(2, IndexedSpline { length: 50.0, map_chain_offset: None, prev: 1, next: 3 });
         // spline 3 is joined end to end: it runs against the chain
-        ix.splines.insert(3, IndexedSpline { length: 80.0, prev: 0, next: 2 });
+        ix.splines.insert(3, IndexedSpline { length: 80.0, map_chain_offset: None, prev: 0, next: 2 });
         assert_eq!(chain_distance(&ix, 1, 3, 1e9), Some((150.0, true)));
         ix.masters.insert((0, 5), (1, 20.0));
         // the master row: 20, 50, 80 m on spline 1
@@ -1016,6 +1153,20 @@ mod tests {
         assert!((objs[0].pose.pos.y - 170.0).abs() < 1e-6, "{:?}", objs[0].pose.pos);
         // the row's right is the spline's left there: still east of the chain
         assert!(objs[0].pose.pos.x > 2.9, "{:?}", objs[0].pose.pos);
+    }
+
+    #[test]
+    fn stop_exit_weights_as_omsi_reads_them() {
+        let v = |a: &[&str]| stop_exit_weight(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        // the stock stops: name, enter max, enter min, exit
+        assert_eq!(v(&["Krankenhaus", "0", "0", "10", "", "", ""]), 10.0);
+        // no exit number: the mean of the two entering numbers
+        assert_eq!(v(&["A", "6", "2"]), 4.0);
+        assert_eq!(v(&["A", "", ""]), 0.5);
+        // rounded, never below 0, rubbish ignored
+        assert_eq!(v(&["A", "1", "0", "2.6"]), 3.0);
+        assert_eq!(v(&["A", "1", "0", "-4"]), 0.0);
+        assert_eq!(v(&["A", "1", "0", "x"]), 0.5);
     }
 
     #[test]

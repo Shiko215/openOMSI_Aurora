@@ -279,6 +279,43 @@ fn mirror_in_view(eye: DVec3, radius: f32, view: &(Camera, f32)) -> bool {
     d.dot(r).abs() <= z.max(0.0) * tan_x + slack_x && d.dot(u).abs() <= z.max(0.0) * tan_y + slack_y
 }
 
+/// A mirror's picture is drawn this wide over its height (Omsi.exe sub_6f6468 gives the
+/// reflection cameras' projection 1.6 on their square textures), and the mirror meshes show
+/// its middle: drawn square, a mirror showed a slice two thirds as wide as OMSI's - the
+/// strip of the bus at its edge and hardly any of the lane beside it.
+const MIRROR_ASPECT: f32 = 1.6;
+
+/// A mirror's camera as Omsi.exe aims it, every frame (0x6f6468 -> 0x7ed0e8): the yaw and
+/// pitch of an `[add_camera_reflexion]` are not where it looks but which way the mirror's
+/// face is turned - (cos p sin y, cos p cos y, sin p) in the vehicle's frame (0x7edfd0); the
+/// ray from the eye of the view being drawn to the mirror is reflected in that face, and the
+/// camera looks along the reflection (yaw 90 - atan2(forward, right) and its elevation) from
+/// the mirror - what a mirror shows whoever looks into it. `off` is the player's own turn of
+/// the mirror (Ctrl+Alt+arrows), which turns the face. (The yaw was turned round instead,
+/// which happened to fit a mirror facing straight back at the driver and no other: the left
+/// mirrors, the kerb-side blind-spot mirrors and the door monitors of many buses looked into
+/// the saloon or at the sky.)
+pub(crate) fn mirror_view(v: &omsi_sim::VehicleInstance, c: &omsi_vehicle::Camera, eye: DVec3, off: [f32; 2]) -> omsi_vehicle::Camera {
+    let rot = v.body_rotation();
+    let at = v.position + rot.transform_point3(glam::Vec3::new(c.pos[0], c.pos[1], c.pos[2])).as_dvec3();
+    let d = rot.inverse().transform_vector3((at - eye).as_vec3());
+    let Some(d) = d.try_normalize() else { return c.clone() };
+    let (y, p) = ((c.yaw + off[0]).to_radians(), (c.pitch + off[1]).to_radians());
+    let m = glam::Vec3::new(p.cos() * y.sin(), p.cos() * y.cos(), p.sin());
+    let r = d - m * (2.0 * d.dot(m));
+    omsi_vehicle::Camera { yaw: r.x.atan2(r.y).to_degrees(), pitch: r.z.clamp(-1.0, 1.0).asin().to_degrees(), ..c.clone() }
+}
+
+/// Where the driver's eye is (for a mirror drawn with no view to aim it by).
+pub(crate) fn driver_eye(p: &Player) -> DVec3 {
+    let def = &p.vehicle.ty.def;
+    let n = def.cameras_driver.len().max(1);
+    match def.cameras_driver.get((def.camera_std + p.cam_choice.0) % n) {
+        Some(c) => p.vehicle.camera_world(c).0 + p.vehicle.body_rotation().transform_vector3(p.head + p.seat).as_dvec3(),
+        None => p.vehicle.position + DVec3::Z * 2.0,
+    }
+}
+
 /// Draw the views of the vehicle's `[add_camera_reflexion]` cameras into its mirror textures.
 /// `only`: render just one mirror, the `i % n`-th of those `view` sees (round robin, as
 /// OMSI takes its turns among the mirrors in the picture; with no view, of all of them).
@@ -290,10 +327,21 @@ pub(crate) fn render_mirrors(
     lighting: &omsi_render::Lighting,
     only: Option<usize>,
     view: Option<(Camera, f32)>,
-) {
-    let cams = p.vehicle.ty.def.cameras_reflexion.clone();
+) -> usize {
+    // (aimed from the eye of the view being drawn, as Omsi.exe aims them - from the
+    // driver's without one)
+    let eye = view.as_ref().map(|v| v.0.position).unwrap_or_else(|| driver_eye(p));
+    let cams: Vec<omsi_vehicle::Camera> = p
+        .vehicle
+        .ty
+        .def
+        .cameras_reflexion
+        .iter()
+        .enumerate()
+        .map(|(i, c)| mirror_view(&p.vehicle, c, eye, p.mirror_offsets.get(i).copied().unwrap_or([0.0; 2])))
+        .collect();
     if cams.is_empty() {
-        return;
+        return 0;
     }
     let textures = world.mirror_textures.lock().clone();
     // small images: skip objects that would be tiny anyway (the original's
@@ -326,7 +374,7 @@ pub(crate) fn render_mirrors(
         .filter(|&i| view.as_ref().map(|v| mirror_in_view(p.vehicle.camera_world_full(&cams[i]).0, cams[i].extra.unwrap_or(0.0).max(MIRROR_MIN_RADIUS), v)).unwrap_or(true))
         .collect();
     if seen.is_empty() {
-        return;
+        return 0;
     }
     let pick = only.map(|k| seen[k % seen.len()]);
     for (i, c) in cams.iter().enumerate() {
@@ -337,9 +385,7 @@ pub(crate) fn render_mirrors(
             continue;
         };
         let (eye, yaw, pitch, roll) = p.vehicle.camera_world_full(c);
-        // (the player's own turn of the mirror, Ctrl+Alt+arrows)
-        let off = p.mirror_offsets.get(i).copied().unwrap_or([0.0; 2]);
-        let (yaw, pitch) = (yaw + off[0], (pitch + off[1]).clamp(-89.0, 89.0));
+        let pitch = pitch.clamp(-89.0, 89.0);
         if omsi_cfg::env::var_os("OMSI_DEBUG_MIRRORS").is_some() {
             log::info!("mirror {i}: eye {:.2},{:.2},{:.2} yaw {yaw:.1} pitch {pitch:.1} roll {roll:.2} fov {:.0} ({} of {} in view)", eye.x, eye.y, eye.z, c.fov, seen.len(), cams.len());
         }
@@ -349,9 +395,14 @@ pub(crate) fn render_mirrors(
             pitch,
             roll,
             fov_deg: if c.fov > 1.0 { c.fov } else { 50.0 },
-            near: 0.3,
-            far: 450.0,
+            // (Omsi.exe's reflection pass, 0x6f68a8: near 0.1 m, far 100 km. Ours cut at
+            // 0.3 m and 450 m: what is close to an inside mirror's camera - a handrail, the
+            // driver's head - vanished, and the street behind ended at the next junction.
+            // The far end is the objects' own reach here, as in the main view.)
+            near: 0.1,
+            far: if renderer.options.max_obj_dist > 0.0 { renderer.options.max_obj_dist.clamp(450.0, 6000.0) } else { 3000.0 },
         };
-        renderer.render_to_texture(scene, *tex, &cam, &lighting);
+        renderer.render_to_texture(scene, *tex, &cam, &lighting, MIRROR_ASPECT);
     }
+    seen.len()
 }

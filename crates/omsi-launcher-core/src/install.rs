@@ -768,6 +768,14 @@ fn list_folder(dir: &Path, job: &Job) -> Result<(Vec<Entry>, Vec<PathBuf>, usize
     Ok((entries, paths, refused))
 }
 
+/// The read buffer an archive is opened with. The zip reader looks for the end of the
+/// archive's table of contents from the back of the file in 2 KB steps, seeking before
+/// each: every step emptied a 64 KB buffer and read it anew. The table of contents of a
+/// 30 000-file map took 3.2 s here (0.06 s with 8 KB), and on a phone, whose shared storage
+/// is read through a slow layer, minutes: the install stood at "reading the archive's table
+/// of contents", 0 of 0 files, for every mod.
+const ZIP_BUFFER: usize = 1 << 13;
+
 fn list_zip(z: &mut zip::ZipArchive<std::io::BufReader<std::fs::File>>, job: &Job) -> Result<(Vec<Entry>, Vec<String>)> {
     let mut out = Vec::new();
     let mut problems = Vec::new();
@@ -837,7 +845,7 @@ fn run(job: &Job, content: &Path, root: Option<&Path>) -> Result<()> {
     job.state("planning", if is_zip { "reading the archive's table of contents" } else { "listing the folder" });
     let (mut source, entries) = if is_zip {
         let f = std::fs::File::open(&src).with_context(|| format!("opening {}", src.display()))?;
-        let mut z = zip::ZipArchive::new(std::io::BufReader::with_capacity(1 << 16, f)).with_context(|| format!("{} is not a readable zip archive", src.display()))?;
+        let mut z = zip::ZipArchive::new(std::io::BufReader::with_capacity(ZIP_BUFFER, f)).with_context(|| format!("{} is not a readable zip archive", src.display()))?;
         let (entries, problems) = list_zip(&mut z, job)?;
         if !problems.is_empty() {
             return Err(anyhow!("{}: {}", src.display(), problems.join("; ")));
@@ -1203,7 +1211,7 @@ pub fn inspect(content: &Path, root: Option<&Path>, src: &Path) -> Result<Source
     let job = Job { id: 0, source: src.to_path_buf(), mode: InstallMode::Auto, from_inbox: false, cancel: AtomicBool::new(false), progress: Mutex::new(Progress::default()), bytes_done: AtomicU64::new(0), files_done: AtomicU64::new(0), linked: Mutex::new(Vec::new()), stall_at: u64::MAX };
     let f = std::fs::File::open(src).with_context(|| format!("opening {}", src.display()))?;
     let archive_bytes = f.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut z = zip::ZipArchive::new(std::io::BufReader::with_capacity(1 << 16, f)).with_context(|| format!("{} is not a readable zip archive", src.display()))?;
+    let mut z = zip::ZipArchive::new(std::io::BufReader::with_capacity(ZIP_BUFFER, f)).with_context(|| format!("{} is not a readable zip archive", src.display()))?;
     let (entries, _) = list_zip(&mut z, &job)?;
     let source_name = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mod".into());
     let plan = plan(&entries, &source_name, &Installed { content, root });

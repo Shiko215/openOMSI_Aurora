@@ -30,6 +30,9 @@ struct Enhanced {
     debug: vec4<f32>,
     // xyz where the sky cube is drawn from, relative to the camera
     eye: vec4<f32>,
+    // x how bright an LED panel's dots burn (0 = off), y whether the LED panels' `\S:n`
+    // masks keep their mip chain (0: at full resolution, the dots stay visible when small)
+    led: vec4<f32>,
 };
 @group(0) @binding(11) var<uniform> enh: Enhanced;
 @group(0) @binding(13) var s_lin: sampler;

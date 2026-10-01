@@ -270,10 +270,18 @@ its kerbs and camber while its arms come down onto the roads that run into them.
 under the plate is then pressed into the base mesh as well, which is what closes the seam
 along its edges.
 
-`[spline_terrain_align]` (no parameter) and `[spline_terrain_align_2] <m>` follow a
-`[spline]` in a tile file: the ground is pulled onto that spline, as the editor's "align
-terrain" does, and the original redoes it on every load (Berlin-Spandau: 33 and 203 of
-2486 splines). `[terrainhole] <mesh.o3d>` inside a `[mesh]` block of a model.cfg names a
+`[spline_terrain_align]` (no parameter) and `[spline_terrain_align_2] <n>` follow a
+`[spline]` in a tile file (Berlin-Spandau: 33 and 203 of 2486 splines). The editor's
+"align terrain" wrote the ground's heights into the `.terrain` file already; at load the
+flag (1, or `n`) only makes the spline cut its outline out of the ground (Omsi.exe: tile
+parser 0x794e1a -> spline +0x35 -> segment +0x205 -> Generate 0x5b1178 -> GenerateTerrain,
+"Terrain hole cutting: Spline"). The outline is the spline type's `[terrainholeprofile]`
+extruded along the spline: right edge, far end, left edge, near end; `n` 2 and 4 keep the
+far end at the spline's end, 3 and 4 the near end at its start, otherwise each point's
+third value moves it past the end. A `.sli` without `[terrainholeprofile]` gets one per
+string of joined `[profile]`s (0x5ab908): its left end and right end 3 cm in and 3 mm
+down, a bottom 10 cm under its lowest point reaching 0.5 m past both ends. An outline
+that crosses itself cuts nothing. `[terrainhole] <mesh.o3d>` inside a `[mesh]` block of a model.cfg names a
 cutter that takes the ground away under the object - 85 of the stock junction objects carry
 one, next to the model or in its `model` folder. Both matter: without them the terrain
 stands over the carriageway, which from the driver's seat looks like a missing road.
@@ -319,7 +327,9 @@ sits over it, so the shoreline is wherever the terrain rises through it. `.terra
 ## Splines (.sli) - unit `mc_splines`
 
 length texture scaleTexByLength patchwork_chain heightprofile profile profilepnt path path_2
-rail_enh third_rail halfcantwidth onlyeditor terrainholeprofile terrainholeprofilepnt.
+rail_enh third_rail halfcantwidth onlyeditor terrainholeprofile terrainholeprofilepnt
+(`[terrainholeprofile]` begins a profile, each `[terrainholeprofilepnt]` - x, height,
+end offset - goes to the last one begun).
 
 `[path]` (5 lines): kind (0 street, 1 sidewalk, 2 rail), lateral offset x (right positive),
 height z, width, direction (0 along the spline, 1 backwards, 2 both). The lane runs the
@@ -377,6 +387,11 @@ add_camera_reflexion(_2) mass momentofintertia cog boundingbox crashmode_pole ne
 (attach_trans attach_rot_x/y/z) maplight rail_enh third_rail triggerbox_new triggerbox_setreverb
 plus the whole model.cfg vocabulary inline.
 
+`[rendertype] presurface` draws the object before terrain and ordinary scenery, keeping
+its mesh/material order. Alpha-blended materials still write depth at transparent texels:
+an invisible cover can keep terrain from hiding an excavation already drawn below it.
+Alpha-tested materials retain their cutouts, and `[matl_noZwrite]` disables blended depth writes.
+
 ## Model (.cfg) - unit `mc_complobj`
 
 LOD VFDmaxmin detail_factor tex_detail_factor noDistanceCheck terrainhole CTC CTCTexture
@@ -415,14 +430,24 @@ WH UK AI cars put their shadow there.
 its *alpha* is the slot's alpha, and a picture without an alpha channel is opaque as Direct3D
 samples it (the WH UK AI cars' paint layer uses a black 24-bit `transmap_null.tga`).
 
-`[texchanges] <file>` names a `chtex_*.cfg` **relative to the vehicle's own folder**
-(`texture\chtex_SD.cfg`, `..\Anzeigen\Rollband_SD79\chtex_rollband.cfg`), not to the
-model.cfg's. It holds `[newtexchangemaster]` blocks of two lines - the texture name as it
+`[texchanges] <file>` names a `chtex_*.cfg`, relative to the vehicle's root folder for
+vehicles and to the model-config folder for scenery. The examples are
+`texture\chtex_SD.cfg` and `..\Anzeigen\Rollband_SD79\chtex_rollband.cfg`. It holds
+`[newtexchangemaster]` blocks of two lines - the texture name as it
 appears in the o3d, and a script variable - each followed by `[entries] n` and n texture
 files that live next to that cfg. The variable's integer value picks the entry, 0 first
 (`rollband.osc` clamps `rlbnd_lnN` to 0…15 for sixteen entries and stores `trunc()+0.001`).
 The named texture usually does not exist on disk at all: the mesh carries it only as a key.
 The masters are model-wide even though `[texchanges]` is written inside a mesh block.
+
+Scenery `[CTC] <variable> <folder> <value>` groups read the folder's `.cti` items. Their
+`[CTCTexture] <name> <default-file>` entries link each item to a material texture. The
+script's integer variable selects an item by zero-based index; each `[CTC]` group has its own
+variable and can select independently. Scenery `[texchanges]` masters use the same indexed
+script-variable selection, with each entry replacing the master texture key. Both mechanisms
+are applied to scenery material slots at runtime, so they can drive adverts on shelter panels,
+building signs, and other props. An out-of-range or negative value leaves the model's own
+texture active.
 
 `[matl_freetex] <texture> <string variable>` is the same idea with a file name the script
 builds at run time: the SD200's destination roller sets `Rollband_Tex_V` from the map's
@@ -491,6 +516,9 @@ the bottom.
 
 * `tile_x_y.map.LM.bmp` (256×256): the tile's **night light map** - pools of street lamp
   light on the ground (not shadows), north at the top row; added to the terrain at night.
+  It covers the tile **and its eight neighbours**: the tile itself is the middle third
+  (texels 85⅓..170⅔ each way). Neighbouring light maps are the same picture shifted by a
+  third - 85 texels between two tiles, 171 between every other one, on all stock maps.
 * Spline profiles (`[profilepnt] x z u v`) are extruded as-is: a road's outer points sit at
   the kerb height (0.25 m on the Marcel street splines) with no skirt down to the terrain,
   so the roadway is a slab standing on the ground. The terrain is only cut away under
@@ -620,7 +648,9 @@ onlytypes end types_prefered number_tour.
   random part lifetime the stock scripts draw is 0, which makes the SD200's rear door
   reopen by itself for ever.
 * Input: keyboard.cfg `[game]/[vehicles]` + `[entry] name scancode modifier` (the modifier
-  is a mask: 1 shift, 2 ctrl, 4 alt - OMSI's own driving keys are Shift + numpad);
+  is a mask, as Omsi.exe reads it (0x6478d0): 1 the action is told the key's state every
+  frame - the throttle, brake and steering keys, " *" in OMSI's key list - 2 Shift, 4 Ctrl;
+  Omsi.exe has no Alt, openOMSI's own Alt is 8, which OMSI leaves alone);
   gamectrler.cfg ctrl axis buttons FFScale.
 * Startup order (logfile.txt) documents the manager creation sequence, mirrored in `omsi-sim`.
 
@@ -814,8 +844,13 @@ of a dirt overlay material. `veh_wash` clears them.
 
 `[matl_change] texture index variable` followed by one `[matl_item]` block (every stock
 file has exactly one): the block's `[matl_nightmap]`, `[matl_lightmap]`, `[matl_allcolor]` …
-describe the material *variant* that is active while the variable is set (≥ 0.5); with the
-variable at 0 the plain material applies. The item's `[matl_nightmap]` glows at full strength while the
+describe the material *variant*. Omsi.exe (0x5fd6xx) rounds the variable to the nearest
+whole number (ties to even) and shows item n for 1 ≤ n ≤ the number of items, the plain
+material for anything else - a variable at 2 with one item is dark. A variable no script
+declares is registered by the model loader at 0 (the stock MANs' spare buttons are switched
+by `*Noch nicht belegt*`, "not assigned yet", and stay dark). The `[matl_change]` block
+itself changes the plain material; each `[matl_item]` starts as a copy of the plain
+material as it is at that point (openOMSI draws the first item). The item's `[matl_nightmap]` glows at full strength while the
 variable is on, by day as well - warning lamps (`lights_blinkgeber`, `cockpit_light_*`,
 `haltewunschlampe`) and dashboard screens drawn only in the night map (the Procity's pressure
 screen, switched by `elec_busbar_main`) depend on it; a plain `[matl_nightmap]` fades in with

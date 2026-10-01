@@ -2,6 +2,7 @@
 
 How to run openOMSI, drive, use the launcher, install mods and play over LAN. For building
 from source see [BUILDING.md](BUILDING.md).
+For OpenXR headset setup and controls on Windows, see [VR.md](VR.md).
 
 > openOMSI runs on the content of an **original OMSI 2 installation**. Without one the game does not start.
 
@@ -33,7 +34,7 @@ Everything can also be given on the command line, which then skips both:
 | --- | --- |
 | `--map maps/Grundorf/global.cfg` | map to load |
 | `--weather Weather/Schmuddelwetter.owt --date 1989-01-15` | weather, and the date that decides the season |
-| `--bus Vehicles/MAN_SD200/MAN_SD80.bus` | player vehicle (`--paint name`, `--hof name`) |
+| `--bus Vehicles/MAN_SD200/MAN_SD80.bus` | player vehicle (`--paint name`, `--hof name`, `--plate "B-AB 1234"`) |
 | `--entry N` / `--spawn x,y,heading` | where the vehicle starts |
 | `--time HH:MM --date YYYY-MM-DD --weather Weather/x.owt` | time, date, weather |
 | `--traffic N --schedule --line 76 --tour 1 --passengers` | AI cars, timetable buses, the player's tour, people at the stops |
@@ -70,7 +71,7 @@ SHA-256 GitHub lists), puts the new program in place of the old one and starts t
 again - on Windows `openomsi.exe` and `openomsi-launcher.exe`, on macOS the `openOMSI.app`
 you started, on Linux the program files; mods, content and settings stay. On Android the
 system's installer asks "Do you want to update this app?"; Update replaces openOMSI and starts
-it again, Cancel leaves it as it was. Settings → Updates: look for updates at the start (on
+it again, Cancel leaves it as it was. Settings → General → Updates: look for updates at the start (on
 by default), install without asking (off by default), Check now. A folder openOMSI cannot
 write to (Program Files, an app opened straight from Downloads on macOS) is reported with
 what to do. `OMSI_NO_UPDATE=1` switches the check off; `OMSI_UPDATE_URL` points it at another
@@ -82,7 +83,7 @@ place across the whole window is the steering from full left to full right lock
 down to the bottom edge the brake. Above 10 km/h the same hand movement turns the wheels less
 and less (at 50 km/h a fifth as far), so the wheel feels heavier the faster the bus goes; for
 the first second after switching it on the wheel and the pedals ease towards the cursor.
-Settings → Controls & sound → *Mouse steering* makes it more or less sensitive (100 % = OMSI).
+Settings → Driving → *Mouse steering sensitivity* makes it more or less sensitive (100 % = OMSI).
 Mouse steering works in the driver's, the passenger and the outside view; the wheel follows
 the cursor smoothly (a short easing, no steps).
 
@@ -95,19 +96,20 @@ and comes up slowly (0.7 per second) when the key is released.
 Left-click a cockpit switch to operate it, hold the button and move the mouse to turn a knob,
 or roll the mouse wheel over it (that is the `<event>_drag` OMSI fires); the name of the switch
 under the cursor is shown in the HUD.
-Right-drag the mouse to look around in any view (the head turns inside, the camera swings
+Right-drag the mouse (or drag with the wheel pressed, OMSI's pan) to look around in any view (the head turns inside, the camera swings
 around the bus outside), I/J/K/L does the same from the keyboard; each view keeps its own
 direction (turning the outside camera leaves the driver's head where it was), **Space** looks
 ahead again in every view (OMSI's `view_reset_all_directions`), Home recentres the view shown.
 The mouse wheel (and **=** / **-**, a pinch on a phone) zooms: outside the camera comes closer,
-inside the bus the view narrows, as in OMSI. F1-F4 driver / passenger / outside / map (free) camera, F5-F8 the destination
-sign and roller blind keys as in OMSI, Alt+S quick save, F9 write the run into the personnel
+inside the bus the view narrows, as in OMSI; **Ctrl**+wheel outside narrows the view instead
+(a telephoto, the camera stays where it is). F1-F4 driver / passenger / outside / map (free) camera, F5-F8 the destination
+sign and roller blind keys as in OMSI, Ctrl+S quick save, F9 write the run into the personnel
 file, WASD+QE in the free camera, left click on cockpit elements, **V** the chat line in a
 LAN session. Esc opens the game menu: drive the next placed vehicle, place any vehicle of
 the installation in front of the camera (or beside the bus), couple what stands close behind
 the bus and uncouple it again, save the situation or load the quicksave, the next weather, the clock an hour on or back, refuel and wash (only at a
 petrol station, as in OMSI), repair (the team needs the map's travel time when the bus stands
-in no depot yard), screenshot, timetable, the object editor (below), quit. Shift+Home is the ticket desk camera, and the
+in no depot yard), screenshot, timetable, the object editor (below), quit. Home is the ticket desk camera and Insert the timetable view (as OMSI's keyboard.cfg binds them), and the
 change keys of keyboard.cfg hand out or take back the change. The HUD
 shows time, speed, line, next stop, delay and what the workshop just did (and why the bus
 stands: the parking brake, low air pressure, a line the date's chrono takes off), and the
@@ -124,7 +126,7 @@ picture **drawn by the game's renderer** - its model, paint, materials, reflecti
 shadows exactly as in the game, under the light of the chosen time and weather - drawn
 again only when something changes; drag on it to turn the bus, scroll to zoom. Its pages:
 
-* **Drive** - four steps: the bus (search, liveries, depot file), the route (map, start
+* **Drive** - four steps: the bus (search, liveries, depot file, number plate), the route (map, start
   point, line and tour - the lines that run on the chosen date), time and weather (time,
   date, season, traffic, passengers, timetable buses, autostart, *LAN play: host / join*,
   the weather presets that suit the season), and the roadbook with the IBIS codes; the
@@ -132,20 +134,29 @@ again only when something changes; drag on it to turn the bus, scroll to zoom. I
 * **Profile** - hours, experience and level, from OMSI's own `.odr` personnel files plus
   the session summaries the game writes to `~/.openomsi/sessions`.
 * **Settings** - everything in `settings.cfg` below, saved as it changes; keys the page
-  does not manage are kept as they are.
+  does not manage are kept as they are. One tab for each thing one comes to change:
+  *Graphics* (the quality preset first, the screen, distances and memory), *Driving* (keys,
+  mouse, wheel and pedals, with the way to the Controls page), *Camera* (the seat, the views,
+  head tracking, VR), *Sound*, *Gameplay* (passengers, traffic, collisions, the clock) and
+  *General* (language, navigator, updates, and resetting every setting).
 * **Controls** - `Inputs/keyboard.cfg`: click a key, press the new one; clashes are red. The
-  keys are the game's with *Driving keys: Custom controls* (Settings); with a ready-made
+  keys are the game's with *Driving keys: Custom controls* (Settings → Driving); with a ready-made
   layout (W A S D, arrows) those keys drive and win over the list - the page says so, and
   changing a key switches to Custom controls by itself. *Game controllers*: wheels, pedals,
   joysticks and button boxes as in OMSI's `gamectrler.cfg` - a connected device not set up
   yet has **Set up**, and **Set up step by step** finds its axes (turn the wheel left, press
   each pedal); every button of the device is listed (press one to jump to it). On Windows the
-  devices are read through DirectInput, as OMSI does, so every wheel Windows lists works
-  (a wheel's force feedback: the centring that grows with the speed, the heavy steering of a
-  bus standing still and the scripts' shaking, `FF_Vib_Amp`); a wheel nobody has set up
-  steers with its X axis. A wheel that a community controller mapping also makes a gamepad (a
+  devices are read through DirectInput, as OMSI does, so wheels Windows lists can be
+  configured for steering. Force feedback needs a driver that supports constant force:
+  parking resistance eases as the bus rolls, with centring and
+  feedback from the bus's sideways acceleration, short bumps when the front wheels cross
+  an edge, plus the scripts' shaking, `FF_Vib_Amp`. A wheel nobody has set up steers with
+  its X axis. A wheel that a community controller mapping also makes a gamepad (a
   Logitech G29) is listed once, and *Use this device* switches any device off
-  (it is then neither read nor listed as steering).
+  (it is then neither read nor listed as steering). Select a device to adjust *Steering force*
+  (centering and resistance) and *Vibration* separately, then press **Save**. The values are stored
+  for that device in the content folder's `Inputs/gamectrler.cfg`; restart a running game to use
+  the new values. *Force feedback and vibration* in Settings → Driving remains the global on/off switch.
 * **Sessions** - every game started from the launcher, with its log, a **Stop** that lets
   it save its run (SIGTERM, up to 8 s, and only a stuck game is killed) and, for a LAN
   session, the code to copy, who is playing and the chat.
@@ -163,8 +174,9 @@ again only when something changes; drag on it to turn the bus, scroll to zoom. I
 scripts/build-macos.sh   # or build-windows.cmd / build-linux.sh: the game opens the launcher
 ```
 
-Without a person at it: `OMSI_LAUNCHER_PAGE=drive:2` opens a page (and a Drive step),
-`OMSI_LAUNCHER_SHOT=secs:file.png` writes a picture, `OMSI_LAUNCHER_EXIT=secs` closes it,
+Without a person at it: `OMSI_LAUNCHER_PAGE=drive:2` opens a page (and a Drive step;
+`settings:3` or `controls:1` a tab), `OMSI_LAUNCHER_SHOT=secs:file.png` writes a picture,
+`OMSI_LAUNCHER_EXIT=secs` closes it,
 `OMSI_LAUNCHER_INPUT="t=2 click 412,60; t=3 type 76; t=4 key Enter; t=5 shot a.png"` works
 it (logical pixels). The data side is `crates/omsi-launcher-core`:
 `openomsi-launcher --cli lines '{"map":"maps/Grundorf/global.cfg"}'` runs any of its commands
@@ -186,7 +198,11 @@ and upscaled), `post_aa` (`fxaa`, the enhanced renderer's, or `off`), `view_dist
 how far the tiles are kept loaded), `texture_memory` (MB - OMSI's `texmemlimit` is read
 under that name too; an eighth of the machine's memory when unset), `texture_compression`
 (BC1-BC3 on the GPU, on by default), `reflections` (the materials' reflection maps,
-`[matl_envmap]` - off, paint, chrome and glass mirror nothing), `mouse_sens` (mouse steering,
+`[matl_envmap]` - off, paint, chrome and glass mirror nothing), `led_glow` (0..15: how
+bright an LED destination matrix's dots burn in the enhanced picture, 0 = off - they are
+the panel's own light, and the glow draws a halo around them), `led_mips` (the LED
+matrices' masks keep the mip chain `STFilter` asks for; off, they are sampled at full
+resolution and stay dots at a distance, which shimmers a little), `mouse_sens` (mouse steering,
 1 = OMSI's), `steering_linear` and `old_steering` (the two steering switches above),
 `ff_invert` (force feedback the other way round), `wheel_range` (the wheel's own rotation,
 lock to lock, 900° by default) and `wheel_lock` (how far it is turned for the bus's full

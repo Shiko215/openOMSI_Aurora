@@ -7,6 +7,7 @@ pub(crate) fn load_weather(args: &Args) -> omsi_content::weather::Weather {
     let rel = args
         .weather
         .clone()
+        .filter(|w| !crate::weather_cycle::is_cycle(Some(w)))
         .unwrap_or_else(|| "Weather/#CAVOK.owt".into());
     // OMSI 2's current weather: `metar:<ICAO>` fetches the airport's report
     let loaded = match rel.strip_prefix("metar:").or_else(|| rel.strip_prefix("METAR:")) {

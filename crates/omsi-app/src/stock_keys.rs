@@ -4,7 +4,7 @@
 //! it alone - also when the player edited the installation's own file, where there was no
 //! untouched copy to tell the changes by.
 
-/// (action, DirectInput scan code, modifier bits: 1 Shift, 2 Ctrl, 4 Alt)
+/// (action, DirectInput scan code, the entry's third value: 1 held, 2 Shift, 4 Ctrl)
 pub(crate) const STOCK_KEYS: &[(&str, i32, i32)] = &[
     ("debug_start_bench2", 48, 6),
     ("sim_pause", 25, 0),

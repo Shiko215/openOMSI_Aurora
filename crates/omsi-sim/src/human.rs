@@ -240,7 +240,9 @@ impl Rig {
             ax = ring.iter().map(|p| p.x).sum::<f32>() / n;
             ay = ring.iter().map(|p| p.y).sum::<f32>() / n;
         }
-        let ay = ay.clamp(heel_y + 0.03, toe_y - 0.1);
+        // (a foot shorter than 13 cm - a child, a small model - has the ankle as far back as
+        // it goes: the bounds crossed and the game stopped on the clamp, #138)
+        let ay = ay.clamp(heel_y + 0.03, (toe_y - 0.1).max(heel_y + 0.03));
         let ax = if (ax - knee.x).abs() < 0.1 {
             ax
         } else {
@@ -968,7 +970,8 @@ fn two_bone(root: Vec3, l1: f32, l2: f32, target: Vec3, pole: Vec3) -> (Vec3, Ve
     let len = d.length();
     let dir = if len > 1e-5 { d / len } else { -Vec3::Z };
     let reach = (l1 + l2) * 0.9995;
-    let dist = len.clamp((l1 - l2).abs() + 1e-3, reach);
+    // (a bone next to nothing puts the floor over the reach: clamp would panic)
+    let dist = len.clamp(((l1 - l2).abs() + 1e-3).min(reach), reach);
     let mut n = dir.cross(pole);
     if n.length_squared() < 1e-8 {
         n = dir.cross(Vec3::Y);
@@ -1867,8 +1870,13 @@ impl Pose {
 
         // --- trunk and head ---
         // shoulders against the hips, and a little towards what the head looks at
+        // (the shoulders take a good part of a look to the side - up to 30 degrees - so that
+        // the head turns no further on the trunk than a neck can: the people of OMSI have
+        // no neck bone, and the skin between collar and head, stretched by a head turned
+        // 60 degrees on still shoulders, made a twisted, broken neck of every passenger
+        // who looked at the driver)
         let trunk_yaw = -pelvis_yaw * 1.7
-            - d(self.head.x.clamp(-90.0, 90.0) * 0.18) * (1.0 - walk) * (1.0 - self.reach)
+            - d((self.head.x.clamp(-90.0, 90.0) * 0.42).clamp(-30.0, 30.0)) * (1.0 - walk) * (1.0 - self.reach)
             + reach_twist;
         let trunk_lean = d(3.0 * walk + lean_acc)
             + d(34.0) * bump
@@ -1889,7 +1897,7 @@ impl Pose {
             - 0.5 * trunk_lean.to_degrees().max(0.0);
         let head_world =
             yaw_quat(self.head.x.clamp(-72.0, 72.0)) * Quat::from_rotation_x(d(head_pitch));
-        let head_rel = limit_quat(trunk_rot.inverse() * head_world, d(80.0));
+        let head_rel = limit_quat(trunk_rot.inverse() * head_world, d(45.0));
         let head_m = trunk_m * about(rig.head_pivot, head_rel);
 
         // --- legs ---

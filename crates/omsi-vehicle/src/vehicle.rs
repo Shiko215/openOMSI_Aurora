@@ -79,9 +79,17 @@ pub struct Vehicle {
     pub description: String,
     pub ai_veh_type: i32,
     pub number_file: Option<String>,
+    /// `[registration_automatic]`: prefix and postfix around the fleet number.
     pub registration_automatic: Option<(String, String)>,
-    pub registration_list: Option<String>,
+    /// `[registration_list]`: the file of plates (line by line beside the `[number]` list),
+    /// then the prefix and postfix for a number the file has no plate for.
+    pub registration_list: Option<(String, String, String)>,
     pub registration_free: bool,
+    /// The plate mode the last of those keywords set (TRoadVehicle +0x28d): 0 none, 1 free,
+    /// 2 list, 3 automatic; and the prefix and postfix the list and automatic modes share
+    /// (+0x2a4, +0x2a8: the later keyword's).
+    pub registration_mode: u8,
+    pub registration_affix: (String, String),
     pub km_counter_init: Option<(i32, f32)>,
     pub sound: Option<String>,
     pub sound_ai: Option<String>,
@@ -267,26 +275,28 @@ impl Vehicle {
                 "description" => v.description = r.until("[end]").join("\n"),
                 "ai_veh_type" => v.ai_veh_type = r.i32(),
                 "number" => v.number_file = Some(r.str().to_string()),
+                // Omsi.exe (TRoadVehicle.LoadFromFile 0x7cddf5, 0x7cde6e) reads these lines
+                // as they come, whatever they say: the automatic mode's prefix and postfix
+                // (the stock "B-V " with its space), the list mode's file, prefix and postfix
                 "registration_automatic" => {
-                    let save = r.pos();
-                    let pre = r.line();
-                    if omsi_cfg::keyword_of(pre).is_some() {
-                        r.seek(save);
-                        v.registration_automatic = Some((String::new(), String::new()));
-                    } else {
-                        let save2 = r.pos();
-                        let post = r.line();
-                        let post = if omsi_cfg::keyword_of(post).is_some() || post.trim().is_empty() {
-                            r.seek(save2);
-                            String::new()
-                        } else {
-                            post.to_string()
-                        };
-                        v.registration_automatic = Some((pre.to_string(), post));
-                    }
+                    let pre = r.line().to_string();
+                    let post = r.line().to_string();
+                    v.registration_automatic = Some((pre.clone(), post.clone()));
+                    v.registration_mode = 3;
+                    v.registration_affix = (pre, post);
                 }
-                "registration_list" => v.registration_list = Some(r.str().to_string()),
-                "registration_free" => v.registration_free = true,
+                "registration_list" => {
+                    let file = r.word().to_string();
+                    let pre = r.line().to_string();
+                    let post = r.line().to_string();
+                    v.registration_list = Some((file, pre.clone(), post.clone()));
+                    v.registration_mode = 2;
+                    v.registration_affix = (pre, post);
+                }
+                "registration_free" => {
+                    v.registration_free = true;
+                    v.registration_mode = 1;
+                }
                 "kmcounter_init" => {
                     let y = r.i32();
                     let km = r.f32();
@@ -454,20 +464,85 @@ impl Train {
     }
 }
 
-/// `.org` number registration list: first line = paint scheme (may be empty), then numbers.
+/// A `[number]` list (`.org`): one fleet number a line - every line, the first as well.
+/// (The stock `.bus` files describe a first line naming a repaint; Omsi.exe 2.3 reads none:
+/// 0x614f90 takes each non-empty line for a number.)
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct NumberList {
-    pub paint_scheme: String,
     pub numbers: Vec<String>,
 }
 
 impl NumberList {
     pub fn load(path: &Path) -> Result<NumberList, omsi_cfg::CfgError> {
         let f = CfgFile::read(path)?;
-        let mut it = f.lines.iter();
-        let paint_scheme = it.next().map(|s| s.trim().to_string()).unwrap_or_default();
-        let numbers = it.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        Ok(NumberList { paint_scheme, numbers })
+        let numbers = f.lines.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        Ok(NumberList { numbers })
+    }
+}
+
+impl Vehicle {
+    /// The fleet numbers of the `[number]` list with the plate `[registration_list]`'s file
+    /// gives each - line by line beside it, empty lines counted (0x614f90) - and no plate
+    /// where that file has none.
+    pub fn numbers_with_plates(&self) -> Vec<(String, String)> {
+        let Some(list) = self.number_file.as_ref() else { return Vec::new() };
+        // (read once per bus: the AI asks it for every bus it puts on the road)
+        static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<(String, String)>>>> = std::sync::OnceLock::new();
+        let key = self.path.clone();
+        if let Some(v) = CACHE.get_or_init(Default::default).lock().ok().and_then(|c| c.get(&key).cloned()) {
+            return v;
+        }
+        let out = self.read_numbers_with_plates(list);
+        if let Ok(mut c) = CACHE.get_or_init(Default::default).lock() {
+            c.insert(key, out.clone());
+        }
+        out
+    }
+
+    fn read_numbers_with_plates(&self, list: &str) -> Vec<(String, String)> {
+        let Ok(numbers) = CfgFile::read(&omsi_cfg::resolve_path(self.dir(), list)) else { return Vec::new() };
+        let plates = self
+            .registration_list
+            .as_ref()
+            .and_then(|(f, _, _)| CfgFile::read(&omsi_cfg::resolve_path(self.dir(), f)).ok());
+        numbers
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| !n.trim().is_empty())
+            .map(|(i, n)| {
+                let plate = plates.as_ref().and_then(|p| p.lines.get(i)).map(|p| p.trim_end().to_string()).unwrap_or_default();
+                (n.trim().to_string(), plate)
+            })
+            .collect()
+    }
+
+    /// The plate of fleet number `number`, as Omsi.exe gives it to an AI bus not in the
+    /// `[registration_free]` mode (0x7e7a80, from the depot buses' 0x70a174): the
+    /// `[registration_list]` file's plate of that number when it has one, whatever the mode,
+    /// else prefix, number and postfix of the list or automatic mode - the number alone
+    /// without a mode.
+    pub fn plate_of_number(&self, number: &str) -> String {
+        self.plate_from(number, self.registration_list.is_some())
+    }
+
+    /// The plate the vehicle dialog gives the player's bus for fleet number `number`
+    /// (Tform_selectVeh.Edit1Change, which Button1Click writes over the AI's): the list
+    /// file's plate only in the list mode, the last plate keyword's - a repaint's
+    /// `[registration_list]` followed by the template's `[registration_automatic]` gives
+    /// the player prefix and number, its AI copies the list's plate.
+    pub fn chosen_plate_of_number(&self, number: &str) -> String {
+        self.plate_from(number, self.registration_mode == 2)
+    }
+
+    fn plate_from(&self, number: &str, list: bool) -> String {
+        if list {
+            if let Some((_, p)) = self.numbers_with_plates().into_iter().find(|(n, p)| n == number.trim() && !p.is_empty()) {
+                return p;
+            }
+        }
+        let (pre, post) = (&self.registration_affix.0, &self.registration_affix.1);
+        format!("{pre}{}{post}", number.trim())
     }
 }
 
@@ -515,6 +590,25 @@ mod tests {
         let offered: Vec<String> = offered_vehicles(&files).iter().map(|(f, _)| f.file_name().unwrap().to_string_lossy().to_string()).collect();
         assert_eq!(offered, vec!["G Main.bus", "L Main.bus", "Solo.bus"]);
         assert_eq!(front_sections_of(&dir.join("L Trail.bus")).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repaint's own `[registration_list]` followed by the template's
+    /// `[registration_automatic]`: the list's plate still wins (Omsi.exe 0x7e7a80 reads the
+    /// list file whatever the mode), prefix + number only where the list has none.
+    #[test]
+    fn list_plate_wins_over_a_later_automatic_mode() {
+        let dir = std::env::temp_dir().join(format!("omsi_vehicle_regs_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Nos.org"), "E1\nE2\n").unwrap();
+        std::fs::write(dir.join("Regs.org"), "AB12 CDE\n").unwrap();
+        std::fs::write(dir.join("x.bus"), "[number]\nNos.org\n\n[registration_list]\nRegs.org\n\n\n\n[registration_automatic]\nB-V \n\n").unwrap();
+        let v = Vehicle::load(&dir.join("x.bus")).unwrap();
+        assert_eq!(v.registration_mode, 3);
+        assert_eq!(v.plate_of_number("E1"), "AB12 CDE");
+        assert_eq!(v.plate_of_number("E2"), "B-V E2");
+        // (the player's bus from the dialog: the automatic mode's plate, Edit1Change)
+        assert_eq!(v.chosen_plate_of_number("E1"), "B-V E1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

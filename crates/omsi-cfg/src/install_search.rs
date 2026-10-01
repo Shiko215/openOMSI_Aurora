@@ -198,10 +198,12 @@ pub fn root_guesses(given: &Path) -> Vec<PathBuf> {
 /// then every usual place.
 pub fn find_original_install(first: &[PathBuf]) -> Option<PathBuf> {
     let mut seen = std::collections::HashSet::new();
+    // (the usual places only when the given ones hold none: making that list looks at every
+    // drive letter, and a network drive that is not connected keeps each look waiting)
     first
         .iter()
         .flat_map(|p| root_guesses(p))
-        .chain(candidates())
+        .chain(std::iter::once_with(candidates).flatten())
         .filter(|p| !p.as_os_str().is_empty() && seen.insert(p.clone()))
         .find(|p| is_install(p))
         .or_else(shallow_scan)

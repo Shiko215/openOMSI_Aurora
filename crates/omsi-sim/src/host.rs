@@ -8,12 +8,20 @@ use omsi_vehicle::hof::Hof;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+/// How many stops a page's departures are kept for at the same time (`omsi.getDepartures`).
+pub const MAX_HTML_DEPARTURE_STOPS: usize = 8;
+
 /// `wearlifespan` of a vehicle that does not wear (OMSI: every AI vehicle, and the
 /// player's with the maintenance option "infinite").
 pub const AI_WEAR_LIFESPAN: f32 = 1.5e6;
 
 #[derive(Default)]
 pub struct VehicleHost {
+    /// The paint scheme the vehicle is made with (`Some(None)`: the model's own textures),
+    /// set before it is made: `Colorscheme` and the scheme's `[setvar]`s are there for its
+    /// `{init}`, as Omsi.exe sets them when it makes the vehicle (0x70a174), before the
+    /// scripts start. None: not known yet (`apply_paint_vars` later).
+    pub paint_scheme: Option<Option<usize>>,
     /// A time of day a script wrote to `(S.S.Time)` this frame: the game's clock takes it.
     pub time_written: Option<f64>,
     pub clock: SimClock,
@@ -82,11 +90,24 @@ pub struct VehicleHost {
     pub tt_line: String,
     pub tt_delay: f32,
     pub tt_stops: Vec<(String, f32, f32)>,
+    /// The map objects of `tt_stops` (0: not known).
+    pub tt_stop_ids: Vec<i64>,
     pub tt_terminus_index: i32,
     pub tt_busstop_index: i32,
     /// The next buses due at the bus stop a scenery object belongs to (its `[varparent]`),
     /// soonest first, for the `GetArrBus*` callbacks of the stop's departure displays.
     pub arrivals: Vec<Arrival>,
+    /// Route, line and destination requests of the vehicle's HTML pages, taken by the game
+    /// (`VehicleInstance::take_html_requests`).
+    pub html_requests: Vec<crate::htmltex::HtmlRequest>,
+    /// The departures the game made for the stops the pages asked for (`omsi.getDepartures`),
+    /// by key (trimmed, lower case): (line, destination, timestamp), soonest first.
+    pub html_departures: std::collections::HashMap<String, Vec<(String, String, f64)>>,
+    /// Which board generation of the game `html_departures` is from.
+    pub html_departures_gen: u64,
+    /// The stops the pages asked departures for, taken by the game: the `MAX_HTML_DEPARTURE_STOPS`
+    /// asked most recently, the oldest first (see [`VehicleHost::want_departures`]).
+    pub html_departure_wants: Vec<String>,
 }
 
 /// A bus due at a stop (`GetArrBusLine`, `GetArrBusTerminus`, `GetArrBusTimeDiff`).
@@ -139,6 +160,22 @@ fn ambient_weather() -> Option<(f32, f32)> {
 }
 
 impl VehicleHost {
+    /// A page asked for the departures of stop `key` (trimmed, lower case). The game keeps the
+    /// stops asked most recently: one asked again moves to the back, a new one past the limit
+    /// pushes out the one asked longest ago. (A fixed first-come list stayed full for good, and
+    /// every later stop - the bus drives on to new ones - got no departures at all.)
+    pub fn want_departures(&mut self, key: String) {
+        if let Some(i) = self.html_departure_wants.iter().position(|k| *k == key) {
+            let k = self.html_departure_wants.remove(i);
+            self.html_departure_wants.push(k);
+            return;
+        }
+        if self.html_departure_wants.len() >= MAX_HTML_DEPARTURE_STOPS {
+            self.html_departure_wants.remove(0);
+        }
+        self.html_departure_wants.push(key);
+    }
+
     pub fn new(clock: SimClock) -> Self {
         // the weather is there before {init} runs: made at 0 °C (the value before the first
         // weather update) every engine was cold, and the PAZ's carburettor engine, which
@@ -175,6 +212,7 @@ impl VehicleHost {
             tt_line: self.tt_line.clone(),
             tt_delay: self.tt_delay,
             tt_stops: self.tt_stops.clone(),
+            tt_stop_ids: self.tt_stop_ids.clone(),
             tt_terminus_index: self.tt_terminus_index,
             tt_busstop_index: self.tt_busstop_index,
             ..Default::default()
@@ -321,8 +359,8 @@ impl Host for VehicleHost {
             "textlength" => {
                 let font = stacks.pop() as i32;
                 let text = stacks.pop_str();
-                // advance per glyph as drawn: glyph width plus the font's gap
-                let w = self.font_atlas(font).map(|a| text.chars().map(|c| a.font.glyph(c).map(|g| g.x1 - g.x0).unwrap_or(0) + a.font.gap).sum::<i32>() as f32).unwrap_or(0.0);
+                // as Omsi.exe measures it (0x5d6c00): the glyphs and the gaps between them
+                let w = self.font_atlas(font).map(|a| a.font.text_width(&text) as f32).unwrap_or(0.0);
                 if omsi_cfg::env::var_os("OMSI_DEBUG_TEXT").is_some() {
                     log::info!("TextLength(font {font} = {:?}, {text:?}) = {w}", self.font_atlas(font).map(|a| a.font.name.clone()));
                 }
@@ -344,8 +382,7 @@ impl Host for VehicleHost {
             "stunlock" => {
                 let i = stacks.pop() as usize;
                 if let Some(t) = self.script_textures.get_mut(i) {
-                    t.locked = false;
-                    t.dirty = true;
+                    t.unlock();
                 }
             }
             "stfilter" => {
@@ -354,8 +391,10 @@ impl Host for VehicleHost {
                 // must also refresh the chain when this matrix changes again.
                 let i = stacks.pop() as usize;
                 if let Some(t) = self.script_textures.get_mut(i) {
-                    t.mipmaps = true;
-                    t.dirty = true;
+                    if !t.mipmaps {
+                        t.mipmaps = true;
+                        t.dirty = true;
+                    }
                 }
             }
             "stsetcolor" => {
@@ -533,7 +572,14 @@ impl Host for VehicleHost {
             "getttlinestring" => stacks.push_str(self.tt_line.clone()),
             "getttdelay" => stacks.push(self.tt_delay),
             "getttbusstopcount" => stacks.push(self.tt_stops.len() as f32),
-            "getttbusstopindex" => stacks.push(self.tt_busstop_index as f32),
+            // Without a timetable there is no current stop. Returning the first
+            // stop (0) makes the Atron repeatedly detect an arrival and clear its
+            // sales text after the holding brake has been on for three seconds.
+            "getttbusstopindex" => stacks.push(if self.tt_stops.is_empty() {
+                -1.0
+            } else {
+                self.tt_busstop_index as f32
+            }),
             "gettterminusindex" | "getttterminusindex" => stacks.push(self.tt_terminus_index as f32),
             // how high a point of the vehicle stands over the ground (the NL/NG ramp
             // measures the kerb this way before extending)
@@ -643,6 +689,22 @@ mod tests {
     use omsi_script::{compile, CompileInput, Vm};
 
     #[test]
+    fn departure_wants_keep_the_stops_asked_most_recently() {
+        let mut host = VehicleHost::new(SimClock::default());
+        for i in 0..MAX_HTML_DEPARTURE_STOPS + 3 {
+            host.want_departures(format!("stop {i}"));
+        }
+        assert_eq!(host.html_departure_wants.len(), MAX_HTML_DEPARTURE_STOPS);
+        assert_eq!(host.html_departure_wants.first().map(String::as_str), Some("stop 3"));
+        assert_eq!(host.html_departure_wants.last().map(String::as_str), Some("stop 10"));
+        // asked again: moves to the back and nothing is pushed out
+        host.want_departures("stop 3".to_string());
+        assert_eq!(host.html_departure_wants.len(), MAX_HTML_DEPARTURE_STOPS);
+        assert_eq!(host.html_departure_wants.last().map(String::as_str), Some("stop 3"));
+        assert_eq!(host.html_departure_wants.first().map(String::as_str), Some("stop 4"));
+    }
+
+    #[test]
     fn stfilter_marks_a_script_texture_for_mipmaps() {
         let dir = std::env::temp_dir().join(format!("omsi_host_stfilter_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -651,7 +713,7 @@ mod tests {
             &script,
             "{trigger:matrix_refresh}\n0 (M.V.STLock)\n0 (M.V.STUnlock)\n0 (M.V.STFilter)\n{end}\n",
         )
-        .unwrap();
+            .unwrap();
         let p = compile(&CompileInput {
             scripts: vec![script],
             ..Default::default()
@@ -669,6 +731,80 @@ mod tests {
         assert!(host.script_textures[0].dirty);
     }
 
+    #[test]
+    fn atron_unlock_filter_relock_publishes_the_released_image() {
+        let dir = std::env::temp_dir().join(format!(
+            "omsi_host_atron_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("atron.osc");
+        std::fs::write(
+            &script,
+            "{trigger:draw}\n0 (M.V.STLock)\n0 255 255 255 255 (M.V.STSetColor)\n0 1 1 (M.V.STDrawPixel)\n0 (M.V.STUnlock)\n0 (M.V.STFilter)\n0 (M.V.STLock)\n0 2 1 (M.V.STDrawPixel)\n{end}\n{trigger:publish}\n0 (M.V.STUnlock)\n0 (M.V.STFilter)\n0 (M.V.STLock)\n{end}\n",
+        ).unwrap();
+        let p = compile(&CompileInput {
+            scripts: vec![script],
+            ..Default::default()
+        });
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+        let mut host = VehicleHost::new(SimClock::default());
+        host.script_textures.push(ScriptTexture::new(4, 2));
+        let mut state = State::new(&p);
+        let mut vm = Vm::new();
+        assert!(vm.run_trigger(&p, "draw", &mut state, &mut host));
+        let t = &mut host.script_textures[0];
+        assert!(t.locked);
+        assert!(t.mipmaps);
+        let first = t.take_upload().expect("STUnlock must survive STLock in the same frame");
+        assert_eq!(&first[20..24], &[255; 4]);
+        assert_eq!(
+            &first[24..28],
+            &[0; 4],
+            "edits after relocking wait for the next unlock"
+        );
+        assert!(t.take_upload().is_none());
+        assert!(vm.run_trigger(&p, "publish", &mut state, &mut host));
+        let second = host.script_textures[0].take_upload().unwrap();
+        assert_eq!(&second[24..28], &[255; 4]);
+        assert!(vm.run_trigger(&p, "publish", &mut state, &mut host));
+        assert!(
+            host.script_textures[0].take_upload().is_none(),
+            "filtering unchanged pixels needs no new upload"
+        );
+    }
+
+    #[test]
+    fn atron_arrival_check_does_not_clear_sales_text_without_a_timetable() {
+        let dir = std::env::temp_dir().join(format!(
+            "omsi_host_atron_arrival_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("arrival.osc");
+        std::fs::write(&script, "{trigger:check}\n(M.V.GetTTBusstopIndex) 1 - -1 >=\n{if}\n0 (M.V.STNewTex)\n{endif}\n{end}\n").unwrap();
+        let p = compile(&CompileInput {
+            scripts: vec![script],
+            ..Default::default()
+        });
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+        let mut host = VehicleHost::new(SimClock::default());
+        host.script_textures.push(ScriptTexture::new(1, 1));
+        host.script_textures[0].put(0, 0, [255; 4]);
+        let mut state = State::new(&p);
+        let mut vm = Vm::new();
+        assert!(vm.run_trigger(&p, "check", &mut state, &mut host));
+        assert_eq!(host.script_textures[0].rgba, vec![255; 4]);
+        // The first stop of an actual timetable still reports an arrival.
+        host.tt_stops.push(("First stop".into(), 0.0, 0.0));
+        assert!(vm.run_trigger(&p, "check", &mut state, &mut host));
+        assert_eq!(host.script_textures[0].rgba, vec![0; 4]);
+        host.script_textures[0].put(0, 0, [255; 4]);
+        host.tt_stops.clear();
+        assert!(vm.run_trigger(&p, "check", &mut state, &mut host));
+        assert_eq!(host.script_textures[0].rgba, vec![255; 4]);
+    }
+
     /// The engine part of the stock SD200/SD202/NL202 collision block: a rear hit low down
     /// damages the engine, one at the front only the general account.
     #[test]
@@ -680,7 +816,7 @@ mod tests {
             &script,
             "{trigger:collision}\n(L.L.collision_energy) (L.S.coll_energy) + (S.L.collision_energy)\n(L.S.coll_pos_y) -4.70 <\n(L.S.coll_pos_z) 1.10 < &&\n{if}\n(L.L.collision_energy_eng) (L.S.coll_energy) + (S.L.collision_energy_eng)\n{endif}\n{end}\n",
         )
-        .unwrap();
+            .unwrap();
         let vars = dir.join("vars.txt");
         std::fs::write(&vars, "collision_energy\ncollision_energy_eng\n").unwrap();
         let p = compile(&CompileInput { varlists: vec![vars], scripts: vec![script], ..Default::default() });

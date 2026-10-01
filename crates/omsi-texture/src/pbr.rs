@@ -68,14 +68,19 @@ pub fn find(diffuse: &Path) -> PbrFiles {
         return out;
     };
     // (the folder's pictures listed once, archives too, and compared case-insensitively:
-    // mods mix `_N` and `_n`)
-    let listing = pictures_in(dir);
+    // mods mix `_N` and `_n`; and the same folder in every content root, highest priority
+    // first - maps put into the content folder beside a texture of the OMSI install were
+    // never found)
     let stem_l = stem.to_ascii_lowercase();
     let mut names: Vec<(String, PathBuf)> = Vec::new();
-    for (s, name) in listing.iter() {
-        if let Some(rest) = s.strip_prefix(&stem_l) {
-            if let Some(suffix) = rest.strip_prefix('_').or_else(|| rest.strip_prefix('-')) {
-                names.push((suffix.to_string(), dir.join(name)));
+    for d in omsi_cfg::mirrored_dirs(dir) {
+        for (s, name) in pictures_in(&d).iter() {
+            if let Some(rest) = s.strip_prefix(&stem_l) {
+                if let Some(suffix) = rest.strip_prefix('_').or_else(|| rest.strip_prefix('-')) {
+                    if !names.iter().any(|(k, _)| k == suffix) {
+                        names.push((suffix.to_string(), d.join(name)));
+                    }
+                }
             }
         }
     }

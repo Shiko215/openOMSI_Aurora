@@ -4,6 +4,7 @@
 
 use super::{Material, Mesh, O3dError, Triangle, Vertex};
 use glam::{Mat3, Mat4, Vec2, Vec3};
+use std::collections::HashMap;
 
 struct Tok<'a> {
     s: &'a str,
@@ -99,6 +100,10 @@ impl<'a> Tok<'a> {
 #[derive(Default)]
 struct Ctx {
     mesh: Mesh,
+    /// Named data objects in an .x file can be referenced from any frame or mesh.
+    named_materials: HashMap<String, Material>,
+    /// Resolve after the whole file, because definitions may follow their references.
+    material_refs: Vec<(usize, String)>,
 }
 
 pub fn parse_x(bytes: &[u8]) -> Result<Mesh, O3dError> {
@@ -113,8 +118,19 @@ pub fn parse_x(bytes: &[u8]) -> Result<Mesh, O3dError> {
     let (text, _) = encoding_rs::WINDOWS_1252.decode_without_bom_handling(bytes);
     let text = text.into_owned();
     let mut t = Tok { s: &text, p: 16 };
-    let mut ctx = Ctx { mesh: Mesh { transform: Mat4::IDENTITY, ..Default::default() } };
+    let mut ctx = Ctx {
+        mesh: Mesh {
+            transform: Mat4::IDENTITY,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     parse_objects(&mut t, &mut ctx, Mat4::IDENTITY)?;
+    for (slot, name) in &ctx.material_refs {
+        if let Some(material) = ctx.named_materials.get(name) {
+            ctx.mesh.materials[*slot] = material.clone();
+        }
+    }
     if ctx.mesh.materials.is_empty() {
         ctx.mesh.materials.push(Material::default());
     }
@@ -147,7 +163,13 @@ fn parse_objects(t: &mut Tok, ctx: &mut Ctx, xform: Mat4) -> Result<(), O3dError
                 t.expect("{")?;
                 parse_mesh(t, ctx, xform)?;
             }
-            "Material" | "AnimationSet" | "Animation" | "AnimTicksPerSecond" | "Header" => {
+            "Material" => {
+                let (name, material) = parse_material(t)?;
+                if let Some(name) = name {
+                    ctx.named_materials.insert(name, material);
+                }
+            }
+            "AnimationSet" | "Animation" | "AnimTicksPerSecond" | "Header" => {
                 if t.peek() != Some("{") {
                     t.next();
                 }
@@ -217,6 +239,12 @@ fn parse_frame(t: &mut Tok, ctx: &mut Ctx, parent: Mat4) -> Result<(), O3dError>
                 t.expect("{")?;
                 parse_mesh(t, ctx, xform)?;
             }
+            "Material" => {
+                let (name, material) = parse_material(t)?;
+                if let Some(name) = name {
+                    ctx.named_materials.insert(name, material);
+                }
+            }
             _ => {
                 if t.peek() != Some("{") {
                     t.next();
@@ -255,6 +283,7 @@ fn parse_mesh(t: &mut Tok, ctx: &mut Ctx, xform: Mat4) -> Result<(), O3dError> {
     let mut uvs: Vec<Vec2> = vec![Vec2::ZERO; nv];
     let mut face_mats: Vec<u16> = vec![0; nf];
     let mut mats: Vec<Material> = Vec::new();
+    let mut material_refs: Vec<(usize, String)> = Vec::new();
     loop {
         let tok = t.next().ok_or_else(|| O3dError::XFile("eof in mesh".into()))?;
         match tok {
@@ -319,39 +348,25 @@ fn parse_mesh(t: &mut Tok, ctx: &mut Ctx, xform: Mat4) -> Result<(), O3dError> {
                     match tk {
                         "}" => break,
                         "Material" => {
-                            if t.peek() != Some("{") {
-                                t.next();
+                            let (name, material) = parse_material(t)?;
+                            if let Some(name) = name {
+                                ctx.named_materials.insert(name, material.clone());
                             }
-                            t.expect("{")?;
-                            let diffuse = [t.number()?, t.number()?, t.number()?, t.number()?];
-                            let power = t.number()?;
-                            let specular = [t.number()?, t.number()?, t.number()?];
-                            let emissive = [t.number()?, t.number()?, t.number()?];
-                            let mut texture = String::new();
-                            loop {
-                                let x = t.next().ok_or_else(|| O3dError::XFile("eof in material".into()))?;
-                                match x {
-                                    "}" => break,
-                                    "TextureFilename" => {
-                                        if t.peek() != Some("{") {
-                                            t.next();
-                                        }
-                                        t.expect("{")?;
-                                        if let Some(q) = t.next() {
-                                            texture = q.trim_matches('"').to_string();
-                                        }
-                                        skip_to_close(t)?;
-                                    }
-                                    "{" => {
-                                        t.skip_block()?;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            mats.push(Material { diffuse, specular, emissive, specular_power: power, texture });
+                            mats.push(material);
                         }
                         "{" => {
-                            // material reference `{ name }`
+                            // Keep this slot even if the named material is defined later or
+                            // absent: dropping it changes every following face material index.
+                            let name = t.next().ok_or_else(|| {
+                                O3dError::XFile("eof in material reference".into())
+                            })?;
+                            if matches!(name, "{" | "}") {
+                                return Err(O3dError::XFile(
+                                    "missing material reference name".into(),
+                                ));
+                            }
+                            material_refs.push((mats.len(), name.to_string()));
+                            mats.push(Material::default());
                             t.skip_block()?;
                         }
                         _ => {}
@@ -381,8 +396,59 @@ fn parse_mesh(t: &mut Tok, ctx: &mut Ctx, xform: Mat4) -> Result<(), O3dError> {
             ctx.mesh.triangles.push(Triangle { indices: [base_v + f[0], base_v + f[k], base_v + f[k + 1]], material: m });
         }
     }
+    let material_base = ctx.mesh.materials.len();
+    ctx.material_refs.extend(
+        material_refs
+            .into_iter()
+            .map(|(slot, name)| (material_base + slot, name)),
+    );
     ctx.mesh.materials.extend(mats);
     Ok(())
+}
+
+/// A material declaration after its `Material` token, either inline or a named object.
+fn parse_material(t: &mut Tok) -> Result<(Option<String>, Material), O3dError> {
+    let name = if t.peek() != Some("{") {
+        t.next().map(str::to_string)
+    } else {
+        None
+    };
+    t.expect("{")?;
+    let diffuse = [t.number()?, t.number()?, t.number()?, t.number()?];
+    let power = t.number()?;
+    let specular = [t.number()?, t.number()?, t.number()?];
+    let emissive = [t.number()?, t.number()?, t.number()?];
+    let mut texture = String::new();
+    loop {
+        match t
+            .next()
+            .ok_or_else(|| O3dError::XFile("eof in material".into()))?
+        {
+            "}" => break,
+            "TextureFilename" => {
+                if t.peek() != Some("{") {
+                    t.next();
+                }
+                t.expect("{")?;
+                if let Some(q) = t.next() {
+                    texture = q.trim_matches('"').to_string();
+                }
+                skip_to_close(t)?;
+            }
+            "{" => t.skip_block()?,
+            _ => {}
+        }
+    }
+    Ok((
+        name,
+        Material {
+            diffuse,
+            specular,
+            emissive,
+            specular_power: power,
+            texture,
+        },
+    ))
 }
 
 fn skip_to_close(t: &mut Tok) -> Result<(), O3dError> {
@@ -401,6 +467,155 @@ fn skip_to_close(t: &mut Tok) -> Result<(), O3dError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    #[ignore = "requires installed traffic-light assets; set OMSI_ROOT or OMSI_TEST_CONTENT"]
+    fn installed_traffic_light_material_references() {
+        let Some(root) =
+            std::env::var_os("OMSI_ROOT").or_else(|| std::env::var_os("OMSI_TEST_CONTENT"))
+        else {
+            eprintln!("skipped: set OMSI_ROOT or OMSI_TEST_CONTENT to the installed content root");
+            return;
+        };
+        let object = std::path::PathBuf::from(root).join("Sceneryobjects/D016_semafory");
+        let mesh = crate::load_mesh(&object.join("model/semafor_3svetla.X")).unwrap();
+        assert!(!mesh.materials.is_empty());
+        assert!(!mesh.triangles.is_empty());
+        // This housing references PDX01; another globally declared material is unused.
+        // Resolving the wrong slot used to leave the housing white.
+        for material in &mesh.materials {
+            assert!(
+                material.texture.eq_ignore_ascii_case("semafor_zaklad.bmp"),
+                "unexpected housing texture: {}",
+                material.texture
+            );
+            let texture = omsi_cfg::resolve_path(&object.join("texture"), &material.texture);
+            assert!(
+                texture.is_file(),
+                "missing referenced texture: {}",
+                texture.display()
+            );
+        }
+        assert!(mesh
+            .triangles
+            .iter()
+            .all(|triangle| (triangle.material as usize) < mesh.materials.len()));
+    }
+
+    fn material_test_mesh(entries: &str) -> String {
+        format!(
+            "Mesh {{
+            3; 0;0;0;, 1;0;0;, 0;1;0;;
+            2; 3;0,1,2;, 3;0,2,1;;
+            MeshMaterialList {{ 2; 2; 0,1;; {entries} }}
+        }}"
+        )
+    }
+
+    /// Traffic signals exported by 3ds Max put named materials before their frames and
+    /// refer to them from each mesh. Ignoring those objects made the housings solid white.
+    #[test]
+    fn named_materials_keep_textures_colours_and_slot_order() {
+        let mesh = material_test_mesh(
+            r#"
+            { SignalHousing }
+            Material { 1;0;0;1;; 2; 0;0;0;; 0;0;0;; }
+        "#,
+        );
+        let x = format!(
+            r#"xof 0303txt 0032
+            template Material {{ <3d82ab4d-62da-11cf-ab39-0020af71e433> FLOAT ignored; }}
+            Material SignalHousing {{
+                0.1;0.2;0.3;0.4;; 8; 0.5;0.6;0.7;; 0.2;0.3;0.4;;
+                TextureFilename {{ "housing.bmp"; }}
+            }}
+            Frame Signal {{ {mesh} }}
+        "#
+        );
+        let parsed = parse_x(x.as_bytes()).unwrap();
+        assert_eq!(parsed.materials.len(), 2);
+        let housing = &parsed.materials[0];
+        assert_eq!(housing.texture, "housing.bmp");
+        assert_eq!(housing.diffuse, [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(housing.specular, [0.5, 0.6, 0.7]);
+        assert_eq!(housing.emissive, [0.2, 0.3, 0.4]);
+        assert_eq!(housing.specular_power, 8.0);
+        assert_eq!(parsed.materials[1].diffuse, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            parsed
+                .triangles
+                .iter()
+                .map(|t| t.material)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn material_references_resolve_forward_across_frames_and_inline_definitions() {
+        let first = material_test_mesh("{ LaterInFrame } { LaterInline }");
+        let second = material_test_mesh(
+            r#"
+            { LaterInFrame }
+            Material LaterInline {
+                1;1;1;1;; 1; 0;0;0;; 1;1;1;;
+                TextureFilename { "lamp.bmp"; }
+            }
+        "#,
+        );
+        let x = format!(
+            r#"xof 0303txt 0032
+            Frame First {{ {first} }}
+            Frame Second {{
+                Material LaterInFrame {{
+                    1;1;1;1;; 1; 0;0;0;; 0;0;0;;
+                    TextureFilename {{ "housing.bmp"; }}
+                }}
+                Frame Child {{ {second} }}
+            }}
+        "#
+        );
+        let parsed = parse_x(x.as_bytes()).unwrap();
+        let textures: Vec<&str> = parsed
+            .materials
+            .iter()
+            .map(|m| m.texture.as_str())
+            .collect();
+        assert_eq!(
+            textures,
+            ["housing.bmp", "lamp.bmp", "housing.bmp", "lamp.bmp"]
+        );
+        assert_eq!(
+            parsed
+                .triangles
+                .iter()
+                .map(|t| t.material)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn missing_material_reference_preserves_following_slots() {
+        let mesh = material_test_mesh(
+            r#"
+            { NotDeclared }
+            Material { 1;0;0;1;; 1; 0;0;0;; 0;0;0;; }
+        "#,
+        );
+        let parsed = parse_x(format!("xof 0303txt 0032\n{mesh}").as_bytes()).unwrap();
+        assert_eq!(parsed.materials[0], Material::default());
+        assert_eq!(parsed.materials[1].diffuse, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(
+            parsed
+                .triangles
+                .iter()
+                .map(|t| t.material)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+    }
 
     /// A Blender export: the root frame swaps Y and Z, the child frame scales, turns about
     /// its up axis and moves the mesh 5.5 m forward and 1.3 m up (the Atron terminal's frames).

@@ -85,6 +85,10 @@ pub struct SyncTable {
     /// The outside sounds: `[sound_ai]` (or `[sound]`), and the horn and indicator relay
     /// entries of `[sound]` - with the folder their files are in.
     sounds: Vec<(Arc<omsi_vehicle::SoundCfg>, PathBuf)>,
+    /// The whole `[sound]` set, heard from inside by whoever rides in the bus.
+    interior: Option<(Arc<omsi_vehicle::SoundCfg>, PathBuf)>,
+    /// The rear sections' outside sounds (`[sound_ai]`, or `[sound]`), by section.
+    part_sounds: Vec<(usize, Arc<omsi_vehicle::SoundCfg>, PathBuf)>,
 }
 
 /// Engine variables every copy works out for itself (or that come in the pose).
@@ -132,8 +136,13 @@ fn fnv1a(data: &[u8]) -> u32 {
 }
 
 impl SyncTable {
-    pub fn new(ty: &omsi_sim::VehicleType) -> SyncTable {
+    /// `parts`: the types of its rear sections, whose lamps, displays, moving parts and
+    /// sounds follow the leading vehicle's variables as its own do (an articulated bus's
+    /// rear section stood dark and silent in the other players' games: none of its
+    /// variables were in the table).
+    pub fn new(ty: &omsi_sim::VehicleType, parts: &[Arc<omsi_sim::VehicleType>]) -> SyncTable {
         let program = &ty.program;
+        let types: Vec<&omsi_sim::VehicleType> = std::iter::once(ty).chain(parts.iter().map(|p| p.as_ref())).collect();
         let var = |n: &str| -> Option<VarId> {
             let n = n.trim();
             if n.is_empty() || n.parse::<f32>().is_ok() {
@@ -155,15 +164,14 @@ impl SyncTable {
             v.truncate(cap);
             v
         };
-        let model = &ty.model;
         let paint_vars: Vec<String> = ty
             .paint_schemes
             .iter()
             .flat_map(|s| s.set_vars.iter().map(|(n, _)| n.to_ascii_lowercase()))
             .collect();
-        let lamp_names = model
-            .meshes
+        let lamp_names = types
             .iter()
+            .flat_map(|t| t.model.meshes.iter())
             .flat_map(|m| {
                 m.materials
                     .iter()
@@ -177,15 +185,15 @@ impl SyncTable {
                     .chain(m.light_enh.iter().map(|l| l.variable.clone()))
                     .chain(m.light_enh_2.iter().map(|l| l.variable.clone()))
             })
-            .chain(model.interior_lights.iter().map(|l| l.variable.clone()));
+            .chain(types.iter().flat_map(|t| t.model.interior_lights.iter()).map(|l| l.variable.clone()));
         let lamps = collect(
             &mut lamp_names.collect::<Vec<_>>().into_iter(),
             &|n| engine_fed(n) || paint_vars.contains(&n.to_ascii_lowercase()),
             omsi_net::wire::MAX_LAMPS,
         );
-        let switch_names: Vec<String> = model
-            .meshes
+        let switch_names: Vec<String> = types
             .iter()
+            .flat_map(|t| t.model.meshes.iter())
             .filter_map(|m| m.visible.as_ref().map(|v| v.0.clone()))
             .collect();
         let lamp_set: Vec<VarId> = lamps.iter().map(|l| l.1).collect();
@@ -214,6 +222,7 @@ impl SyncTable {
             }
         };
         let mut sounds = Vec::new();
+        let interior = def.sound.as_deref().and_then(|rel| load(rel));
         if let Some(rel) = def.sound_ai.as_deref().or(def.sound.as_deref()) {
             sounds.extend(load(rel));
         }
@@ -236,16 +245,37 @@ impl SyncTable {
                 }
             }
         }
-        let mut value_names: Vec<String> = Vec::new();
-        for (cfg, _) in &sounds {
-            for e in &cfg.sounds {
-                value_names.extend(e.vol_curves.iter().map(|c| c.variable.clone()));
-                value_names.extend(e.conditions.iter().map(|c| c.variable.clone()));
-                if !e.pitch_variable.is_empty() {
-                    value_names.push(e.pitch_variable.clone());
+        // the rear sections' outside sounds, each where its section is
+        let mut part_sounds = Vec::new();
+        for (k, part) in parts.iter().enumerate() {
+            let pdef = &part.def;
+            if let Some(rel) = pdef.sound_ai.as_deref().or(pdef.sound.as_deref()) {
+                let path = omsi_cfg::resolve_path(pdef.dir(), rel);
+                match omsi_vehicle::SoundCfg::load(&path) {
+                    Ok(c) => part_sounds.push((k, Arc::new(c), path.parent().map(|p| p.to_path_buf()).unwrap_or_default())),
+                    Err(e) => log::warn!("LAN: sounds of {}: {e}", pdef.path.display()),
                 }
             }
         }
+        // the variables the outside sounds follow: the leading vehicle's, then the rear
+        // sections' (whatever of the capped list those leave)
+        let sound_vars = |cfgs: &mut dyn Iterator<Item = &Arc<omsi_vehicle::SoundCfg>>| -> Vec<String> {
+            let mut out = Vec::new();
+            for cfg in cfgs {
+                for e in &cfg.sounds {
+                    out.extend(e.vol_curves.iter().map(|c| c.variable.clone()));
+                    out.extend(e.conditions.iter().map(|c| c.variable.clone()));
+                    if !e.pitch_variable.is_empty() {
+                        out.push(e.pitch_variable.clone());
+                    }
+                }
+            }
+            out
+        };
+        let sound_names = sound_vars(&mut sounds.iter().map(|s| &s.0));
+        let part_sound_names = sound_vars(&mut part_sounds.iter().map(|s| &s.1));
+        // what moves where it can be seen
+        let mut value_names: Vec<String> = Vec::new();
         // the parts that move where they can be seen (not the cockpit's switches)
         // - and the doors opened by hand, whose meshes are clickable: the W906's cab and rear
         // doors (`[mouseevent] cp_kryshka1_opn`, "kryshka" a Russian mod's word for a
@@ -255,8 +285,8 @@ impl SyncTable {
             let t = t.to_ascii_lowercase();
             DOORISH.iter().any(|k| t.contains(k))
         };
-        for (i, m) in model.meshes.iter().enumerate() {
-            if !ty.meshes.iter().any(|vm| vm.def_index == i) {
+        for (t, i, m) in types.iter().flat_map(|t| t.model.meshes.iter().enumerate().map(move |(i, m)| (t, i, m))) {
+            if !t.meshes.iter().any(|vm| vm.def_index == i) {
                 continue;
             }
             let file = m.file.to_ascii_lowercase();
@@ -272,15 +302,27 @@ impl SyncTable {
         // the water on the windows (the sender's wipers wipe it: another player's bus stood
         // dry in the rain, its window films left out as engine-fed `rain_` variables)
         let rain_film = |n: &str| n.trim().to_ascii_lowercase().starts_with("rain_window");
-        for m in &model.meshes {
+        for m in types.iter().flat_map(|t| t.model.meshes.iter()) {
             value_names.extend(m.materials.iter().filter_map(|mat| mat.alphascale.clone()).filter(|n| rain_film(n)));
+            // what scrolls a texture along its slot: a roller blind turning to the next
+            // number (its pictures come in the pose, see `freetex_names`)
+            value_names.extend(m.materials.iter().flat_map(|mat| mat.texcoord_trans_x.iter().chain(mat.texcoord_trans_y.iter()).cloned()));
         }
         let taken: Vec<VarId> = lamps.iter().chain(&switches).map(|l| l.1).collect();
-        let values = collect(
-            &mut value_names.into_iter(),
-            &|n| (engine_fed(n) && !rain_film(n)) || var(n).map(|id| taken.contains(&id)).unwrap_or(true),
-            omsi_net::wire::MAX_VALUES,
-        );
+        // What is seen first, then the leading vehicle's sounds, then the rear sections',
+        // each sorted by name: the list is capped, and taken as one list in name order the
+        // rear sections' sound variables pushed what is seen out of it.
+        let skip = |n: &str| (engine_fed(n) && !rain_film(n)) || var(n).map(|id| taken.contains(&id)).unwrap_or(true);
+        let mut values = collect(&mut value_names.into_iter(), &skip, omsi_net::wire::MAX_VALUES);
+        for names in [sound_names, part_sound_names] {
+            let had: Vec<VarId> = values.iter().map(|v| v.1).collect();
+            let more = collect(
+                &mut names.into_iter(),
+                &|n| skip(n) || var(n).is_some_and(|id| had.contains(&id)),
+                omsi_net::wire::MAX_VALUES - values.len(),
+            );
+            values.extend(more);
+        }
         let doors: Vec<VarId> = (0..omsi_net::wire::MAX_DOORS)
             .map_while(|i| program.var(&format!("door_{i}")))
             .collect();
@@ -332,6 +374,8 @@ impl SyncTable {
             throttle: var("Throttle"),
             brake: var("Brake"),
             sounds,
+            interior,
+            part_sounds,
         }
     }
 
@@ -339,23 +383,26 @@ impl SyncTable {
         let names =
             |l: &[(String, VarId)]| l.iter().map(|x| x.0.as_str()).collect::<Vec<_>>().join(" ");
         format!(
-            "{} lamps, {} switches, {} doors, values [{}], {} sound set(s), table {:08X}",
+            "{} lamps, {} switches, {} doors, values [{}], {} sound set(s) and {} of rear sections, table {:08X}",
             self.lamps.len(),
             self.switches.len(),
             self.doors.len(),
             names(&self.values),
             self.sounds.len(),
+            self.part_sounds.len(),
             self.hash
         )
     }
 }
 
 /// The sync table of a vehicle type (worked out once per type).
-fn sync_table(game: &mut LanGame, ty: &omsi_sim::VehicleType) -> Arc<SyncTable> {
+fn sync_table(game: &mut LanGame, v: &omsi_sim::VehicleInstance) -> Arc<SyncTable> {
+    let ty = &v.ty;
     game.tables
         .entry(ty.def.path.clone())
         .or_insert_with(|| {
-            let t = Arc::new(SyncTable::new(ty));
+            let parts: Vec<Arc<omsi_sim::VehicleType>> = v.trailers.iter().map(|t| t.ty.clone()).collect();
+            let t = Arc::new(SyncTable::new(ty, &parts));
             log::info!(
                 "LAN: sync table of {}: {}",
                 ty.def.path.display(),
@@ -378,6 +425,8 @@ pub struct RemoteVehicle {
     pub name: String,
     table: Arc<SyncTable>,
     sounds: Vec<omsi_audio::SoundSet>,
+    /// Its `[sound]` heard from inside, while we ride in it (`SyncTable::interior`).
+    inside_sounds: Option<omsi_audio::SoundSet>,
     /// Where the latest pose puts the bus and its rear sections, for smoothing between
     /// network updates.
     target: (DVec3, f64),
@@ -409,6 +458,8 @@ pub struct RemoteVehicle {
     /// state, and whoever stood in it shook).
     samples: std::collections::VecDeque<(f64, Pose)>,
     offset: Option<f64>,
+    /// The moment of theirs drawn (see `PlayClock`).
+    play: crate::lan_world::PlayClock,
 }
 
 impl RemoteVehicle {
@@ -521,6 +572,10 @@ pub struct LanGame {
     last_received: u64,
     /// The host's weather last taken over from its clock messages.
     weather_seen: Option<String>,
+    /// Vehicles another player drives that could not be made here, and when that was
+    /// tried: tried again only after a while (every frame, a server read a big add-on bus
+    /// it could not load over and over and stood still for everybody).
+    failed: hashbrown::HashMap<(u32, String), std::time::Instant>,
 }
 
 /// What the frame knows that LAN play needs.
@@ -680,8 +735,22 @@ pub fn open_public_gateway(session: &LanSession, info: omsi_net::ws::ServerInfo,
         // relay keeps it for hours, a joining game takes the latest - and counts the posts)
         let mut posted: Option<(String, Instant)> = None;
         let mut checked = Instant::now();
+        // the official server (`OMSI_OFFICIAL_KEY`: its signing key's file) says where it is
+        // reached every five minutes, for the players who type `openomsi`
+        let official = omsi_cfg::env::var_os("OMSI_OFFICIAL_KEY").and_then(|p| std::fs::read(&p).map_err(|e| log::warn!("official key {}: {e}", std::path::Path::new(&p).display())).ok());
+        let mut announced: Option<(String, Instant)> = None;
         loop {
             let now = url.lock().ok().and_then(|u| u.clone());
+            if let (Some(key), Some(u)) = (official.as_ref(), now.as_ref()) {
+                let due = announced.as_ref().is_none_or(|(a, t)| a != u || t.elapsed() > Duration::from_secs(300));
+                if due {
+                    match omsi_net::official::announce(u, key) {
+                        Ok(()) => log::info!("official server: announced at {u}"),
+                        Err(e) => log::warn!("official server: not announced: {e}"),
+                    }
+                    announced = Some((u.clone(), Instant::now()));
+                }
+            }
             match (now, &posted) {
                 (Some(u), None) => {
                     omsi_net::bridge::post_tunnel(sid, &u);
@@ -1020,7 +1089,16 @@ pub fn take_host_map(args: &mut Args, lan: &mut LanSession) {
     let Some(theirs) = lan.welcome.as_ref().map(|w| w.world.map.trim().replace('\\', "/")) else {
         return;
     };
-    let norm = |s: &str| s.trim().replace('\\', "/").to_ascii_lowercase();
+    // (the same map, however its path was written: from its `maps/` folder on - a map
+    // chosen as a whole path, or out of an archive, is still the host's one, and taking it
+    // for another map dropped the line and tour chosen: everybody drove without a duty)
+    let norm = |s: &str| {
+        let s = s.trim().replace('\\', "/").to_ascii_lowercase();
+        match s.rfind("maps/") {
+            Some(k) => s[k..].to_string(),
+            None => s,
+        }
+    };
     if theirs.is_empty() || norm(&theirs) == norm(&args.map) {
         return;
     }
@@ -1504,7 +1582,7 @@ pub fn my_pose(
 ) -> Pose {
     let Some(p) = p else { return Pose::default() };
     let v = &p.vehicle;
-    let table = sync_table(game, &v.ty);
+    let table = sync_table(game, v);
     let val = |n: &str| v.var(n).unwrap_or(0.0);
     let on = |n: &str| val(n) > 0.5;
     let get = |id: VarId| v.state.vars.get(id as usize).copied().unwrap_or(0.0);
@@ -1572,6 +1650,7 @@ pub fn my_pose(
     let box_offset = ((fp.x - v.position.x) * h.sin() + (fp.y - v.position.y) * h.cos()) as f32;
     let (line, destination) = line_and_destination(p, duty);
     let texts = display_texts(v);
+    let freetex = freetex_values(v);
     Pose {
         id: 0,
         name: String::new(),
@@ -1581,6 +1660,7 @@ pub fn my_pose(
         destination,
         tour: String::new(),
         texts,
+        freetex,
         figure: p.driver.as_ref().map(|d| content_relative(&d.human_type().def.path, &args.root)).unwrap_or_default(),
         length: fp.length.max(bb[1]),
         width: bb[0],
@@ -1627,14 +1707,70 @@ pub fn my_pose(
     }
 }
 
-/// The strings the vehicle's `[texttexture]` displays show, in the model's order.
+/// The string variables the vehicle's `[texttexture]` displays show: the model's, in its
+/// order, then those of its rear sections' displays that the model has not (a side
+/// destination sign on an articulated bus's rear section stood blank for the others).
+fn display_vars(v: &omsi_sim::VehicleInstance) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let models = std::iter::once(&v.ty.model).chain(v.trailers.iter().map(|t| &t.ty.model));
+    for t in models.flat_map(|m| m.text_textures.iter()) {
+        let n = t.variable.trim();
+        if !names.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+            names.push(n.to_string());
+        }
+    }
+    names.truncate(omsi_net::MAX_TEXTS);
+    names
+}
+
+/// The strings the vehicle's `[texttexture]` displays show (see [`display_vars`]).
 fn display_texts(v: &omsi_sim::VehicleInstance) -> Vec<String> {
-    v.ty.model
-        .text_textures
+    display_vars(v)
         .iter()
-        .take(omsi_net::MAX_TEXTS)
-        .map(|t| v.ty.program.str_var(t.variable.trim()).and_then(|i| v.state.str_vars.get(i as usize)).cloned().unwrap_or_default())
+        .map(|n| v.ty.program.str_var(n).and_then(|i| v.state.str_vars.get(i as usize)).cloned().unwrap_or_default())
         .collect()
+}
+
+/// The `[matl_freetex]` string variables of a vehicle type, sorted by name (both games
+/// agree on the order): the picture a slot shows is the file one of them names - a roller
+/// blind's number, a sign. Worked out by the sender's scripts alone.
+fn freetex_names(ty: &omsi_sim::VehicleType) -> Vec<String> {
+    let mut names: Vec<String> = ty
+        .model
+        .meshes
+        .iter()
+        .flat_map(|m| m.materials.iter().filter_map(|mat| mat.freetex.as_ref().map(|f| f.1.trim().to_string())))
+        .filter(|n| ty.program.str_var(n).is_some())
+        .collect();
+    names.sort_by_key(|n| n.to_ascii_lowercase());
+    names.dedup_by_key(|n| n.to_ascii_lowercase());
+    names.truncate(omsi_net::MAX_FREETEX);
+    names
+}
+
+/// What the vehicle's `[matl_freetex]` variables hold now (see [`freetex_names`]).
+fn freetex_values(v: &omsi_sim::VehicleInstance) -> Vec<String> {
+    freetex_names(&v.ty)
+        .iter()
+        .map(|n| v.ty.program.str_var(n).and_then(|i| v.state.str_vars.get(i as usize)).cloned().unwrap_or_default())
+        .collect()
+}
+
+/// Show another player's `[matl_freetex]` pictures on their bus here: their copy's scripts
+/// do not run the roller blind, which stood empty (the line number never showed).
+fn show_freetex(v: &mut omsi_sim::VehicleInstance, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    for (name, value) in freetex_names(&v.ty).iter().zip(values) {
+        if let Some(i) = v.ty.program.str_var(name) {
+            if let Some(s) = v.state.str_vars.get_mut(i as usize) {
+                if s != value {
+                    *s = value.clone();
+                }
+            }
+        }
+    }
 }
 
 /// Show another player's display texts on their bus here (same files, same order).
@@ -1642,8 +1778,8 @@ fn show_display_texts(v: &mut omsi_sim::VehicleInstance, texts: &[String]) {
     if texts.is_empty() {
         return;
     }
-    for (t, text) in v.ty.model.text_textures.clone().iter().zip(texts) {
-        if let Some(i) = v.ty.program.str_var(t.variable.trim()) {
+    for (name, text) in display_vars(v).iter().zip(texts) {
+        if let Some(i) = v.ty.program.str_var(name) {
             if let Some(s) = v.state.str_vars.get_mut(i as usize) {
                 if s != text {
                     *s = text.clone();
@@ -2048,19 +2184,32 @@ fn remote_bus_file(args: &Args, bus: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Load the type a remote player drives, or ours as a stand-in.
+/// Load the type a remote player drives, or a stand-in: ours, or on a server the first of
+/// the buses its `vehicles` list allows. A bus the list does not allow is not loaded at all
+/// (a player joining with another than the server offers).
 fn remote_type(
     args: &Args,
     pose: &Pose,
     player: Option<&Player>,
 ) -> Option<(Arc<omsi_sim::VehicleType>, bool)> {
-    let loaded = remote_bus_file(args, &pose.bus)
-        .and_then(|path| omsi_sim::VehicleType::load(&args.root, &path).map_err(|e| e.to_string()));
+    let allowed = crate::server::SERVER_VEHICLES.get().filter(|l| !l.is_empty());
+    let norm = |s: &str| s.trim().replace('\\', "/").to_ascii_lowercase();
+    let listed = allowed.map(|l| l.iter().any(|v| norm(v) == norm(&pose.bus) || norm(&pose.bus).ends_with(&norm(v)))).unwrap_or(true);
+    let loaded = if listed {
+        remote_bus_file(args, &pose.bus).and_then(|path| omsi_sim::VehicleType::load(&args.root, &path).map_err(|e| e.to_string()))
+    } else {
+        Err("the server does not offer it".to_string())
+    };
     match loaded {
         Ok(t) => Some((Arc::new(t), false)),
         Err(e) => {
-            log::warn!("LAN: player {} drives {:?}, which cannot be loaded here ({e}); showing our own bus type", pose.id, pose.bus);
-            player.map(|p| (p.vehicle.ty.clone(), true))
+            log::warn!("LAN: player {} drives {:?}, which cannot be loaded here ({e}); showing a stand-in", pose.id, pose.bus);
+            if let Some(p) = player {
+                return Some((p.vehicle.ty.clone(), true));
+            }
+            let first = allowed.and_then(|l| l.first())?;
+            let path = remote_bus_file(args, first).ok()?;
+            omsi_sim::VehicleType::load(&args.root, &path).ok().map(|t| (Arc::new(t), true))
         }
     }
 }
@@ -2077,12 +2226,19 @@ fn new_remote(
     clock: Option<&omsi_sim::SimClock>,
 ) -> Option<RemoteVehicle> {
     let (ty, stand_in) = remote_type(args, pose, player)?;
-    let table = sync_table(game, &ty);
     let mut host =
         omsi_sim::VehicleHost::new(clock.cloned().unwrap_or_else(|| crate::start_clock(args)));
     host.font_lib = Some(world.fonts.clone());
     let hof = crate::find_hof(args, world, &ty);
     host.hof = hof.clone();
+    let scheme = if pose.paint.is_empty() {
+        None
+    } else {
+        ty.paint_schemes
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(&pose.paint))
+    };
+    host.paint_scheme = Some(scheme);
     let mut vehicle = omsi_sim::VehicleInstance::new(ty.clone(), host);
     vehicle.ground = None;
     if !ty.model.text_textures.is_empty() {
@@ -2092,23 +2248,16 @@ fn new_remote(
                 .map(|i| (i.width, i.height, i.rgba))
         });
     }
-    let scheme = if pose.paint.is_empty() {
-        None
-    } else {
-        ty.paint_schemes
-            .iter()
-            .position(|s| s.name.eq_ignore_ascii_case(&pose.paint))
-    };
     vehicle.apply_paint_vars(scheme);
-    let render = world.add_vehicle_shared(r, scene, &ty, scheme);
+    let render = world.add_vehicle_shared(r, scene, &ty, scheme, None);
     // the coupled sections of an articulated bus
     let mut trailer_renders = Vec::new();
     let mut lead = ty.clone();
-    for _ in 0..4 {
-        let Some((file, _)) = lead.def.couple_back.clone() else {
+    let mut lead_rev = false;
+    for _ in 0..8 {
+        let Some((path, rev)) = crate::spawn::next_coupled(&lead.def, lead_rev, true) else {
             break;
         };
-        let path = omsi_cfg::resolve_path(lead.def.dir(), &file);
         match omsi_sim::VehicleType::load(&args.root, &path) {
             Ok(t) => {
                 let t = Arc::new(t);
@@ -2117,9 +2266,11 @@ fn new_remote(
                     scene,
                     &t,
                     scheme.filter(|i| *i < t.paint_schemes.len()),
+                    Some(&render),
                 ));
-                vehicle.attach_trailer(t.clone());
+                vehicle.attach_trailer_ex(t.clone(), rev);
                 lead = t;
+                lead_rev = rev;
             }
             Err(e) => {
                 log::warn!("LAN: rear section {}: {e}", path.display());
@@ -2127,6 +2278,8 @@ fn new_remote(
             }
         }
     }
+    // (with its rear sections: theirs are in the table too)
+    let table = sync_table(game, &vehicle);
     vehicle.position = DVec3::new(pose.x, pose.y, pose.z);
     vehicle.heading = pose.heading as f64;
     let rear: Vec<(DVec3, f64)> = pose
@@ -2166,6 +2319,7 @@ fn new_remote(
         name: pose.name.clone(),
         table,
         sounds: Vec::new(),
+        inside_sounds: None,
         target: (DVec3::new(pose.x, pose.y, pose.z), pose.heading as f64),
         rear,
         pose_seen: (DVec3::new(pose.x, pose.y, pose.z), Instant::now()),
@@ -2182,6 +2336,7 @@ fn new_remote(
         driver_tried: false,
         samples: std::collections::VecDeque::new(),
         offset: None,
+        play: Default::default(),
     })
 }
 
@@ -2210,6 +2365,7 @@ impl RemoteVehicle {
                 if self.samples.back().map(|b| b.0 - sent > 30.0).unwrap_or(false) {
                     self.samples.clear();
                     self.offset = None;
+                    self.play = Default::default();
                 } else {
                     continue;
                 }
@@ -2232,7 +2388,7 @@ impl RemoteVehicle {
     /// Their state as it was `INTERP_DELAY` ago: between the two states around that moment,
     /// or carried on from the last one along its way for a short while. None without
     /// stamped states (an older game).
-    fn interpolated(&self) -> Option<Pose> {
+    fn interpolated(&mut self) -> Option<Pose> {
         // (`OMSI_NO_INTERP=1`: the old way, for comparing)
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *OFF.get_or_init(|| omsi_cfg::env::var_os("OMSI_NO_INTERP").is_some()) {
@@ -2249,7 +2405,11 @@ impl RemoteVehicle {
         } else {
             0.05
         };
-        let t = lan_now() - off - (gap * 2.0 + 0.02).clamp(INTERP_DELAY, 0.45);
+        // (the moment drawn follows that smoothly: set anew each frame, it went back a
+        // few hundredths of a second whenever one of their frames had taken long, and on
+        // again when that one was no longer among the last four - the bus jumped)
+        let now = lan_now();
+        let t = self.play.step(now, now - off - (gap * 2.0 + 0.02).clamp(INTERP_DELAY, 0.45), 0.5);
         let k = self.samples.iter().rposition(|(st, _)| *st <= t);
         let Some(k) = k else {
             return self.samples.front().map(|x| x.1.clone());
@@ -2516,6 +2676,7 @@ fn drive_remote(rv: &mut RemoteVehicle, pose: &Pose, dt: f32, exact: bool) {
         brake: pose.flags & omsi_net::FLAG_BRAKE != 0 || pose.brake > 0.1,
         lights: pose.head >= 2,
         at_station: if doors_open { 1 } else { -1 },
+        priority_warning: false,
     };
     rv.vehicle.update_ai_with(dt, &frame, &inputs, &pinned);
     rv.last = pose.clone();
@@ -2527,6 +2688,7 @@ fn sound_remote(
     audio: Option<&omsi_audio::AudioEngine>,
     listener: Option<DVec3>,
     muffled: bool,
+    inside: bool,
 ) {
     let fired: Vec<String> = std::mem::take(&mut rv.vehicle.host.fired_triggers);
     let fired_files: Vec<(String, String)> =
@@ -2534,6 +2696,34 @@ fn sound_remote(
     let (Some(audio), Some(at)) = (audio, listener) else {
         return;
     };
+    // Riding in it: its whole `[sound]` heard from inside, as our own bus is heard from its
+    // cab - not its outside sounds muffled, which a passenger heard as if standing in the
+    // street beside it (the exterior engine, the tyres, the doors from outside).
+    let interior = inside.then_some(()).and(rv.table.interior.clone());
+    if let Some((cfg, dir)) = interior {
+        for mut s in rv.sounds.drain(..) {
+            s.stop_all(audio);
+        }
+        if rv.inside_sounds.is_none() && audio.clips_ready(&omsi_audio::SoundSet::clip_paths(&cfg, &dir)) {
+            let number = rv.vehicle.number();
+            rv.inside_sounds = Some(omsi_audio::SoundSet::new(audio, &cfg.chosen_for(&number), &dir));
+        }
+        if let Some(ss) = rv.inside_sounds.as_mut() {
+            let xf = rv.vehicle.world_transform();
+            let v = &rv.vehicle;
+            ss.set_inside(true);
+            ss.set_muffled(true);
+            ss.set_listener_vehicle(true);
+            ss.update(audio, &|n| v.var(n), &xf, &fired);
+            for (t, f) in &fired_files {
+                ss.play_file_trigger(audio, t, f, &|n| v.var(n), &xf);
+            }
+        }
+        return;
+    }
+    if let Some(mut s) = rv.inside_sounds.take() {
+        s.stop_all(audio);
+    }
     let d = (rv.vehicle.position - at).length();
     if d > HEAR_RANGE * 1.2 {
         for mut s in rv.sounds.drain(..) {
@@ -2547,6 +2737,8 @@ fn sound_remote(
             .table
             .sounds
             .iter()
+            .map(|(cfg, dir)| (cfg, dir))
+            .chain(rv.table.part_sounds.iter().map(|(_, cfg, dir)| (cfg, dir)))
             .all(|(cfg, dir)| audio.clips_ready(&omsi_audio::SoundSet::clip_paths(cfg, dir)));
         if ready {
             let number = rv.vehicle.number();
@@ -2556,6 +2748,12 @@ fn sound_remote(
                 .iter()
                 .map(|(cfg, dir)| omsi_audio::SoundSet::new_exterior(audio, &cfg.chosen_for(&number), dir))
                 .collect();
+            // the rear sections' sounds ride on the first set, each at its section
+            if let Some(first) = rv.sounds.first_mut() {
+                for (k, cfg, dir) in &rv.table.part_sounds {
+                    first.add_part(*k, omsi_audio::SoundSet::new_exterior(audio, &cfg.chosen_for(&number), dir));
+                }
+            }
         }
     }
     let xf = rv.vehicle.world_transform();
@@ -2563,6 +2761,7 @@ fn sound_remote(
     for ss in rv.sounds.iter_mut() {
         ss.set_muffled(muffled);
         ss.update(audio, &|n| v.var(n), &xf, &fired);
+        ss.update_parts(audio, &|n| v.var(n), &|i| v.trailers.get(i).map(|t| t.world_transform()), &fired);
         for (t, f) in &fired_files {
             ss.play_file_trigger(audio, t, f, &|n| v.var(n), &xf);
         }
@@ -2757,6 +2956,10 @@ pub fn tick(
             }
         }
         if !game.remotes.contains_key(&pose.id) {
+            let key = (pose.id, pose.bus.clone());
+            if game.failed.get(&key).is_some_and(|t| t.elapsed().as_secs_f32() < 30.0) {
+                continue;
+            }
             let Some(rv) = new_remote(
                 game,
                 args,
@@ -2767,8 +2970,10 @@ pub fn tick(
                 scene,
                 frame.clock,
             ) else {
+                game.failed.insert(key, std::time::Instant::now());
                 continue;
             };
+            game.failed.remove(&key);
             game.remotes.insert(pose.id, rv);
         }
         let Some(rv) = game.remotes.get_mut(&pose.id) else {
@@ -2812,12 +3017,15 @@ pub fn tick(
                 ip.line = pose.line.clone();
                 ip.destination = pose.destination.clone();
                 ip.texts = pose.texts.clone();
+                ip.freetex = pose.freetex.clone();
                 drive_remote(rv, &ip, dt, true);
             }
             None => drive_remote(rv, &pose, dt, false),
         }
         show_display_texts(&mut rv.vehicle, &pose.texts);
-        sound_remote(rv, frame.audio, frame.listener, frame.muffled);
+        show_freetex(&mut rv.vehicle, &pose.freetex);
+        let inside = frame.inside_of == Some(pose.id);
+        sound_remote(rv, frame.audio, frame.listener, frame.muffled, inside);
     }
     // draw them like AI traffic
     for (id, rv) in game.remotes.iter_mut() {
@@ -3128,6 +3336,50 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What is seen comes before what is heard in the capped values list: the AA-FR Agora
+    /// L's sound variables filled it in name order before its roller blind's scroll.
+    #[test]
+    fn the_roller_blind_scroll_is_in_the_sync_table() {
+        let root = omsi_cfg::env::var_os("OMSI_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("../../../OMSI 2 Original"));
+        let bus = root.join("Vehicles/AA-FR_BusBundle/2002_Agora_L_4d_main.bus");
+        if !bus.exists() {
+            eprintln!("skipped: no {}", bus.display());
+            return;
+        }
+        let ty = omsi_sim::VehicleType::load(&root, &bus).expect("Agora L");
+        let t = SyncTable::new(&ty, &[]);
+        assert!(t.values.len() <= omsi_net::wire::MAX_VALUES);
+        for want in ["Rollband_Linie_Trans", "Rollband_Linie_Trans_2"] {
+            assert!(t.values.iter().any(|v| v.0.eq_ignore_ascii_case(want)), "no {want}: {}", t.describe());
+        }
+    }
+
+    /// An articulated bus's rear section is in its sync table: its lamps, displays' switches
+    /// and outside sounds (the AA-FR Agora L's rear section stood dark and silent in the
+    /// other players' games).
+    #[test]
+    fn the_rear_section_is_in_the_sync_table() {
+        let root = omsi_cfg::env::var_os("OMSI_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("../../../OMSI 2 Original"));
+        let bus = root.join("Vehicles/AA-FR_BusBundle/2002_Agora_L_3d_main.bus");
+        let trail = root.join("Vehicles/AA-FR_BusBundle/2002_Agora_L_3d_trail.bus");
+        if !bus.exists() || !trail.exists() {
+            eprintln!("skipped: no {}", bus.display());
+            return;
+        }
+        let ty = omsi_sim::VehicleType::load(&root, &bus).expect("Agora L");
+        let part = Arc::new(omsi_sim::VehicleType::load(&root, &trail).expect("Agora L trail"));
+        let alone = SyncTable::new(&ty, &[]);
+        let whole = SyncTable::new(&ty, &[part]);
+        let count = |t: &SyncTable| t.lamps.len() + t.switches.len();
+        assert!(count(&whole) > count(&alone), "alone {}, whole {}", alone.describe(), whole.describe());
+        assert!(!whole.part_sounds.is_empty(), "no sounds for the rear section: {}", whole.describe());
+        assert_ne!(whole.hash, alone.hash);
+    }
 
     #[test]
     fn day_numbers_and_clock_gaps() {

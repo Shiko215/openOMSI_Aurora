@@ -41,7 +41,7 @@ OMSI 2 reads the first four and skips the rest. A model may declare any number o
   textures always stay sharp. Far scenery gives up detail only when the texture memory
   (`texture_memory` in the settings, or `OMSI_TEXTURE_MEMORY`, in MB) runs out, as OMSI's
   `[texmemlimit]` does.
-- `[scripttexture]` and `[texttexture]` / `[texttexture_enh]` can be any size the card
+- `[scripttexture]`, `[htmltexture]` and `[texttexture]` / `[texttexture_enh]` can be any size the card
   takes.
 
 ## PBR materials

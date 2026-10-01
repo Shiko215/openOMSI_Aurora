@@ -70,7 +70,8 @@ pub struct Gpu {
     uniform: wgpu::Buffer,
     uniform_group: wgpu::BindGroup,
     sampler: wgpu::Sampler,
-    buffers: Vec<(wgpu::Buffer, u64)>,
+    /// The vertex buffers and their capacity (None: making it failed; tried again next upload).
+    buffers: Vec<(Option<wgpu::Buffer>, u64)>,
     textures: Vec<Option<Tex>>,
     msaa: Option<(wgpu::TextureView, u32, u32)>,
     samples: u32,
@@ -275,14 +276,33 @@ impl Gpu {
     pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, id: usize, verts: &[Vertex]) {
         let bytes = std::mem::size_of_val(verts) as u64;
         while self.buffers.len() <= id {
-            self.buffers.push((device.create_buffer(&wgpu::BufferDescriptor { label: Some("omsi-ui vertices"), size: 4096, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }), 4096));
+            self.buffers.push((None, 0));
         }
-        if bytes > self.buffers[id].1 {
+        if bytes > self.buffers[id].1 || self.buffers[id].0.is_none() {
             let cap = bytes.next_power_of_two().max(4096);
-            self.buffers[id] = (device.create_buffer(&wgpu::BufferDescriptor { label: Some("omsi-ui vertices"), size: cap, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }), cap);
+            self.buffers[id] = (Self::vertex_buffer(device, cap), cap);
         }
-        if bytes > 0 {
-            queue.write_buffer(&self.buffers[id].0, 0, bytemuck::cast_slice(verts));
+        if let (Some(buf), true) = (&self.buffers[id].0, bytes > 0) {
+            queue.write_buffer(buf, 0, bytemuck::cast_slice(verts));
+        }
+    }
+
+    /// A vertex buffer of `size` bytes, made where its failure can be seen: a card out of
+    /// memory hands out an invalid buffer, and writing to that every frame flooded the log
+    /// with thousands of errors and took the frame rate down with it (#217). A failed one
+    /// is None: nothing draws from it, and the next upload tries again.
+    fn vertex_buffer(device: &wgpu::Device, size: u64) -> Option<wgpu::Buffer> {
+        let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let valid = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("omsi-ui vertices"), size, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let invalid = pollster::block_on(valid.pop());
+        let out_of_memory = pollster::block_on(oom.pop());
+        match invalid.or(out_of_memory) {
+            None => Some(buf),
+            Some(e) => {
+                log::warn!("omsi-ui: a vertex buffer of {size} bytes could not be made: {e}");
+                None
+            }
         }
     }
 
@@ -331,7 +351,7 @@ impl Gpu {
         });
         pass.set_pipeline(&self.pipeline);
         for d in draws {
-            let (Some((buf, _)), Some(l)) = (self.buffers.get(d.buffer), layers.get(d.layer)) else { continue };
+            let (Some((Some(buf), _)), Some(l)) = (self.buffers.get(d.buffer), layers.get(d.layer)) else { continue };
             let Some(Some(tex)) = self.textures.get(d.texture).or(self.textures.first()) else { continue };
             if d.range.is_empty() || d.layer as u64 >= MAX_LAYERS {
                 continue;

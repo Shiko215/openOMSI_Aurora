@@ -17,12 +17,14 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use winit::platform::android::activity::AndroidApp;
 use winit::platform::android::EventLoopBuilderExtAndroid;
 
+/// Whether the first drive of this run was already started (see `Shell::switch`).
+static SAFER_TRIED: AtomicBool = AtomicBool::new(false);
+
 /// Where the app keeps what a person puts on the phone for it.
 pub const SHARED: &str = "/storage/emulated/0/openOMSI";
 
 #[no_mangle]
 fn android_main(app: AndroidApp) {
-    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("openOMSI"));
     // an error is also written where a person finds it without a computer:
     // openOMSI/crash.log (or Android/data/org.openomsi.game/files/crash.log)
     let crash_files: Vec<PathBuf> = [Some(PathBuf::from(SHARED)), app.external_data_path()].into_iter().flatten().map(|d| d.join("crash.log")).collect();
@@ -34,6 +36,7 @@ fn android_main(app: AndroidApp) {
         }
     }));
     log::info!("openOMSI {VERSION} for Android, build {BUILD}");
+    log::info!("device: {} {} (Android {}, API {})", prop("ro.product.manufacturer"), prop("ro.product.model"), prop("ro.build.version.release"), prop("ro.build.version.sdk"));
     // the Java activity (OmsiActivity) for the calls into it: ndk_context's context is the
     // Application, which has none of the activity's methods
     ACTIVITY.store(app.activity_as_ptr(), Ordering::Relaxed);
@@ -41,6 +44,7 @@ fn android_main(app: AndroidApp) {
     if let Some(home) = app.internal_data_path() {
         std::env::set_var("HOME", &home);
     }
+    init_log();
     // the content folder (mods, archives, screenshots): on the shared storage when the
     // app may write there, else in the app's own folder on it
     let shared = PathBuf::from(SHARED);
@@ -52,6 +56,7 @@ fn android_main(app: AndroidApp) {
     };
     std::env::set_var("OMSI_CONTENT", &content);
     let _ = std::fs::write(content.join("README.txt"), README);
+    hide_from_gallery(&content);
     // `openOMSI/env.txt`: the OMSI_* switches a computer takes from its environment, one
     // `NAME=value` a line (a phone has no environment to set; for looking into problems)
     if let Ok(t) = std::fs::read_to_string(content.join("env.txt")) {
@@ -86,6 +91,130 @@ fn android_main(app: AndroidApp) {
     std::process::exit(0);
 }
 
+/// The log to the system's (logcat) and to `game.log` in the app's data folder - a phone
+/// has no terminal and the launcher and the game share one process, so without the file a
+/// crash left the launcher's report empty (#229). The previous run's log is kept as
+/// `game-prev.log`: when that run closed in the middle of a drive (a crash in the graphics
+/// driver takes the process without a word), the launcher shows its end
+/// ([`previous_run_crash`]).
+fn init_log() {
+    let dir = omsi_launcher_lib::data_dir();
+    let (now, prev) = (dir.join("game.log"), dir.join("game-prev.log"));
+    let _ = std::fs::rename(&now, &prev);
+    let file = std::fs::File::create(&now).ok();
+    let logger = TeeLogger {
+        system: android_logger::AndroidLogger::new(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("openOMSI")),
+        file: std::sync::Mutex::new(file),
+    };
+    if log::set_boxed_logger(Box::new(logger)).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+}
+
+struct TeeLogger {
+    system: android_logger::AndroidLogger,
+    file: std::sync::Mutex<Option<std::fs::File>>,
+}
+
+impl log::Log for TeeLogger {
+    fn enabled(&self, m: &log::Metadata) -> bool {
+        m.level() <= log::Level::Info
+    }
+
+    fn log(&self, r: &log::Record) {
+        if !self.enabled(r.metadata()) {
+            return;
+        }
+        self.system.log(r);
+        use std::io::Write;
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        if let Some(f) = self.file.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            // (the desktop's env_logger layout: the launcher's `crash_of` reads it)
+            let _ = writeln!(f, "[{secs:.3} {:<5} {}] {}", r.level(), r.target(), r.args());
+        }
+    }
+
+    fn flush(&self) {
+        if let Some(f) = self.file.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            use std::io::Write;
+            let _ = f.flush();
+        }
+    }
+}
+
+/// A system property (`ro.product.model` ...), for the log's first lines.
+fn prop(name: &str) -> String {
+    extern "C" {
+        fn __system_property_get(name: *const std::ffi::c_char, value: *mut std::ffi::c_char) -> i32;
+    }
+    let (Ok(n), mut buf) = (std::ffi::CString::new(name), [0 as std::ffi::c_char; 92]) else { return String::new() };
+    let len = unsafe { __system_property_get(n.as_ptr(), buf.as_mut_ptr()) };
+    if len <= 0 {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned()
+}
+
+/// When the app's previous run closed while a drive was going (a game started from the
+/// launcher, and neither "game ends" nor "session ended" after it): what it said last and
+/// the end of its log, for the launcher's crash dialog.
+pub(crate) fn previous_run_crash() -> Option<(String, String)> {
+    let p = omsi_launcher_lib::data_dir().join("game-prev.log");
+    let text = std::fs::read_to_string(&p).ok()?;
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().rposition(|l| l.contains("starting the game:"))?;
+    if lines[start..].iter().any(|l| l.contains("game ends") || l.contains("session ended")) {
+        return None;
+    }
+    // sent to the background and not brought back: the system ended the app there (or the
+    // player swiped it away) - no crash, whatever the game was doing
+    let back = lines[start..].iter().rposition(|l| l.contains("app in the background"));
+    let front = lines[start..].iter().rposition(|l| l.contains("app in front"));
+    if back.is_some() && back > front {
+        return None;
+    }
+    if let Some(c) = launcher::crash_of(&p) {
+        return Some(c);
+    }
+    let last = lines.last().map(|l| l.split_once("] ").map(|x| x.1).unwrap_or(l)).unwrap_or("");
+    let tail = lines[lines.len().saturating_sub(150)..].join("\n");
+    Some((format!("the game closed without a word while it was running (the last it said: {last})"), tail))
+}
+
+/// Android's media scanner hands every picture it finds to the gallery apps: the thousands
+/// of textures of an OMSI installation and of the mods turned up there as photos, the scan
+/// kept the phone busy, and people deleted them as clutter - white buses, empty maps
+/// (#443). A `.nomedia` file keeps a folder and everything under it out of the gallery:
+/// every folder of the content folder gets one except `Screenshots` (those are pictures to
+/// find), and so does the OMSI installation when it lies somewhere else. Nothing of the
+/// content is moved or changed.
+fn hide_from_gallery(content: &Path) {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(content)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("Screenshots")))
+        .collect();
+    if let Some(root) = crate::startup::root_memo().and_then(|f| std::fs::read_to_string(f).ok()) {
+        let root = PathBuf::from(root.trim());
+        if root.is_dir() && !root.starts_with(content) && !content.starts_with(&root) {
+            dirs.push(root);
+        }
+    }
+    for dir in dirs {
+        let marker = dir.join(".nomedia");
+        if marker.exists() {
+            continue;
+        }
+        match std::fs::write(&marker, b"") {
+            Ok(()) => log::info!("{}: kept out of the gallery (.nomedia)", dir.display()),
+            Err(e) => log::warn!("{}: no .nomedia ({e})", dir.display()),
+        }
+    }
+}
+
 fn is_writable(dir: &Path) -> bool {
     let probe = dir.join(".openomsi-write-test");
     let ok = std::fs::write(&probe, b"x").is_ok();
@@ -98,7 +227,9 @@ const README: &str = "openOMSI\n\
 Put a complete copy of OMSI 2 (the folder with Omsi.exe, maps and Vehicles in it) here as\n\
 \"OMSI 2\", e.g. openOMSI/OMSI 2, and choose it in the launcher under Setup.\n\
 Mods: copy them into openOMSI/Mods (they are installed when the launcher opens), or install\n\
-a folder or a .zip from the launcher's Mods page. Screenshots are written to OMSI 2/Screenshots.\n";
+a folder or a .zip from the launcher's Mods page. Screenshots are written to openOMSI/Screenshots.\n\
+The folders here hold a .nomedia file so that the gallery leaves the game's textures alone:\n\
+they are not photos - deleting them breaks buses and maps.\n";
 
 /// The launcher, or the game in the launcher's window.
 struct Shell {
@@ -114,6 +245,10 @@ impl Shell {
             let args = Args::parse_from(["openomsi"]);
             if let Err(e) = prepare(args, true) {
                 log::error!("{e:#}");
+            }
+            // (an installation chosen under Setup is known from here on)
+            if let Some(content) = crate::startup::content_dir() {
+                hide_from_gallery(&content);
             }
             launcher_statics();
             self.instance = Some(());
@@ -143,6 +278,34 @@ impl Shell {
             return;
         }
         let Some(line) = omsi_launcher_lib::take_in_process_launch() else { return };
+        // the first drive after a run that closed in the middle of one (a graphics driver
+        // that took the process down) starts with safer graphics, and on OpenGL when that
+        // run drew with Vulkan: a phone whose Vulkan driver fails on the game still plays
+        if !SAFER_TRIED.swap(true, Ordering::Relaxed) && previous_run_crash().is_some() {
+            let prev = std::fs::read_to_string(omsi_launcher_lib::data_dir().join("game-prev.log")).unwrap_or_default();
+            let vulkan = prev.lines().any(|l| l.contains("renderer: ") && l.contains("(Vulkan)")) || prev.lines().any(|l| l.contains("graphics: ") && l.to_ascii_uppercase().contains("VULKAN"));
+            std::env::set_var("OMSI_SAFE_GPU", "1");
+            // It went down while the graphics driver compiled the shaders (the last it said
+            // was a stage of that): the phone's Vulkan driver cannot take them, and will not
+            // next time either (the Maleoon and several Mali drivers after the cloud noise,
+            // #229, #278). OpenGL from now on, in the settings - Settings → Graphics API
+            // takes it back.
+            let last = prev.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+            let compiling = last.contains("renderer: compiling") || last.contains("cloud noise made") || last.contains("opening graphics device") || last.contains("compiling renderer pipelines");
+            if vulkan && compiling {
+                if let Ok(mut v) = omsi_launcher_lib::get_settings() {
+                    v["graphics_api"] = serde_json::json!("gl");
+                    match omsi_launcher_lib::save_settings(&v) {
+                        Ok(()) => log::warn!("the graphics driver went down compiling the shaders on Vulkan: OpenGL from now on (Settings → Graphics API)"),
+                        Err(e) => log::warn!("settings not saved: {e:#}"),
+                    }
+                }
+            }
+            if vulkan && std::env::var_os("OMSI_BACKEND").is_none() {
+                std::env::set_var("OMSI_BACKEND", "gl");
+            }
+            log::warn!("the last run closed in the middle of a drive: this one starts with safer graphics{}", if vulkan { " on OpenGL" } else { "" });
+        }
         log::info!("starting the game: {}", line.join(" "));
         let argv: Vec<String> = std::iter::once("openomsi".to_string()).chain(line).collect();
         let args = match Args::try_parse_from(&argv) {
@@ -172,6 +335,7 @@ impl Shell {
 
 impl ApplicationHandler for Shell {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        log::info!("app in front");
         match self.game.as_mut() {
             Some(g) => g.resumed(event_loop),
             None => self.launcher().resumed(event_loop),
@@ -180,6 +344,9 @@ impl ApplicationHandler for Shell {
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+        // (the system may end an app in the background without a word: see
+        // `previous_run_crash`)
+        log::info!("app in the background");
         match self.game.as_mut() {
             Some(g) => g.suspended(event_loop),
             None => self.launcher().suspended(event_loop),

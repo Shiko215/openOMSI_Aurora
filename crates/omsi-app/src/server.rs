@@ -49,7 +49,8 @@ name = openOMSI server
 motd = Welcome! Drive safely.
 
 # the map (relative to the OMSI 2 folder), the start date (YYYY-MM-DD, empty: today),
-# the time of day and the weather (a .owt of the OMSI 2 folder, empty: the map's default)
+# the time of day and the weather (a .owt of the OMSI 2 folder, empty: the map's default,
+# cycle: one after another through the day, as the month allows)
 map = maps/Berlin-Spandau/global.cfg
 date =
 time = 08:00
@@ -142,6 +143,7 @@ pub(crate) fn info_of(cfg: &ServerCfg) -> omsi_net::ws::ServerInfo {
         weather: cfg.weather.clone().unwrap_or_default(),
         password: false,
         vehicles: cfg.vehicles.clone(),
+        reached_at: String::new(),
     }
 }
 
@@ -151,6 +153,7 @@ pub(crate) fn prepare(args: &mut Args, path: &Path) -> Result<ServerCfg> {
     let cfg = ServerCfg::load(path)?;
     SERVER_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = SERVER_ADMIN.set((cfg.admin_password.clone(), cfg.time_speed));
+    let _ = SERVER_VEHICLES.set(cfg.vehicles.clone());
     args.map = cfg.map.clone();
     args.time = cfg.time.clone();
     if let Some(d) = &cfg.date {
@@ -172,6 +175,9 @@ pub(crate) fn prepare(args: &mut Args, path: &Path) -> Result<ServerCfg> {
     log::info!("server '{}': map {}, {} at {}, traffic {}, timetable {}, passengers {}, UDP {} / web {}, at most {} players", cfg.name, cfg.map, cfg.date.as_deref().unwrap_or("today"), cfg.time, cfg.traffic, cfg.timetable, cfg.passengers, cfg.port, cfg.web_port, cfg.max_players);
     Ok(cfg)
 }
+
+/// The buses a dedicated server allows (`vehicles`; empty: every bus it has).
+pub(crate) static SERVER_VEHICLES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 /// A dedicated server's admin password and clock speed (for the host loop).
 pub(crate) static SERVER_ADMIN: std::sync::OnceLock<(String, f64)> = std::sync::OnceLock::new();

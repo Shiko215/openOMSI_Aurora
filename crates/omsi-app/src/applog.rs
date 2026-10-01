@@ -89,8 +89,12 @@ impl App {
         let cam = self.camera.as_ref().map(|c| format!("camera at ({:.0}, {:.0}, {:.0})", c.position.x, c.position.y, c.position.z));
         let traffic = self.traffic.as_ref().map(|t| t.cars.len()).unwrap_or(0);
         let time = self.clock.time;
+        let gpu = match (self.renderer.as_ref(), self.scene.as_ref()) {
+            (Some(r), Some(sc)) => format!(", GPU memory: textures {:.0} MB, meshes {:.0} MB", r.texture_bytes(sc) as f64 / 1e6, r.mesh_bytes(sc) as f64 / 1e6),
+            _ => String::new(),
+        };
         log::info!(
-            "status: {fps:.0} fps (worst frame {worst:.0} fps), {}, view {}, game time {:02}:{:02}, {traffic} AI vehicles{}",
+            "status: {fps:.0} fps (worst frame {worst:.0} fps), {}, view {}, game time {:02}:{:02}, {traffic} AI vehicles{}{gpu}",
             bus.or(cam).unwrap_or_default(),
             self.view,
             (time / 3600.0) as i64 % 24,

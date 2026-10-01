@@ -2,6 +2,21 @@
 
 use super::*;
 
+
+/// Global actions a controller button should send to the game instead of to the bus script.
+pub(crate) fn is_game_action(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("view_")
+        || matches!(
+            name.as_str(),
+            "sim_pause" | "screenshot" | "quicksave" | "toggel_mouse_ctrl" | "toggel_ctrler"
+        )
+}
+
+
+/// How far (m) a click reaches a page (`[htmltexture]`) on a scenery object.
+const HTML_OBJECT_REACH: f32 = 4.0;
+
 impl App {
     /// Save the personnel file and the session summary (once: every caller ends the game,
     /// and the frames the loop still runs before it stops count no more time).
@@ -97,8 +112,8 @@ impl App {
                     KeyCode::SuperLeft,
                     KeyCode::SuperRight,
                 ]
-                .iter()
-                .any(|k| self.keys.contains(k));
+                    .iter()
+                    .any(|k| self.keys.contains(k));
                 if lan::chat_key(l, &mut self.remotes, code, pressed, repeat, modifiers) {
                     return;
                 }
@@ -107,6 +122,20 @@ impl App {
                 self.keys.insert(code);
             } else if !pressed {
                 self.keys.remove(&code);
+            }
+            #[cfg(windows)]
+            if pressed && !repeat && (self.vr.is_some() || self.settings.vr_requested()) {
+                let modifier = omsi_content::input::chord(
+                    self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight),
+                    self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight),
+                    self.keys.contains(&KeyCode::AltLeft) || self.keys.contains(&KeyCode::AltRight),
+                );
+                let action = keys::dik_code(code).and_then(|scan| self.game_keys.iter()
+                    .find(|b| b.scan_code == scan && b.matches(modifier) && b.action.starts_with("vr_"))
+                    .map(|b| b.action.clone()));
+                if let Some(action) = action {
+                    if self.game_action(&action) { return; }
+                }
             }
             // Shift+number works a door the way a key bound to its trigger in
             // `Inputs/keyboard.cfg` does in OMSI: `<trigger>` when it goes down and
@@ -181,15 +210,21 @@ impl App {
             // driving layout uses keeps that meaning (with the OMSI layout, every binding
             // counts)
             if pressed && !repeat {
-                let m = shift_now as i32 | (ctrl as i32) * 2 | (alt as i32) * 4;
+                let m = omsi_content::input::chord(shift_now, ctrl, alt);
                 let own = keys::dik_code(code).is_some_and(|s| self.own_keys.contains(&s));
                 let ours = self.args.drive_keys != "omsi"
                     && m == 0
                     && !own
                     && (fallback_action(code, &self.args.drive_keys).is_some()
-                        || matches!(code, KeyCode::KeyZ | KeyCode::KeyX | KeyCode::KeyC | KeyCode::KeyI | KeyCode::KeyL));
+                    || matches!(code, KeyCode::KeyZ | KeyCode::KeyX | KeyCode::KeyC | KeyCode::KeyI | KeyCode::KeyL));
+                // the arrows are never the camera keys without Ctrl (they move: drive, or turn the
+                // head when held, with any other modifier and in every layout); only Ctrl+Left/Right
+                // switch the interior camera, below.
+                let plain_arrow = matches!(code, KeyCode::ArrowLeft | KeyCode::ArrowRight) && !ctrl;
                 if let Some(scan) = keys::dik_code(code).filter(|_| !ours) {
-                    let action = self.game_keys.iter().find(|b| b.scan_code == scan && b.modifier == m).map(|b| b.action.clone());
+                    let action = self.game_keys.iter().find(|b| b.scan_code == scan && b.matches(m)
+                        && !b.action.starts_with("vr_")
+                        && !(plain_arrow && b.action.starts_with("view_interiorcam_"))).map(|b| b.action.clone());
                     if let Some(a) = action {
                         if self.game_action(&a) {
                             return;
@@ -222,14 +257,14 @@ impl App {
                         self.game_action("view_interiorcam_plus");
                         return;
                     }
-                    // OMSI's `screenshot` (Ctrl+Alt+P), and F12 as most games have it
-                    KeyCode::KeyP if ctrl && alt => {
+                    // OMSI's `screenshot` (Ctrl+Shift+P: 25 / 6), and F12 as most games have it
+                    KeyCode::KeyP if ctrl && shift_now => {
                         self.take_screenshot();
                         return;
                     }
                     // (F12 alone only where the bus has no key of its own on it: in OMSI's
                     // keyboard.cfg it is the pram/wheelchair button, which it took away)
-                    KeyCode::F12 if !self.player.as_ref().is_some_and(|p| p.bindings.iter().any(|b| b.scan_code == 88 && b.modifier == 0 && p.vehicle.ty.program.trigger(&b.action).is_some())) => {
+                    KeyCode::F12 if !self.player.as_ref().is_some_and(|p| p.bindings.iter().any(|b| b.scan_code == 88 && b.chord() == 0 && p.vehicle.ty.program.trigger(&b.action).is_some())) => {
                         self.take_screenshot();
                         return;
                     }
@@ -258,12 +293,13 @@ impl App {
                         return;
                     }
                     // OMSI's `view_toggle_informationdisplay` (Ctrl+Y)
-                    KeyCode::KeyY if ctrl => {
+                    // OMSI's `view_toggle_informationdisplay` (Shift+Y: 21 / 2)
+                    KeyCode::KeyY if shift_now && !ctrl => {
                         self.info_bar = !self.info_bar;
                         return;
                     }
-                    // OMSI's `view_set_schedule` (Shift+Insert)
-                    KeyCode::Insert if shift_now => {
+                    // OMSI's `view_set_schedule` (Insert: 210 / 1, the key's state every frame)
+                    KeyCode::Insert if !shift_now && !ctrl => {
                         self.timetable = !self.timetable;
                         return;
                     }
@@ -286,47 +322,12 @@ impl App {
                     && extras
                     && matches!(code, KeyCode::KeyZ | KeyCode::KeyX | KeyCode::KeyC)
                 {
-                    if let Some(p) = self.player.as_mut() {
-                        let want: u8 = match code {
-                            KeyCode::KeyZ => 1,
-                            KeyCode::KeyC => 2,
-                            _ => 3,
-                        };
-                        // (as the lever stands now: the scripts put it back themselves after
-                        // a turn, and the key remembered "left" - the next Z switched off a
-                        // blinker that was off, and it took two presses)
-                        let lever = if p.vehicle.var("lights_sw_warnblinker").is_some_and(|v| v > 0.5) {
-                            Some(3)
-                        } else {
-                            p.vehicle.var("lights_sw_blinker").map(|v| match v.round() as i32 {
-                                1 => 1u8,
-                                2 => 2,
-                                _ => 0,
-                            })
-                        };
-                        if let Some(l) = lever {
-                            p.blinker_key_state = l;
-                        }
-                        // (the hazard lights have a switch of their own that toggles: pressed
-                        // again with them on, "blinker_off" only let go of the indicator
-                        // lever, and the hazards - the phone's button too - never went off)
-                        let action = if want == 3 {
-                            p.blinker_key_state = if p.blinker_key_state == 3 { 0 } else { 3 };
-                            "blinker_warn_toggle"
-                        } else if p.blinker_key_state == want {
-                            p.blinker_key_state = 0;
-                            "blinker_off"
-                        } else {
-                            p.blinker_key_state = want;
-                            match want {
-                                1 => "blinker_left_set",
-                                2 => "blinker_right_set",
-                                _ => "blinker_warn_toggle",
-                            }
-                        };
-                        p.action(action, true);
-                        p.action(action, false);
-                    }
+                    let want: u8 = match code {
+                        KeyCode::KeyZ => 1,
+                        KeyCode::KeyC => 2,
+                        _ => 3,
+                    };
+                    self.blinker(want);
                 }
                 // Shift + 1..9: open or close that physical door, front to back (see
                 // `door_trigger_groups`); plain digits are left alone (some buses put
@@ -381,56 +382,56 @@ impl App {
                         self.ego = false;
                     }
                     KeyCode::KeyU
-                        if self.keys.contains(&KeyCode::ShiftLeft)
-                            || self.keys.contains(&KeyCode::ShiftRight) =>
-                    {
-                        // Shift+U: toggle a bus's service state by itself (start a shut
-                        // bus, shut down a running one), and set its IBIS to the current
-                        // duty as the driver would do while putting it into service.
-                        if let Some(p) = self.player.as_mut() {
-                            let msg = p.start_up();
-                            self.service_msg = Some((msg, 6.0));
-                            if let Some(d) = self.duty.as_ref() {
-                                let (trip, stop) = d.trip_for_ibis();
-                                p.set_duty_destination(trip, stop);
+                    if self.keys.contains(&KeyCode::ShiftLeft)
+                        || self.keys.contains(&KeyCode::ShiftRight) =>
+                        {
+                            // Shift+U: toggle a bus's service state by itself (start a shut
+                            // bus, shut down a running one), and set its IBIS to the current
+                            // duty as the driver would do while putting it into service.
+                            if let Some(p) = self.player.as_mut() {
+                                let msg = p.start_up();
+                                self.service_msg = Some((msg, 6.0));
+                                if let Some(d) = self.duty.as_ref() {
+                                    let (trip, stop) = d.trip_for_ibis();
+                                    p.set_duty_destination(trip, stop);
+                                }
                             }
                         }
-                    }
 
                     KeyCode::KeyR
-                        if self.keys.contains(&KeyCode::ShiftLeft)
-                            || self.keys.contains(&KeyCode::ShiftRight) =>
-                    {
-                        // Shift+R: the next internet radio station (see radio.rs)
-                        let msg = self.radio.next_station();
-                        self.service_msg = Some((msg, 4.0));
-                    }
-                    KeyCode::KeyM
-                        if self.keys.contains(&KeyCode::ShiftLeft)
-                            || self.keys.contains(&KeyCode::ShiftRight) =>
-                    {
-                        // Shift+M: the city map (M alone is the starter)
-                        if let Some(n) = self.navigator.as_mut() {
-                            n.toggle_map();
+                    if self.keys.contains(&KeyCode::ShiftLeft)
+                        || self.keys.contains(&KeyCode::ShiftRight) =>
+                        {
+                            // Shift+R: the next internet radio station (see radio.rs)
+                            let msg = self.radio.next_station();
+                            self.service_msg = Some((msg, 4.0));
                         }
-                    }
-                    KeyCode::KeyN
-                        if self.keys.contains(&KeyCode::ShiftLeft)
-                            || self.keys.contains(&KeyCode::ShiftRight) =>
-                    {
-                        // Shift+N: navigator → navigator with the schedule → off (N alone is
-                        // the gearbox's neutral)
-                        if let Some(n) = self.navigator.as_mut() {
-                            match (n.enabled, n.schedule) {
-                                (true, false) => n.schedule = true,
-                                (true, true) => {
-                                    n.enabled = false;
-                                    n.schedule = false;
-                                }
-                                _ => n.enabled = true,
+                    KeyCode::KeyM
+                    if self.keys.contains(&KeyCode::ShiftLeft)
+                        || self.keys.contains(&KeyCode::ShiftRight) =>
+                        {
+                            // Shift+M: the city map (M alone is the starter)
+                            if let Some(n) = self.navigator.as_mut() {
+                                n.toggle_map();
                             }
                         }
-                    }
+                    KeyCode::KeyN
+                    if self.keys.contains(&KeyCode::ShiftLeft)
+                        || self.keys.contains(&KeyCode::ShiftRight) =>
+                        {
+                            // Shift+N: navigator → navigator with the schedule → off (N alone is
+                            // the gearbox's neutral)
+                            if let Some(n) = self.navigator.as_mut() {
+                                match (n.enabled, n.schedule) {
+                                    (true, false) => n.schedule = true,
+                                    (true, true) => {
+                                        n.enabled = false;
+                                        n.schedule = false;
+                                    }
+                                    _ => n.enabled = true,
+                                }
+                            }
+                        }
                     KeyCode::F11 => {
                         // (Ctrl+F11; F11 alone is OMSI's pedestrian view)
                         // where am I: so a place that looks wrong can be named
@@ -518,15 +519,11 @@ impl App {
                     let m = if covers_vehicle_key {
                         0
                     } else {
-                        shift as i32 * 1
-                            | (self.keys.contains(&KeyCode::ControlLeft)
-                                || self.keys.contains(&KeyCode::ControlRight))
-                                as i32
-                                * 2
-                            | (self.keys.contains(&KeyCode::AltLeft)
-                                || self.keys.contains(&KeyCode::AltRight))
-                                as i32
-                                * 4
+                        omsi_content::input::chord(
+                            shift,
+                            self.keys.contains(&KeyCode::ControlLeft) || self.keys.contains(&KeyCode::ControlRight),
+                            self.keys.contains(&KeyCode::AltLeft) || self.keys.contains(&KeyCode::AltRight),
+                        )
                     };
                     p.key(scan, m, pressed);
                 }
@@ -624,9 +621,9 @@ impl App {
                     "LAN: the host's weather: {}",
                     w.as_deref().unwrap_or("the map's default")
                 );
-                self.args.weather = w;
-                self.weather = Some(load_weather(&self.args));
-                self.wetness = self.weather.as_ref().map(initial_wetness).unwrap_or(0.0);
+                // (coming over to it as the host does, not at a stroke - the streets stay
+                // as wet as they are and dry or wet with it)
+                self.change_weather(w, false);
             }
             lan::WorldUpdate::Tours(tours) => {
                 if let Some(s) = self.schedule.as_mut() {
@@ -645,7 +642,16 @@ impl App {
     /// view left is put away and the one of the view entered comes back (straight ahead
     /// the first time).
     pub(crate) fn sync_view_look(&mut self) {
-        swap_view_look(&mut self.look, &mut self.view_looks, &mut self.look_view, &self.view);
+        let key = self.look_key();
+        swap_view_look(&mut self.look, &mut self.view_looks, &mut self.look_view, &key);
+    }
+
+    /// Which camera the look belongs to: the view, and for the driver's and the passengers'
+    /// view the camera chosen in it. Each of Omsi.exe's cameras keeps where it was turned
+    /// (a `TCamera` has its own yaw and pitch besides the file's, 0x7edde4 resets them): the
+    /// look went back to straight ahead whenever the viewpoint changed.
+    pub(crate) fn look_key(&self) -> String {
+        look_key_of(&self.view, self.player.as_ref().map(|p| p.cam_choice))
     }
 
     /// Zoom the view inside the bus by `notches` of the mouse wheel (in: positive).
@@ -689,8 +695,145 @@ impl App {
     /// once a frame (`RedrawRequested`). A gaming mouse sends 500-8000 moves a second, and a
     /// ray through every cockpit mesh for each of them kept the event queue from ever
     /// draining - no frame was drawn while the mouse moved.
+    /// The indicator lever: 1 left, 2 right, 3 the hazard lights - each a toggle, as the
+    /// Z / C / X keys and the phone's buttons work it.
+    pub(crate) fn blinker(&mut self, want: u8) {
+        let Some(p) = self.player.as_mut() else { return };
+        // (as the lever stands now: the scripts put it back themselves after
+        // a turn, and the key remembered "left" - the next Z switched off a
+        // blinker that was off, and it took two presses)
+        let lever = if p.vehicle.var("lights_sw_warnblinker").is_some_and(|v| v > 0.5) {
+            Some(3)
+        } else {
+            p.vehicle.var("lights_sw_blinker").map(|v| match v.round() as i32 {
+                1 => 1u8,
+                2 => 2,
+                _ => 0,
+            })
+        };
+        if let Some(l) = lever {
+            p.blinker_key_state = l;
+        }
+        // (the hazard lights have a switch of their own that toggles: pressed
+        // again with them on, "blinker_off" only let go of the indicator
+        // lever, and the hazards - the phone's button too - never went off)
+        let action = if want == 3 {
+            p.blinker_key_state = if p.blinker_key_state == 3 { 0 } else { 3 };
+            "blinker_warn_toggle"
+        } else if p.blinker_key_state == want {
+            p.blinker_key_state = 0;
+            "blinker_off"
+        } else {
+            p.blinker_key_state = want;
+            match want {
+                1 => "blinker_left_set",
+                2 => "blinker_right_set",
+                _ => "blinker_warn_toggle",
+            }
+        };
+        p.action(action, true);
+        p.action(action, false);
+    }
+
+    /// Both mouse buttons held in a view of the bus: start OMSI's mouse zoom (false when
+    /// there is nothing to zoom - a menu, the city map, on foot).
+    pub(crate) fn start_both_drag(&mut self) -> bool {
+        if self.game_menu.is_some() || self.player.is_none() || self.navigator.as_ref().is_some_and(|n| n.map_open()) {
+            return false;
+        }
+        let value = match self.view.as_str() {
+            "outside" => self.orbit,
+            "driver" | "pax" => *self.view_zoom.get(&self.view).unwrap_or(&1.0),
+            _ => return false,
+        };
+        self.both_drag = Some((self.cursor.1, value));
+        self.mouse_look = false;
+        self.update_hover();
+        true
+    }
+
     pub(crate) fn on_mouse_moved(&mut self, x: f32, y: f32) {
-        self.move_cursor(x, y);
+        if self.move_cursor(x, y) {
+            self.html_move();
+        }
+    }
+
+    fn html_move(&mut self) {
+        if let Some((id, page, ..)) = self.html_object_pressed {
+            let Some((o, d, _)) = self.cursor_ray_now() else { return };
+            let Some(w) = self.world.clone() else { return };
+            if let Some(h) = w.html_object_hit(o, d, HTML_OBJECT_REACH).filter(|h| h.map_id == id && h.page == page) {
+                w.html_object_pointer(id, page, h.u, h.v, omsi_sim::htmltex::PointerKind::Move);
+                self.html_object_pressed = Some((id, page, h.u, h.v));
+            }
+            return;
+        }
+        let Some((page, ..)) = self.html_pressed else { return };
+        let Some((o, d, _)) = self.cursor_ray_now() else { return };
+        let Some(p) = self.player.as_mut() else { return };
+        if let Some((pg, u, v)) = p.html_hit(o, d).filter(|h| h.0 == page) {
+            p.html_pointer(pg, u, v, omsi_sim::htmltex::PointerKind::Move);
+            self.html_pressed = Some((pg, u, v));
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn reset_vr_pointer(&mut self) {
+        if let Some(vr) = self.vr.as_mut() {
+            vr.recenter_pointer();
+        }
+        self.vr_cursor_physical = None;
+        self.vr_cursor_warp_pending = None;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn on_vr_cursor_moved(&mut self, x: f32, y: f32) {
+        if let Some(target) = self.vr_cursor_warp_pending.take() {
+            // CursorMoved from set_cursor_position is not hand movement.
+            self.vr_cursor_physical = Some((x, y));
+            if (x - target.0).abs() < 3.0 && (y - target.1).abs() < 3.0 {
+                return;
+            }
+            // A real move arrived first; use the next event as the new baseline.
+            return;
+        }
+        if let Some(previous) = self.vr_cursor_physical {
+            self.cursor.0 += x - previous.0;
+            self.cursor.1 += y - previous.1;
+        }
+        self.vr_cursor_physical = Some((x, y));
+        self.html_move();
+        let Some((width, height)) = self.surface.as_ref().map(|s|
+            (s.config.width as f32, s.config.height as f32)) else { return };
+        if self.window_focused && !self.mouse_look
+            && (x < 12.0 || x > width - 12.0 || y < 12.0 || y > height - 12.0) {
+            let center = (width * 0.5, height * 0.5);
+            if self.window.as_ref().is_some_and(|window| window.set_cursor_position(
+                winit::dpi::PhysicalPosition::new(center.0 as f64, center.1 as f64)).is_ok()) {
+                self.vr_cursor_physical = Some(center);
+                self.vr_cursor_warp_pending = Some(center);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn poll_vr_cursor_position(&mut self) {
+        let cockpit = self.vr.is_some() && self.game_menu.is_none()
+            && self.chooser.is_none() && !self.mouse_drive
+            && matches!(self.view.as_str(), "driver" | "pax");
+        if !cockpit {
+            self.vr_cursor_physical = None;
+            self.vr_cursor_warp_pending = None;
+            return;
+        }
+        if !self.window_focused || self.mouse_look { return; }
+        let Some(window) = self.window.as_ref() else { return };
+        let Ok(client_origin) = window.inner_position() else { return };
+        let mut point = windows::Win32::Foundation::POINT::default();
+        if unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point) }.is_ok() {
+            self.on_vr_cursor_moved((point.x - client_origin.x) as f32,
+                                    (point.y - client_origin.y) as f32);
+        }
     }
 
     /// Mouse steering beyond the window's edge: with the cursor pinned at the left or right
@@ -721,6 +864,45 @@ impl App {
     fn move_cursor(&mut self, x: f32, y: f32) -> bool {
         let last = self.cursor;
         self.cursor = (x, y);
+        if let Some((y0, v0)) = self.both_drag {
+            // (0x82c5f8: the value at the press times 1 + the way up over 500 pixels; in the
+            // bus no wider than the seat's own view, as OMSI's zoom never goes below 1)
+            let k = (1.0 + (y0 - y) / 500.0).max(0.05);
+            if self.view == "outside" {
+                self.orbit = (v0 * k).clamp(ORBIT_MIN, ORBIT_MAX);
+            } else {
+                self.view_zoom.insert(self.view.clone(), (v0 / k).clamp(0.2, 1.0_f32.max(v0)));
+            }
+            return false;
+        }
+        if self.menu_scroll_drag {
+            let Some(ui) = self.ui.as_ref() else {
+                self.menu_scroll_drag = false;
+                return true;
+            };
+
+            if let (Some(track), Some(thumb)) =
+                (ui.menu_scroll_track, ui.menu_scroll_thumb)
+            {
+                let track_h = (track[3] - track[1]).max(1.0);
+                let thumb_h = (thumb[3] - thumb[1]).max(1.0);
+                let travel = (track_h - thumb_h).max(1.0);
+
+                let max_top =
+                    (self.menu_len() as f32 - ui.menu_rows as f32).max(0.0);
+
+                if max_top > 0.0 {
+                    let delta = (y - last.1) / travel * max_top;
+
+                    self.menu_top = Some(
+                        (self.menu_top.unwrap_or(ui.menu_start as f32) + delta)
+                            .clamp(0.0, max_top),
+                    );
+                }
+            }
+
+            return false;
+        }
         // an object dragged in the object editor follows
         if self.editor_drag {
             self.editor_drag_frame();
@@ -795,32 +977,94 @@ impl App {
         if self.view == "foot" && self.inside_remote.is_some() {
             return;
         }
-        // on foot, only from inside the own bus
-        if self.view == "foot" && self.foot_bus() != Some(crate::humans::BusId::Player) {
+        // a page (`[htmltexture]`) on a scenery object: pressed and released like the bus's own
+        if self.html_object_click(pressed) {
             return;
         }
-        if let (Some(p), Some(cam), Some(s)) = (
+        // on foot: the own bus's switches, doors and flaps from inside it or standing by it
+        if self.view == "foot" && !self.foot_reaches_bus() {
+            return;
+        }
+        #[cfg(windows)]
+        if self.vr.is_some() && self.mouse_drive && self.game_menu.is_none()
+            && matches!(self.view.as_str(), "driver" | "pax") {
+            if !pressed {
+                if let Some(player) = self.player.as_mut() { player.release(); }
+                self.dragging = false;
+            }
+            return;
+        }
+        let ray = self.camera.as_ref().zip(self.surface.as_ref())
+            .map(|(cam, s)| self.cockpit_cursor_ray(cam, (s.config.width, s.config.height)));
+        if let (Some(p), Some((o, d, spread))) = (
             self.player.as_mut(),
-            self.camera.as_ref(),
-            self.surface.as_ref(),
+            ray,
         ) {
             self.drag_delta = (0.0, 0.0);
             if pressed {
-                let (o, d) = cursor_ray(
-                    cam,
-                    self.cursor.0,
-                    self.cursor.1,
-                    s.config.width as f32,
-                    s.config.height as f32,
-                );
+                if let Some((page, u, v)) = p.html_hit(o, d) {
+                    p.release();
+                    p.html_pointer(page, u, v, omsi_sim::htmltex::PointerKind::Down);
+                    self.html_pressed = Some((page, u, v));
+                    self.dragging = false;
+                    return;
+                }
                 self.dragging = p
-                    .click(o, d, pixel_angle(cam, s.config.height as f32) * 6.0)
+                    .click(o, d, spread)
                     .is_some();
             } else {
+                if let Some((page, u, v)) = self.html_pressed.take() {
+                    let (u, v) = p.html_hit(o, d).filter(|h| h.0 == page).map_or((u, v), |h| (h.1, h.2));
+                    p.html_pointer(page, u, v, omsi_sim::htmltex::PointerKind::Up);
+                    self.dragging = false;
+                    return;
+                }
                 p.release();
                 self.dragging = false;
             }
         }
+    }
+
+    /// A click on a page of a scenery object (`[htmltexture]` in its model). True when the
+    /// click was the page's: the press lands on it, the release goes to it wherever the
+    /// pointer is by then.
+    fn html_object_click(&mut self, pressed: bool) -> bool {
+        let Some(w) = self.world.clone() else { return false };
+        if !pressed {
+            let Some((id, page, u, v)) = self.html_object_pressed.take() else { return false };
+            let (u, v) = self
+                .cursor_ray_now()
+                .and_then(|(o, d, _)| w.html_object_hit(o, d, HTML_OBJECT_REACH))
+                .filter(|h| h.map_id == id && h.page == page)
+                .map_or((u, v), |h| (h.u, h.v));
+            w.html_object_pointer(id, page, u, v, omsi_sim::htmltex::PointerKind::Up);
+            self.dragging = false;
+            return true;
+        }
+        // (driving with the VR pointer: the clicks are the bus's)
+        #[cfg(windows)]
+        if self.vr.is_some() && self.mouse_drive && self.game_menu.is_none() && matches!(self.view.as_str(), "driver" | "pax") {
+            return false;
+        }
+        let Some((o, d, _)) = self.cursor_ray_now() else { return false };
+        let Some(h) = w.html_object_hit(o, d, HTML_OBJECT_REACH) else { return false };
+        // the bus in front of the page (a switch, a window, its own page) takes the click
+        if self.player.as_ref().and_then(|p| p.body_hit(o, d)).is_some_and(|t| t < h.t) {
+            return false;
+        }
+        if let Some(p) = self.player.as_mut() {
+            p.release();
+        }
+        w.html_object_pointer(h.map_id, h.page, h.u, h.v, omsi_sim::htmltex::PointerKind::Down);
+        self.html_object_pressed = Some((h.map_id, h.page, h.u, h.v));
+        self.dragging = false;
+        true
+    }
+
+    /// The ray under the cursor now (see [`Self::cockpit_cursor_ray`]).
+    fn cursor_ray_now(&self) -> Option<(glam::DVec3, glam::Vec3, f32)> {
+        let (cam, s) = self.camera.as_ref().zip(self.surface.as_ref())?;
+        Some(self.cockpit_cursor_ray(cam, (s.config.width, s.config.height)))
     }
 
     /// A switch held with the mouse: OMSI runs its `<event>_drag` trigger every frame the
@@ -840,48 +1084,48 @@ impl App {
     }
 
     /// A key of the input script by name: a letter, a digit, F1..F12, or one of the named keys.
-pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
-    use KeyCode::*;
-    pub(crate) const LETTERS: [KeyCode; 26] = [KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ];
-    pub(crate) const DIGITS: [KeyCode; 10] = [Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9];
-    pub(crate) const FKEYS: [KeyCode; 12] = [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12];
-    let b = name.as_bytes();
-    if b.len() == 1 && b[0].is_ascii_alphabetic() {
-        return Some(LETTERS[(b[0].to_ascii_uppercase() - b'A') as usize]);
+    pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
+        use KeyCode::*;
+        pub(crate) const LETTERS: [KeyCode; 26] = [KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS, KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ];
+        pub(crate) const DIGITS: [KeyCode; 10] = [Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9];
+        pub(crate) const FKEYS: [KeyCode; 12] = [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12];
+        let b = name.as_bytes();
+        if b.len() == 1 && b[0].is_ascii_alphabetic() {
+            return Some(LETTERS[(b[0].to_ascii_uppercase() - b'A') as usize]);
+        }
+        if b.len() == 1 && b[0].is_ascii_digit() {
+            return Some(DIGITS[(b[0] - b'0') as usize]);
+        }
+        if let Some(n) = name.strip_prefix('F').and_then(|n| n.parse::<usize>().ok()) {
+            return FKEYS.get(n.wrapping_sub(1)).copied();
+        }
+        Some(match name {
+            "Shift" => ShiftLeft,
+            "Ctrl" => ControlLeft,
+            "Alt" => AltLeft,
+            "." => Period,
+            "," => Comma,
+            "Up" => ArrowUp,
+            "Down" => ArrowDown,
+            "Left" => ArrowLeft,
+            "Right" => ArrowRight,
+            "Enter" => Enter,
+            "Escape" => Escape,
+            "Backspace" => Backspace,
+            "Space" => Space,
+            "PageUp" => PageUp,
+            "PageDown" => PageDown,
+            "Insert" => Insert,
+            "Home" => Home,
+            "End" => End,
+            "Delete" => Delete,
+            "[" => BracketLeft,
+            "]" => BracketRight,
+            _ => return None,
+        })
     }
-    if b.len() == 1 && b[0].is_ascii_digit() {
-        return Some(DIGITS[(b[0] - b'0') as usize]);
-    }
-    if let Some(n) = name.strip_prefix('F').and_then(|n| n.parse::<usize>().ok()) {
-        return FKEYS.get(n.wrapping_sub(1)).copied();
-    }
-    Some(match name {
-        "Shift" => ShiftLeft,
-        "Ctrl" => ControlLeft,
-        "Alt" => AltLeft,
-        "." => Period,
-        "," => Comma,
-        "Up" => ArrowUp,
-        "Down" => ArrowDown,
-        "Left" => ArrowLeft,
-        "Right" => ArrowRight,
-        "Enter" => Enter,
-        "Escape" => Escape,
-        "Backspace" => Backspace,
-        "Space" => Space,
-        "PageUp" => PageUp,
-        "PageDown" => PageDown,
-        "Insert" => Insert,
-        "Home" => Home,
-        "End" => End,
-        "Delete" => Delete,
-        "[" => BracketLeft,
-        "]" => BracketRight,
-        _ => return None,
-    })
-}
 
-/// `OMSI_INPUT`: scripted window input, so the very same handlers the mouse and keyboard
+    /// `OMSI_INPUT`: scripted window input, so the very same handlers the mouse and keyboard
     /// reach can be driven from the command line and checked without a hand on the mouse:
     /// `t=3 move 1045,826; t=3.2 press; t=3.5 drag 0,-80; t=4 release; t=4.5 log bremse_feststell;
     /// t=5 key F3` - coordinates in logical pixels, `drag` relative, `key` a winit key name;
@@ -969,6 +1213,8 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
                         self.placing_wheel(n);
                     } else if self.game_menu.is_some() {
                         self.menu_wheel(n);
+                    } else {
+                        self.wheel(n);
                     }
                     log::info!("input script: wheel {n}: menu line {:?}, chooser {:?}, placing heading {:?}", self.game_menu, self.chooser, self.placing.as_ref().map(|p| p.heading));
                 }
@@ -981,6 +1227,18 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
                         self.on_left(false);
                     }
                     log::info!("input script: click: placing {:?}, placed at {:?}", self.placing.as_ref().map(|p| (p.at, p.blocked)), self.placed.last().map(|q| (q.vehicle.position, q.vehicle.heading)));
+                }
+                // `both down|up`: both mouse buttons held (OMSI's mouse zoom) or let go
+                "both" => {
+                    if arg == "down" {
+                        self.buttons_held = (true, true);
+                        let started = self.start_both_drag();
+                        log::info!("input script: both buttons: zoom drag {started}");
+                    } else {
+                        self.buttons_held = (false, false);
+                        self.both_drag = None;
+                        log::info!("input script: both buttons up: zoom {:?}, orbit {:.1}", self.view_zoom.get(&self.view), self.orbit);
+                    }
                 }
                 "press" => self.on_left(true),
                 "release" => self.on_left(false),
@@ -1688,15 +1946,59 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
         }
         let cur = self.args.weather.clone().unwrap_or_default().replace('\\', "/").to_ascii_lowercase();
         let i = files.iter().position(|f| f.to_ascii_lowercase() == cur).map(|i| (i + 1) % files.len()).unwrap_or(0);
-        self.args.weather = Some(files[i].clone());
-        self.weather = Some(load_weather(&self.args));
-        // (a host: the others take it up with its next clock message)
-        if let Some(l) = self.lan.as_mut() {
-            l.set_weather(&files[i]);
+        self.change_weather(Some(files[i].clone()), true);
+    }
+
+    /// Go over to weather `file` (None: the map's default) in a few minutes of the day (see
+    /// `weather_cycle`); a host tells the others (`share`), who come over to it the same way.
+    pub(crate) fn change_weather(&mut self, file: Option<String>, share: bool) {
+        let from = self.weather.clone().unwrap_or_default();
+        self.args.weather = file.clone();
+        let to = load_weather(&self.args);
+        let name = to.name.clone();
+        self.weather_blend = Some(crate::weather_cycle::Blend::new(from, to, 240.0));
+        if share {
+            // (a host: the others take it up with its next clock message)
+            if let (Some(l), Some(f)) = (self.lan.as_mut(), file.as_ref()) {
+                l.set_weather(f);
+            }
         }
-        let name = self.weather.as_ref().map(|w| w.name.clone()).unwrap_or_default();
-        log::info!("weather now {} ({name})", files[i]);
+        log::info!("weather: going over to {file:?} ({name})");
         self.service_msg = Some((format!("Weather: {name}"), 4.0));
+    }
+
+    /// The weather this frame: a change coming in, and the cycle's next one (`secs` of the
+    /// day went by; in LAN play only the host's cycle runs, the others follow it).
+    pub(crate) fn tick_weather(&mut self, secs: f32) {
+        if let Some(b) = self.weather_blend.as_mut() {
+            let (w, clouds_changed, done) = b.step(secs);
+            self.weather = Some(w);
+            if done {
+                self.weather_blend = None;
+            }
+            if clouds_changed {
+                if let (Some(r), Some(scene)) = (self.renderer.as_ref(), self.scene.as_mut()) {
+                    crate::weather_setup::setup_sky(&self.args, r, scene, self.envir.as_ref(), self.weather.as_ref());
+                }
+            }
+        }
+        let follows = self.lan.as_ref().is_some_and(|l| l.role == omsi_net::Role::Client);
+        if follows || self.weather_blend.is_some() {
+            return;
+        }
+        let Some(c) = self.weather_cycle.as_mut() else { return };
+        c.next_in -= secs as f64;
+        if c.next_in > 0.0 {
+            return;
+        }
+        c.next_in = c.interval();
+        let r = c.rand();
+        let all = crate::weather_cycle::installed();
+        let now = self.weather.clone().unwrap_or_default();
+        let now_file = self.args.weather.clone().unwrap_or_default();
+        if let Some(next) = crate::weather_cycle::pick(&all, &now, &now_file, self.clock.day_month().1, r) {
+            self.change_weather(Some(next), true);
+        }
     }
 
     /// Drive another of the vehicles standing in the world (a situation's): the one driven
@@ -1762,7 +2064,7 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
         let dir = crate::startup::content_dir().unwrap_or_else(|| self.args.root.clone()).join("Situations");
         let file = dir.join("quicksave.osn");
         if !file.exists() {
-            self.service_msg = Some(("No quicksave yet (Alt+S saves one)".into(), 4.0));
+            self.service_msg = Some(("No quicksave yet (Ctrl+S saves one)".into(), 4.0));
             return false;
         }
         let Ok(exe) = std::env::current_exe() else { return false };
@@ -1807,8 +2109,52 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
         }
     }
 
+    #[cfg(windows)]
+    fn vr_action(&mut self, name: &str) -> bool {
+        if name == "vr_toggle_mode" {
+            self.vr_zoom_active = false;
+            if !self.settings.vr_requested() { return false; }
+            if self.vr.is_some() {
+                self.vr = None;
+                self.service_msg = Some(("Desktop mode".into(), 2.0));
+            } else if let Some(renderer) = self.renderer.as_ref() {
+                match crate::openxr::Vr::new(renderer, self.settings.vr_scale,
+                                             self.settings.vr_desktop_mirror) {
+                    Ok(vr) => {
+                        self.vr = Some(vr);
+                        self.service_msg = Some(("VR mode".into(), 2.0));
+                    }
+                    Err(e) => {
+                        log::error!("OpenXR could not restart: {e:#}");
+                        self.service_msg = Some((format!("{}: {e}", omsi_ui::tr("Could not start VR")), 5.0));
+                    }
+                }
+            }
+            self.hover_key = None;
+            return true;
+        }
+        if self.vr.is_none() { return false; }
+        match name {
+            "vr_recenter" => {
+                self.vr.as_mut().unwrap().recenter();
+                self.look = (0.0, 0.0);
+                self.service_msg = Some(("VR view recentered".into(), 2.0));
+            }
+            "vr_toggle_desktop_mirror" => {
+                let visible = self.vr.as_mut().unwrap().toggle_desktop_mirror();
+                self.settings.vr_desktop_mirror = visible;
+                self.service_msg = Some((if visible { "Desktop VR mirror on" }
+                                         else { "Desktop VR mirror off" }.into(), 2.0));
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// One of OMSI's global key actions; false when it is not one this game does.
     pub(crate) fn game_action(&mut self, name: &str) -> bool {
+        #[cfg(windows)]
+        if self.vr_action(name) { return true; }
         match name {
             "sim_pause" => self.toggle_pause(),
             "screenshot" => self.take_screenshot(),
@@ -1868,33 +2214,58 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
                             self.view = "driver".into();
                         }
                         self.sync_view_look();
-                        self.look = (0.0, 0.0);
                     } else if !schedule {
                         self.service_msg = Some(("This bus has no ticket desk camera".into(), 3.0));
                     }
                 }
             }
             "view_toggle_informationdisplay" => self.info_bar = !self.info_bar,
-            "view_reset_direction" => self.look = (0.0, 0.0),
-            // (Space in Inputs/keyboard.cfg: every view looks ahead again)
+            // (Omsi.exe's camera reset, 0x7edde4, puts back the field of view with the
+            // direction: the zoom goes as well, #244)
+            "view_reset_direction" => {
+                self.look = (0.0, 0.0);
+                self.view_zoom.remove(&self.view);
+                #[cfg(windows)]
+                if let Some(vr) = self.vr.as_mut() { vr.recenter(); }
+            }
+            // (Space in Inputs/keyboard.cfg: every view looks ahead again, and back to the
+            // standard camera - "center")
             "view_reset_all_directions" => {
                 self.look = (0.0, 0.0);
                 self.view_looks.clear();
+                self.view_zoom.clear();
+                self.orbit = ORBIT_DEFAULT;
+                if let Some(p) = self.player.as_mut() {
+                    p.cam_choice = (0, 0);
+                }
             }
             "view_toggle_viewpoint" | "view_interiorcam_plus" | "view_interiorcam_minus" => {
                 let Some(p) = self.player.as_mut() else { return true };
+                // (the interior cameras only cycle in the interior: from outside the keys
+                // would change an invisible camera)
+                if !matches!(self.view.as_str(), "driver" | "pax") {
+                    return true;
+                }
                 let def = &p.vehicle.ty.def;
-                let (count, pax) = if self.view == "pax" { (def.cameras_pax.len(), true) } else { (def.cameras_driver.len(), false) };
+                let (count, pax) = if self.view == "pax" { (p.pax_camera_count(), true) } else { (def.cameras_driver.len(), false) };
                 if count > 1 {
                     let c = if pax { &mut p.cam_choice.1 } else { &mut p.cam_choice.0 };
                     *c = if name == "view_interiorcam_minus" { (*c + count - 1) % count } else { (*c + 1) % count };
                     let n = *c + 1;
-                    self.look = (0.0, 0.0);
+                    // (the camera left keeps its look, the one taken finds its own again)
+                    self.sync_view_look();
                     self.service_msg = Some((format!("{} camera {n} of {count}", if pax { "Passenger" } else { "Driver" }), 2.0));
                 }
             }
             "toggel_mouse_ctrl" => {
                 self.mouse_drive = !self.mouse_drive;
+                if !self.mouse_drive {
+                    crate::player::keep_wheel(self.player.as_mut());
+                }
+                #[cfg(windows)]
+                if !self.mouse_drive {
+                    self.reset_vr_pointer();
+                }
                 // (the wheel eases from where it is to the cursor for the first second)
                 self.mouse_steer = (self.player.as_ref().map(|p| p.vehicle.physics.controls.steering).unwrap_or(0.0), 1.0);
                 self.mouse_pedals = self.player.as_ref().map(|p| (p.vehicle.physics.controls.throttle, p.vehicle.physics.controls.brake)).unwrap_or((0.0, 0.0));
@@ -1988,18 +2359,20 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
             self.service_msg = Some(("In a LAN session only the host moves vehicles on the map".into(), 4.0));
             return;
         }
-        let net = self.traffic.as_ref().map(|t| &t.net).or_else(|| self.navigator.as_ref().and_then(|n| n.map_net()));
-        let Some(net) = net else { return };
         let p = glam::DVec3::new(at.x, at.y, 0.0);
-        // (the height of the point does not matter: the nearest by the ground plan)
-        let Some((lane, s, dist)) = net.nearest_lane(p, omsi_sim::traffic::LaneKind::Street) else {
+        // the traffic's lanes (the tiles loaded around the bus), else the navigator's of the
+        // whole map: a street far off on a big map was "no street" until the bus had been
+        // flown there (#235). (the height of the point does not matter: the nearest by the
+        // ground plan)
+        let nets = [self.traffic.as_ref().map(|t| &t.net), self.navigator.as_ref().and_then(|n| n.map_net())];
+        let Some((net, (lane, s, _))) = nets
+            .into_iter()
+            .flatten()
+            .find_map(|net| net.nearest_lane(p, omsi_sim::traffic::LaneKind::Street).filter(|(_, _, d)| *d <= 300.0).map(|f| (net, f)))
+        else {
             self.service_msg = Some(("No street near that point".into(), 3.0));
             return;
         };
-        if dist > 300.0 {
-            self.service_msg = Some(("No street near that point".into(), 3.0));
-            return;
-        }
         let l = &net.lanes[lane];
         let (pos, heading) = l.at(s);
         let heading = heading as f64;
@@ -2039,20 +2412,63 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
     /// `laststn.osn` in the map's folder (the content folder's copy: the original is never
     /// written), as OMSI keeps it: the launcher offers to continue it. Not
     /// in a tutorial, a LAN session or without a bus of one's own.
-    pub(crate) fn save_last_situation(&mut self) {
+    pub(crate) fn save_last_situation(&mut self) -> Option<std::path::PathBuf> {
         if self.tutorial.is_some() || self.lan.is_some() || self.player.is_none() {
-            return;
+            return None;
         }
-        let (Some(w), Some(cam)) = (self.world.as_ref(), self.camera.as_ref()) else { return };
-        let Some(dir) = std::path::Path::new(&self.args.map.replace('\\', "/")).parent().map(|d| d.to_path_buf()) else { return };
-        let Some(base) = crate::startup::content_dir() else { return };
+        let (Some(w), Some(cam)) = (self.world.as_ref(), self.camera.as_ref()) else { return None };
+        let dir = std::path::Path::new(&self.args.map.replace('\\', "/")).parent().map(|d| d.to_path_buf())?;
+        let base = crate::startup::content_dir()?;
         let dir = base.join(dir);
         let _ = std::fs::create_dir_all(&dir);
         let out = dir.join("laststn.osn");
-        let sit = build_situation(&self.args, w, &self.clock, self.args.weather.as_deref(), self.player.as_ref(), cam, self.duty.as_ref(), "Last situation");
+        let sit = build_situation(&self.args, w, &self.clock, self.args.weather.as_deref(), self.player.as_ref(), &self.placed, cam, self.duty.as_ref(), "Last situation");
         match sit.save(&out) {
-            Ok(()) => log::info!("saved the last situation {}", out.display()),
-            Err(e) => log::warn!("saving {}: {e}", out.display()),
+            Ok(()) => {
+                log::info!("saved the last situation {}", out.display());
+                Some(out)
+            }
+            Err(e) => {
+                log::warn!("saving {}: {e}", out.display());
+                None
+            }
+        }
+    }
+
+    /// The graphics device was lost (the driver reset the card: it ran out of memory, or a
+    /// frame took it too long): the game starts again by itself on the situation just
+    /// saved, with lighter graphics (`Settings::apply_safe_gpu`), and on Windows with the
+    /// other graphics interface when the lost one was Vulkan. Twice at most in a row. False
+    /// when it cannot (a LAN session, the tutorial, nothing to save): the session ends.
+    pub(crate) fn restart_after_device_loss(&mut self) -> bool {
+        let n = omsi_cfg::env::var("OMSI_SAFE_GPU").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        if n >= 2 {
+            return false;
+        }
+        let Some(file) = self.save_last_situation() else { return false };
+        let Ok(exe) = std::env::current_exe() else { return false };
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("--root").arg(&self.args.root).arg("--no-menu").arg("--situation").arg(&file);
+        cmd.env("OMSI_SAFE_GPU", (n + 1).to_string());
+        // (on Windows the other interface: DirectX 12 after Vulkan, Vulkan after DirectX 12 -
+        // an AMD Radeon's DX12 driver lost the device where its Vulkan one did not, #274)
+        let name = self.renderer.as_ref().map(|r| r.adapter_name.clone()).unwrap_or_default();
+        if cfg!(windows) {
+            if name.contains("(Vulkan)") {
+                cmd.env("OMSI_BACKEND", "dx12");
+            } else if name.contains("(Dx12)") {
+                cmd.env("OMSI_BACKEND", "vulkan");
+            }
+        }
+        match cmd.spawn() {
+            Ok(_) => {
+                log::warn!("starting again with safer graphics on {} (the graphics device was lost)", file.display());
+                true
+            }
+            Err(e) => {
+                log::warn!("could not start the game again: {e}");
+                false
+            }
         }
     }
 
@@ -2064,7 +2480,7 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
         let dir = crate::startup::content_dir().unwrap_or_else(|| self.args.root.clone()).join("Situations");
         let _ = std::fs::create_dir_all(&dir);
         let out = dir.join("quicksave.osn");
-        let sit = build_situation(&self.args, w, &self.clock, self.args.weather.as_deref(), self.player.as_ref(), cam, self.duty.as_ref(), "Quicksave");
+        let sit = build_situation(&self.args, w, &self.clock, self.args.weather.as_deref(), self.player.as_ref(), &self.placed, cam, self.duty.as_ref(), "Quicksave");
         match sit.save(&out) {
             Ok(()) => {
                 log::info!("saved situation {} ({} vehicles)", out.display(), sit.vehicles.len());
@@ -2088,25 +2504,67 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
         self.shot = Some(path);
     }
 
+    /// On foot, the own bus is within reach: inside it, or standing by it (a hand's reach
+    /// round its body; a click still has to hit one of its meshes).
+    pub(crate) fn foot_reaches_bus(&self) -> bool {
+        if self.foot_bus() == Some(crate::humans::BusId::Player) {
+            return true;
+        }
+        match (self.player.as_ref(), self.camera.as_ref()) {
+            (Some(p), Some(c)) => {
+                let bb = p.vehicle.ty.def.bounding_box.unwrap_or([2.5, 12.0, 3.0, 0.0, 0.0, 1.5]);
+                let reach = (bb[0].max(bb[1]) as f64) * 0.5 + 3.0;
+                (c.position - p.vehicle.position).length() < reach
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn cockpit_cursor_ray(&self, cam: &Camera, size: (u32, u32)) -> (glam::DVec3, glam::Vec3, f32) {
+        #[cfg(windows)]
+        if let Some(ray) = self.vr.as_ref().and_then(|vr| vr.cursor_ray(self.cursor.0, self.cursor.1, size)) {
+            return (ray.0, ray.1, ray.2 * 6.0);
+        }
+        let (o, d) = cursor_ray(cam, self.cursor.0, self.cursor.1, size.0 as f32, size.1 as f32);
+        (o, d, pixel_angle(cam, size.1 as f32) * 6.0)
+    }
+
     pub(crate) fn update_hover(&mut self) {
+        #[cfg(windows)]
+        if !self.mouse_drive && self.vr.as_ref().is_some_and(|vr| vr.needs_cursor_surface(
+            self.cursor, self.game_menu.is_some() || self.chooser.is_some())) {
+            let surface = self.player.as_ref()
+                .zip(self.camera.as_ref())
+                .zip(self.surface.as_ref())
+                .filter(|_| matches!(self.view.as_str(), "driver" | "pax"))
+                .map(|((player, camera), window)| {
+                    let (origin, direction, _) = self.cockpit_cursor_ray(camera,
+                                                                         (window.config.width, window.config.height));
+                    (player.surface_hit(origin, direction),
+                     (player.vehicle.position, player.vehicle.body_rotation()))
+                });
+            if let Some(vr) = self.vr.as_mut() {
+                vr.set_cursor_surface(surface.as_ref().and_then(|s| s.0),
+                                      surface.map(|s| s.1));
+            }
+        }
         let found = match (
             self.player.as_ref(),
             self.camera.as_ref(),
             self.surface.as_ref(),
         ) {
-            (Some(p), Some(cam), Some(s)) if self.view != "free" && (self.view != "foot" || self.foot_bus() == Some(crate::humans::BusId::Player)) => {
-                let (o, d) = cursor_ray(
-                    cam,
-                    self.cursor.0,
-                    self.cursor.1,
-                    s.config.width as f32,
-                    s.config.height as f32,
-                );
-                p.hovered_part(o, d, pixel_angle(cam, s.config.height as f32) * 6.0)
+            (Some(p), Some(cam), Some(s)) if self.view != "free"
+                && (self.view != "foot" || self.foot_reaches_bus())
+                && !(self.vr_active() && self.mouse_drive
+                && matches!(self.view.as_str(), "driver" | "pax")) => {
+                let (o, d, spread) = self.cockpit_cursor_ray(cam, (s.config.width, s.config.height));
+                p.hovered_part(o, d, spread)
             }
             // (in another player's bus nothing is offered: its switches are the driver's)
-            _ => None,
+            _ => (None, false),
         };
+        let (found, hand) = found;
+        self.hover_hand = hand;
         match found {
             Some((name, true)) => {
                 self.hover = Some(name);
@@ -2122,10 +2580,13 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
             }
         }
         // the cursor itself says when it is over something that can be operated
-        // (steering with the mouse: a cross, as OMSI shows it)
-        let kind: u8 = if self.mouse_drive && matches!(self.view.as_str(), "driver" | "outside" | "pax") && self.game_menu.is_none() {
+        // (steering with the mouse: a cross, as OMSI shows it; turning the view with the
+        // right button held: the four arrows OMSI shows then, #185)
+        let kind: u8 = if self.mouse_look && self.game_menu.is_none() {
+            3
+        } else if self.mouse_drive && matches!(self.view.as_str(), "driver" | "outside" | "pax") && self.game_menu.is_none() {
             2
-        } else if self.hover.is_some() {
+        } else if self.hover.is_some() || self.hover_hand {
             1
         } else {
             0
@@ -2134,6 +2595,7 @@ pub(crate) fn script_key(name: &str) -> Option<KeyCode> {
             self.cursor_kind = kind;
             if let Some(w) = self.window.as_ref() {
                 w.set_cursor(match kind {
+                    3 => winit::window::CursorIcon::Move,
                     2 => winit::window::CursorIcon::Crosshair,
                     1 => winit::window::CursorIcon::Pointer,
                     _ => winit::window::CursorIcon::Default,
@@ -2318,6 +2780,15 @@ pub(crate) const GAME_MENU: [(&str, &str); 33] = [
 ];
 
 /// `App::sync_view_look` for where `self` is borrowed in parts.
+/// See `App::look_key`.
+pub(crate) fn look_key_of(view: &str, cam: Option<(usize, usize)>) -> String {
+    match (view, cam) {
+        ("driver", Some((d, _))) => format!("driver#{d}"),
+        ("pax", Some((_, x))) => format!("pax#{x}"),
+        _ => view.to_string(),
+    }
+}
+
 pub(crate) fn swap_view_look(look: &mut (f32, f32), looks: &mut std::collections::HashMap<String, (f32, f32)>, look_view: &mut String, view: &str) {
     if look_view != view {
         let old = std::mem::replace(look_view, view.to_string());

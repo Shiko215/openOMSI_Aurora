@@ -240,35 +240,6 @@ impl Launcher {
     }
 
     /// The narrow rail: an icon for each page.
-    pub(super) fn rail_mobile(&mut self) {
-        let size = self.ui.size;
-        let rail = Rect::new(0.0, 0.0, RAIL_W_MOBILE, size.y);
-        self.ui.solid(rail);
-        self.ui.p().rect(rail, RAIL);
-        self.ui.p().rect(Rect::new(RAIL_W_MOBILE - 1.0, 0.0, 1.0, size.y), EDGE);
-        let n = super::PAGES.len() as f32;
-        let step = ((size.y - 12.0) / n).clamp(34.0, 46.0);
-        let mut y = ((size.y - step * n) * 0.5).max(6.0);
-        for (p, name, icon) in super::PAGES {
-            let r = Rect::new(8.0, y, RAIL_W_MOBILE - 16.0, step - 4.0);
-            let id = super::ui::id_of(&format!("nav-{name}"));
-            let (h, _, clicked) = self.ui.interact(id, r);
-            if clicked {
-                self.go(p);
-            }
-            let sel = self.page == p;
-            if sel {
-                self.ui.p().rounded(r, 8.0, SELECTED);
-                self.ui.p().rounded(Rect::new(r.x - 6.0, r.y + 8.0, 3.0, r.h - 16.0), 1.5, ACCENT);
-            } else if h {
-                self.ui.p().rounded(r, 8.0, HOVER);
-            }
-            let c = if sel { ACCENT } else if h { TEXT_SOFT } else { TEXT_DIM };
-            self.ui.icon(icon, r.center(), 22.0, c);
-            y += step;
-        }
-    }
-
     /// Open the storage browser (a phone's "Browse").
     pub fn browse(&mut self, purpose: Purpose, start: &str) {
         self.browser = Some(Browser::new(purpose, start));

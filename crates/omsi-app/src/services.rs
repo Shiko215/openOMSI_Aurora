@@ -11,7 +11,8 @@ pub(crate) fn run_export(args: &Args, out: &PathBuf) -> Result<()> {
     let path = player_bus_path(&args.root, &bus)?;
     let vt = Arc::new(omsi_sim::VehicleType::load(&args.root, &path)?);
     let scheme = paint_scheme(&vt, args.paint.as_deref());
-    let host = omsi_sim::VehicleHost::new(start_clock(args));
+    let mut host = omsi_sim::VehicleHost::new(start_clock(args));
+    host.paint_scheme = Some(scheme);
     let mut vehicle = omsi_sim::VehicleInstance::new(vt.clone(), host);
     vehicle.apply_paint_vars(scheme);
     // the coupled rear of an articulated bus

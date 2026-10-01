@@ -8,6 +8,7 @@ log.workspace = true
 ureq = { version = "2", default-features = false, features = ["tls"] }
 flate2 = "1"
 sha2 = "0.10"
+ring = "0.17"
 tungstenite = { version = "0.26", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
 
 [target.'cfg(unix)'.dependencies]

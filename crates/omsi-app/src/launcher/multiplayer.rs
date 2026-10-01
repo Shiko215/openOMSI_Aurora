@@ -145,8 +145,8 @@ fn servers(l: &mut Launcher, r: Rect) {
     }
     if l.ui.button("mp-add", Rect::new(bar.right() - btn_w, bar.y, btn_w, ROW), "Add server", Some("add"), ButtonKind::Primary) {
         let addr = l.mp.add_address.trim().to_string();
-        if omsi_net::ws::ws_url(&addr).is_none() {
-            l.state.set_status("That is not a server address: copy it again from its owner", true);
+        if addr.is_empty() {
+            l.state.set_status("Type the server's address (an IP, a name or a link)", true);
         } else if l.state.servers.iter().any(|s| s.address.eq_ignore_ascii_case(&addr)) {
             l.state.set_status("That server is in the list already", true);
         } else {

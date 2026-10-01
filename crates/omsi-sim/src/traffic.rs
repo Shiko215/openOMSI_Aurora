@@ -68,10 +68,14 @@ pub struct Lane {
     pub offset: f32,
     /// Spline/object file the lane came from (debugging).
     pub name: String,
-    /// `[rule] trafficdensity`: how much of the road traffic uses this lane (0 = none).
+    /// `[rule] trafficdensity`: how much of the road traffic uses this lane (0 = none), of
+    /// any random traffic group.
     pub density: f32,
-    /// Explicit trafficdensity overrides indexed by unsched_vehgroups order.
-    pub pool_densities: Vec<(usize, f32)>,
+    /// `[rule] trafficdensity <value> <group>` of the path, the last per group: the group
+    /// is the random traffic group's place in the map's `unsched_vehgroups.txt`. A group
+    /// without one takes its default there (Berlin-Spandau's GDR cars only drive where
+    /// the Falkensee paths ask for them).
+    pub group_density: Vec<(u16, f32)>,
     /// `[rule] no_cars` / `bus`: cars keep off this lane; only the timetable's buses use it.
     pub no_cars: bool,
     /// `[rule] trucks 0`: no lorries here.
@@ -95,10 +99,31 @@ pub struct Lane {
 /// Priority of a path without a `[rule] priority`.
 pub const DEFAULT_PRIORITY: f32 = 128.0;
 
+/// How much of `unsched_vehgroups.txt` group `pool`'s traffic a path carries: its `[rule]
+/// trafficdensity` for the group (`rules`, see `Lane::group_density`: the last rule of a
+/// group counts), else the group's default there (`defaults`): 0 none, for the first group 1
+/// its medium density, for any other k that of the k-th group on the same path.
+pub fn pool_density(rules: &[(u16, f32)], defaults: &[i32], pool: usize) -> f32 {
+    let mut u = pool;
+    // (a default naming another group that names this one again would go round for ever)
+    for _ in 0..=defaults.len() {
+        if let Some(&(_, v)) = rules.iter().rev().find(|(k, _)| *k as usize == u) {
+            return v;
+        }
+        match defaults.get(u).copied().unwrap_or(0) {
+            d if d <= 0 => return 0.0,
+            _ if u == 0 => return 1.0,
+            d => u = d as usize - 1,
+        }
+    }
+    0.0
+}
+
 impl Lane {
-    pub fn pool_density(&self, pool: usize, default_enabled: bool) -> f32 {
-        self.pool_densities.iter().rev().find(|(p, _)| *p == pool)
-            .map(|(_, d)| *d).unwrap_or(if default_enabled { self.density } else { 0.0 })
+    /// How much of `unsched_vehgroups.txt` group `pool`'s traffic the lane carries (see
+    /// [`pool_density`]).
+    pub fn pool_density(&self, defaults: &[i32], pool: usize) -> f32 {
+        pool_density(&self.group_density, defaults, pool)
     }
 
     /// Closest point of the lane's polyline to `p`: (distance along the lane, distance to it).
@@ -119,6 +144,11 @@ impl Lane {
 
     pub fn length(&self) -> f32 {
         *self.dist.last().unwrap_or(&0.0)
+    }
+
+    /// Measure the lane again after its points were moved (an object's tilt).
+    pub fn refresh(&mut self) {
+        self.dist = cumulative(&self.points);
     }
 
     /// Segment and fraction along it at distance `s` (clamped to the lane).
@@ -236,7 +266,7 @@ impl LaneBuilder {
     pub fn curve(points: Vec<DVec3>, headings: Vec<f32>, curvature: Vec<f32>, kind: LaneKind, width: f32) -> Lane {
         let dist = cumulative(&points);
         let speed_limit_kmh = if kind == LaneKind::Air { AIR_NO_LIMIT_KMH } else { 50.0 };
-        Lane { key: None, reversed: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, pool_densities: Vec::new(), no_cars: false, no_trucks: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new() }
+        Lane { key: None, reversed: false, kind, width, points, headings, curvature, dist, speed_limit_kmh, next: Vec::new(), traffic_light: None, turn: 0, source: 0, offset: 0.0, name: String::new(), invisible: false, density: 1.0, group_density: Vec::new(), no_cars: false, no_trucks: false, left: None, right: None, priority: DEFAULT_PRIORITY, blocks: Vec::new() }
     }
 
     /// Lane from bare points: headings from the neighbouring points on both sides (the
@@ -539,6 +569,48 @@ impl Network {
             }
         }
         best.map(|(ri, s, _, lat)| (ri, s, lat))
+    }
+
+    /// Where a bus stop at `p` lies on `route`: like [`Network::project_on_route_lateral`],
+    /// but among the points within `reach` (when given) and not before route index
+    /// `from`, a lane with the stop on its kerb side (right, or left with left-hand traffic)
+    /// goes before a nearer one with the stop across it - a route back along the same
+    /// street passes each stop twice, once from the other side, and the bus stopped at the
+    /// stop across the road on its way out. Falls back to the nearest point.
+    pub fn project_stop_on_route(&self, route: &[usize], p: DVec3, reach: Option<f64>, from: usize) -> Option<(usize, f32, f32)> {
+        // (index, s, distance, lateral) of the best on the kerb side, and of any
+        let mut kerb: Option<(usize, f32, f64, f32)> = None;
+        let mut any: Option<(usize, f32, f64, f32)> = None;
+        for (ri, &li) in route.iter().enumerate().skip(from.min(route.len())) {
+            let l = &self.lanes[li];
+            for k in 0..l.points.len().saturating_sub(1) {
+                let a = l.points[k];
+                let b = l.points[k + 1];
+                let ab = b - a;
+                let t = ((p - a).dot(ab) / ab.length_squared().max(1e-9)).clamp(0.0, 1.0);
+                let q = a + ab * t;
+                let d = (q - p).truncate().length();
+                if reach.is_some_and(|r| d > r) {
+                    continue;
+                }
+                let dir = ab.truncate().normalize_or_zero();
+                let rel = (p - q).truncate();
+                let lateral = (rel.x * dir.y - rel.y * dir.x) as f32;
+                let cand = (ri, l.dist[k] + (l.dist[k + 1] - l.dist[k]) * t as f32, d, lateral);
+                let kerb_side = if self.left_hand { lateral < -0.3 } else { lateral > 0.3 };
+                if kerb_side && kerb.map(|b| d < b.2).unwrap_or(true) {
+                    kerb = Some(cand);
+                }
+                if any.map(|b| d < b.2).unwrap_or(true) {
+                    any = Some(cand);
+                }
+            }
+        }
+        match kerb.or(any) {
+            Some((ri, s, _, lat)) => Some((ri, s, lat)),
+            None if from > 0 => self.project_stop_on_route(route, p, reach, 0),
+            None => None,
+        }
     }
 
     /// Geometric conflicts between the lanes of each crossing object (paths that intersect
@@ -997,7 +1069,7 @@ impl Network {
         impl Eq for State {}
         impl Ord for State {
             fn cmp(&self, other: &Self) -> Ordering {
-                other.cost.partial_cmp(&self.cost).unwrap_or(Ordering::Equal)
+                other.cost.total_cmp(&self.cost)
             }
         }
         impl PartialOrd for State {
@@ -1650,7 +1722,7 @@ const SIGNAL_BEFORE_CHANGE: f32 = 1.2;
 /// going. The body that follows this way is `ai_motion::AiBody`.
 #[derive(Debug, Clone)]
 pub struct AiState {
-    pub traffic_pool: Option<(usize, bool)>,
+    pub traffic_pool: Option<(usize, std::sync::Arc<Vec<i32>>)>,
     pub lane: usize,
     pub s: f32,
     pub speed: f32,
@@ -1901,8 +1973,27 @@ impl AiState {
     /// depot yard from next door. A car that has taken a turn lane takes the turn.
     fn choose_after(&mut self, net: &Network, lane: usize) -> Option<usize> {
         let l = &net.lanes[lane];
-        let open: Vec<usize> = l.next.iter().copied().filter(|&n| !net.lanes[n].no_cars && self.traffic_pool.map(|(p, enabled)| net.lanes[n].pool_density(p, enabled)).unwrap_or(net.lanes[n].density) > 0.0).collect();
-        let mut choices = if open.is_empty() && self.traffic_pool.is_none() { l.next.clone() } else { open };
+        // (a car of a traffic pool - the trucks of a map that keeps them to its port roads -
+        // takes the ways its pool may go, as it was put on one; where none of them does, the
+        // ways open to cars, then any: it does not stand at the junction for ever)
+        let open_to = |pooled: bool| -> Vec<usize> {
+            l.next
+                .iter()
+                .copied()
+                .filter(|&n| {
+                    let nl = &net.lanes[n];
+                    let d = match self.traffic_pool.as_ref().filter(|_| pooled) {
+                        Some((p, defaults)) => nl.pool_density(defaults, *p),
+                        None => nl.density,
+                    };
+                    !nl.no_cars && d > 0.0
+                })
+                .collect()
+        };
+        let pooled = self.traffic_pool.is_some().then(|| open_to(true)).filter(|o| !o.is_empty());
+        let weighted = pooled.is_some();
+        let open = pooled.unwrap_or_else(|| open_to(false));
+        let mut choices = if open.is_empty() { l.next.clone() } else { open };
         // and a way that goes on rather than into the end of the network, where there is
         // the choice (the map's edge is where OMSI takes its cars away; a village like
         // Grundorf had a queue of twenty growing at the end of its one outbound road)
@@ -1922,18 +2013,16 @@ impl AiState {
         if choices.is_empty() {
             None
         } else {
-            if let Some((pool, enabled)) = self.traffic_pool {
-                let total: f32 = choices.iter().map(|&n| net.lanes[n].pool_density(pool, enabled)).sum();
+            if let Some((pool, defaults)) = self.traffic_pool.clone().filter(|_| weighted) {
+                let total: f32 = choices.iter().map(|&n| net.lanes[n].pool_density(&defaults, pool)).sum();
                 let mut pick = (self.rand() >> 32) as f32 / (u32::MAX as f32 + 1.0) * total;
                 for &n in &choices {
-                    let weight = net.lanes[n].pool_density(pool, enabled);
+                    let weight = net.lanes[n].pool_density(&defaults, pool);
                     if pick < weight { return Some(n); }
                     pick -= weight;
                 }
                 choices.last().copied()
-            } else {
-                Some(choices[(self.rand() % choices.len() as u64) as usize])
-            }
+            } else { Some(choices[(self.rand() % choices.len() as u64) as usize]) }
         }
     }
 
@@ -2334,8 +2423,12 @@ impl AiState {
         // clears (the wave that runs down a queue at a green light)
         if self.speed < 0.05 {
             if acc <= 0.05 {
+                // (a hold of a frame or two - a junction that is free and not free by turns
+                // as the cars on the ring come and go - winds the reaction back only a
+                // little: set back whole every frame, it never ran out, and the car stood at
+                // an empty roundabout for minutes, "about to go")
+                self.start_timer = if self.held { (self.start_timer + 3.0 * dt).min(self.reaction) } else { self.reaction };
                 self.held = true;
-                self.start_timer = self.reaction;
                 acc = acc.min(0.0);
             } else if self.held {
                 self.start_timer -= dt;
@@ -2429,6 +2522,24 @@ impl AiState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_stop_is_matched_to_the_lane_it_stands_beside() {
+        // out along y = 0 (east), back along y = 6 (west); the stop stands north of the
+        // way back: on its right, across the road from the way out
+        let out = LaneBuilder::polyline(vec![DVec3::new(0.0, 0.0, 0.0), DVec3::new(100.0, 0.0, 0.0)], LaneKind::Street, 3.0);
+        let back = LaneBuilder::polyline(vec![DVec3::new(100.0, 6.0, 0.0), DVec3::new(0.0, 6.0, 0.0)], LaneKind::Street, 3.0);
+        let net = Network { lanes: vec![out, back], ..Default::default() };
+        let stop = DVec3::new(50.0, 9.0, 0.0);
+        // nearer to the way back anyway: matched there
+        assert_eq!(net.project_stop_on_route(&[0, 1], stop, Some(25.0), 0).unwrap().0, 1);
+        // a stop on the right of the way out, nearer the middle of the road
+        let stop2 = DVec3::new(50.0, -2.0, 0.0);
+        assert_eq!(net.project_stop_on_route(&[0, 1], stop2, Some(25.0), 0).unwrap().0, 0);
+        // the route out, back and out again: a stop on the way out, once the trip is past
+        // its first leg, is the one on the second way out
+        assert_eq!(net.project_stop_on_route(&[0, 1, 0], stop2, Some(25.0), 1).unwrap().0, 2);
+    }
+
     use super::*;
 
     /// A straight lane of 60 m running north, then a right-hand bend of radius 14 m over
@@ -2839,19 +2950,19 @@ mod light_tests {
 }
 
 #[cfg(test)]
-mod pool_density_tests {
+mod aurora_pool_tests {
     use super::*;
     #[test]
-    fn numazu_pool_rules_are_independent_and_preserve_rare_traffic() {
-        let mut lane = Lane::arc(DVec3::ZERO, 0.0, 100.0, 0.0, 0.0, LaneKind::Street, 3.0);
-        lane.pool_densities = vec![(0, 1.0), (1, 0.1), (2, 1.0), (3, 0.001), (5, 0.0)];
-        assert_eq!(lane.pool_density(0, true), 1.0);
-        assert_eq!(lane.pool_density(1, false), 0.1);
-        assert_eq!(lane.pool_density(3, false), 0.001);
-        assert_eq!(lane.pool_density(4, false), 0.0);
-        assert_eq!(lane.pool_density(5, true), 0.0);
-        lane.pool_densities.push((1, 0.5));
-        assert_eq!(lane.pool_density(1, false), 0.5);
-        assert_eq!(lane.pool_density(0, true), 1.0);
+    fn independent_rules_and_default_references() {
+        let mut lane = LaneBuilder::arc(DVec3::ZERO, 0.0, 100.0, 0.0, 0.0, LaneKind::Street, 3.0);
+        lane.group_density = vec![(0, 1.0), (1, 0.1), (3, 0.001), (5, 0.0)];
+        let defaults = [1, 0, 1, 0, 0, 0];
+        assert_eq!(lane.pool_density(&defaults, 1), 0.1);
+        assert_eq!(lane.pool_density(&defaults, 2), 1.0);
+        assert_eq!(lane.pool_density(&defaults, 3), 0.001);
+        assert_eq!(lane.pool_density(&defaults, 4), 0.0);
+        assert_eq!(lane.pool_density(&defaults, 5), 0.0);
+        lane.group_density.push((1, 0.5));
+        assert_eq!(lane.pool_density(&defaults, 1), 0.5);
     }
 }

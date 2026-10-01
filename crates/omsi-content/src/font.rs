@@ -60,28 +60,41 @@ impl Font {
         Ok(out)
     }
 
-    /// The glyph of `c`, or of the same letter in another code page: a font and the text
-    /// it shows need not have been read in the same one (a Russian font's `Л` is the byte
-    /// 0xCB, which a font file without other Cyrillic reads as `Ë`).
-    ///
-    /// A letter the font does not have at all is drawn with the same letter in the other
-    /// case, or without its accent: display fonts are often capitals only (the LiAZ's
-    /// "Annax Small" has no Latin small letters), and the German stop names of a map came
-    /// out as "A O" for "Am Omnibushof" on its saloon display.
+    /// Width of a space character in pixels: the font's own space glyph if defined,
+    /// else the width of '0' (for digit-only fonts), else the font's first glyph
+    /// (the font's default advance), or half the font height.
+    pub fn space_width(&self) -> i32 {
+        self.exact_glyph(' ')
+            .map(|g| (g.x1 - g.x0).max(0))
+            .or_else(|| self.exact_glyph('0').map(|g| (g.x1 - g.x0).max(0)))
+            .or_else(|| self.chars.first().map(|g| (g.x1 - g.x0).max(0)))
+            .unwrap_or_else(|| (self.height / 2).max(1))
+    }
+
+    /// The glyph Omsi.exe draws for `c` (0x5d66a4): the character itself (or the same
+    /// character read in another code page: a font and the text it shows need not have
+    /// been read in the same one - a Russian font's `Л` is the byte 0xCB, which a font file
+    /// without other Cyrillic reads as `Ë`), else for a small Latin letter a-z its capital,
+    /// else nothing: its lookup (0x5d660c) gives -1 and the text is drawn and measured
+    /// without it (its callers skip a negative index), only the font's gap moves on.
+    /// Whitespace the font lacks is still given a width ([`Font::space_width`]) so words
+    /// keep their gaps - the font's first glyph, drawn in its place before, put a `|` in
+    /// front of the MAN Lion's City's odometer (#360).
     pub fn glyph(&self, c: char) -> Option<&FontChar> {
-        self.exact_glyph(c).or_else(|| {
-            let mut alternatives: Vec<char> = Vec::new();
-            let plain = without_accent(c);
-            for v in [c, plain] {
-                alternatives.extend(v.to_uppercase());
-                alternatives.extend(v.to_lowercase());
-            }
-            alternatives.push(plain);
-            alternatives
-                .into_iter()
-                .filter(|&v| v != c)
-                .find_map(|v| self.exact_glyph(v))
-        })
+        if c.is_whitespace() {
+            return self.exact_glyph(' ').or_else(|| {
+                omsi_cfg::codepage::char_variants(c)
+                    .into_iter()
+                    .find_map(|v| self.chars.iter().find(|g| g.ch == v))
+            });
+        }
+        self.exact_glyph(c)
+            .or_else(|| c.is_ascii_lowercase().then(|| self.exact_glyph(c.to_ascii_uppercase())).flatten())
+    }
+
+    /// Whether the font has a glyph of its own for `c`.
+    pub fn has_glyph(&self, c: char) -> bool {
+        self.exact_glyph(c).is_some()
     }
 
     fn exact_glyph(&self, c: char) -> Option<&FontChar> {
@@ -92,17 +105,22 @@ impl Font {
         })
     }
 
-    /// Text width in pixels (glyph advance = x1 - x0, which includes the spacing).
+    /// A text's width as Omsi.exe measures it (0x5d6c00, the scripts' `TextLength` too):
+    /// its glyphs' widths and the font's gap between each two of them.
     pub fn text_width(&self, text: &str) -> i32 {
-        text.chars().filter_map(|c| self.glyph(c)).map(|g| g.x1 - g.x0).sum()
+        let n = text.chars().count() as i32;
+        let w: i32 = text
+            .chars()
+            .map(|c| {
+                if c.is_whitespace() {
+                    self.space_width()
+                } else {
+                    self.glyph(c).map(|g| (g.x1 - g.x0).max(0)).unwrap_or(0)
+                }
+            })
+            .sum();
+        w + (n - 1).max(0) * self.gap
     }
-}
-
-/// The Latin letter under an accent (`ä` → `a`, `É` → `E`), for fonts without it.
-fn without_accent(c: char) -> char {
-    const FROM: &str = "àáâãäåāăąçćčďèéêëēėęěìíîïīįłñńňòóôõöøōőŕřśšşţťùúûüūůűųýÿźżžÀÁÂÃÄÅĀĂĄÇĆČĎÈÉÊËĒĖĘĚÌÍÎÏĪĮŁÑŃŇÒÓÔÕÖØŌŐŔŘŚŠŞŢŤÙÚÛÜŪŮŰŲÝŸŹŻŽ";
-    const TO: &str = "aaaaaaaaacccdeeeeeeeeiiiiiilnnnoooooooorrsssttuuuuuuuuyyzzzAAAAAAAAACCCDEEEEEEEEIIIIIILNNNOOOOOOOORRSSSTTUUUUUUUUYYZZZ";
-    FROM.chars().position(|f| f == c).and_then(|i| TO.chars().nth(i)).unwrap_or(c)
 }
 
 /// Horizontal placement of a text in its texture (`[texttexture_enh]` orientation and
@@ -170,34 +188,20 @@ impl FontAtlas {
 
     /// Pixel width of `text` in this font (glyph advances including the gap after each).
     pub fn text_width(&self, text: &str) -> i32 {
-        let mut x = 0i32;
-        for ch in text.chars() {
-            match self.font.glyph(ch) {
-                Some(g) => x += (g.x1 - g.x0).max(0) + self.font.gap,
-                None => x += self.missing_advance(ch),
-            }
-        }
-        x
+        text.chars()
+            .map(|ch| {
+                let w = if ch.is_whitespace() {
+                    self.font.space_width()
+                } else {
+                    self.font.glyph(ch).map(|g| (g.x1 - g.x0).max(0)).unwrap_or(0)
+                };
+                w + self.font.gap
+            })
+            .sum()
     }
 
-    /// How far a character the font lacks moves on: a space as wide as a narrow letter
-    /// (many display fonts have no space at all, and the words of a destination ran into
-    /// one another), anything else by the gap.
-    fn missing_advance(&self, ch: char) -> i32 {
-        if ch.is_whitespace() {
-            let w = ['n', 'N', 'i', '1', 'I']
-                .iter()
-                .find_map(|c| self.font.glyph(*c))
-                .map(|g| (g.x1 - g.x0).max(1))
-                .unwrap_or((self.font.height / 3).max(2));
-            w + self.font.gap
-        } else {
-            self.font.gap.max(1)
-        }
-    }
-
-    /// Render `text` centred into a `w`×`h` RGBA image; text wider than the image is
-    /// squeezed horizontally to fit (like OMSI's text textures on signs and displays).
+    /// Render `text` centred into a `w`×`h` RGBA image (a text wider than the image is
+    /// clipped at its edge, as OMSI's text textures are).
     /// `full_color` uses the font's colour bitmap, otherwise glyphs are filled with `rgb`;
     /// the alpha channel holds the coverage.
     pub fn render(&self, text: &str, w: u32, h: u32, full_color: bool, rgb: [u8; 3]) -> Vec<u8> {
@@ -232,31 +236,8 @@ impl FontAtlas {
             }
             return out;
         }
-        let full = self.text_width(text).max(1) as u32;
-        if full > w && w > 0 {
-            let wide = self.render_unscaled(text, full, h, full_color, rgb, align);
-            let mut out = vec![0u8; (w * h * 4) as usize];
-            for y in 0..h as usize {
-                for x in 0..w as usize {
-                    // box filter over the source span of this destination pixel
-                    let x0 = x * full as usize / w as usize;
-                    let x1 = ((x + 1) * full as usize / w as usize).max(x0 + 1);
-                    let mut acc = [0u32; 4];
-                    for sx in x0..x1 {
-                        let si = (y * full as usize + sx) * 4;
-                        for c in 0..4 {
-                            acc[c] += wide[si + c] as u32;
-                        }
-                    }
-                    let n = (x1 - x0) as u32;
-                    let di = (y * w as usize + x) * 4;
-                    for c in 0..4 {
-                        out[di + c] = (acc[c] / n) as u8;
-                    }
-                }
-            }
-            return out;
-        }
+        // (a text wider than the texture runs off its edge, as Omsi.exe draws it: the
+        // start is not left of the texture and the rest is clipped, 0x5fb79c / 0x5d67bc)
         self.render_unscaled(text, w, h, full_color, rgb, align)
     }
 
@@ -266,8 +247,12 @@ impl FontAtlas {
         let y0 = (h as i32 - glyph_h) / 2;
         let mut x = align.offset(w as i32, self.text_width(text), self.font.gap);
         for ch in text.chars() {
+            if ch.is_whitespace() {
+                x += self.font.space_width() + self.font.gap;
+                continue;
+            }
             let Some(g) = self.font.glyph(ch) else {
-                x += self.missing_advance(ch);
+                x += self.font.gap;
                 continue;
             };
             let gw = (g.x1 - g.x0).max(0);
@@ -302,5 +287,53 @@ impl FontAtlas {
             x += gw + self.font.gap;
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whitespace_does_not_draw_visible_first_glyph() {
+        // A font like MAN New Lion's City odometer font: first character is '|',
+        // digits follow, and there is no space character defined in the font.
+        let font = Font {
+            path: PathBuf::new(),
+            name: "LCD_Test".into(),
+            bitmap: "lcd.bmp".into(),
+            alpha: "lcd_alpha.bmp".into(),
+            height: 10,
+            gap: 1,
+            chars: vec![
+                FontChar { ch: '|', x0: 0, x1: 2, y: 0 },
+                FontChar { ch: '0', x0: 2, x1: 10, y: 0 },
+                FontChar { ch: '1', x0: 10, x1: 18, y: 0 },
+            ],
+        };
+        // Alpha bitmap where '|' has opaque pixels
+        let mut alpha = vec![0u8; 18 * 10 * 4];
+        for y in 0..10 {
+            for x in 0..2 {
+                let idx = (y * 18 + x) * 4;
+                alpha[idx] = 255;
+            }
+        }
+        let atlas = FontAtlas::new(font.clone(), 18, 10, alpha.clone(), alpha);
+
+        // Leading spaces (as used in odometer padding e.g. "  1") must not draw '|'
+        let rendered = atlas.render_aligned("  1", 40, 10, false, [255, 255, 255], TextAlign { orientation: 1, grid: 1 });
+        // The first 10 pixels horizontally (where spaces sit) must have 0 alpha!
+        for y in 0..10 {
+            for x in 0..10 {
+                let idx = (y * 40 + x) * 4;
+                assert_eq!(rendered[idx + 3], 0, "space pixel at ({x}, {y}) must be transparent");
+            }
+        }
+
+        // glyph(' ') must not return the '|' character
+        assert_eq!(font.glyph(' '), None);
+        // space_width should fall back to '0' width (8)
+        assert_eq!(font.space_width(), 8);
     }
 }

@@ -28,7 +28,37 @@ pub struct AiGroup {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct AiTypGroup {
     pub file: String,
-    pub entries: Vec<(String, String)>,
+    pub entries: Vec<DepotEntry>,
+}
+
+/// One vehicle of a depot's type group: an `[aigroup_depot_typgroup_2]` line is its fleet
+/// number, plate, repaint and first and last day (YYYYMMDD), tab-separated (Omsi.exe
+/// 0x780a58 splits it at each tab with 0x7ef900, empty fields kept); an
+/// `[aigroup_depot_typgroup]` line is the number alone, which also names the repaint.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DepotEntry {
+    pub number: String,
+    pub registration: String,
+    pub paint: String,
+    pub from: Option<i32>,
+    pub to: Option<i32>,
+}
+
+impl DepotEntry {
+    /// A `[aigroup_depot_typgroup_2]` line.
+    pub fn parse(line: &str) -> DepotEntry {
+        let mut f = line.split('\t');
+        let mut next = || f.next().unwrap_or("").to_string();
+        let (number, registration, paint, from, to) = (next(), next(), next(), next(), next());
+        let date = |s: &str| s.trim().parse::<i32>().ok();
+        DepotEntry {
+            number: number.trim().to_string(),
+            registration,
+            paint,
+            from: date(&from),
+            to: date(&to),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -96,15 +126,16 @@ impl AiLists {
                 "aigroup_depot_typgroup" | "aigroup_depot_typgroup_2" => {
                     let file = r.str().to_string();
                     let mut tg = AiTypGroup { file, entries: Vec::new() };
+                    let v2 = k == "aigroup_depot_typgroup_2";
                     for l in r.until("[end]") {
                         if l.trim().is_empty() {
                             continue;
                         }
-                        let (n, reg) = match l.split_once('\t') {
-                            Some((n, reg)) => (n.trim().to_string(), reg.trim().to_string()),
-                            None => (l.trim().to_string(), String::new()),
-                        };
-                        tg.entries.push((n, reg));
+                        tg.entries.push(if v2 {
+                            DepotEntry::parse(l)
+                        } else {
+                            DepotEntry { number: l.trim().to_string(), paint: l.trim().to_string(), ..Default::default() }
+                        });
                     }
                     if let Some(g) = a.groups.last_mut() {
                         g.typgroups.push(tg);
@@ -321,27 +352,10 @@ pub fn date_code(date: &str) -> Option<i32> {
     }
 }
 
-/// Depot vehicle entry validity: `number  [name]  [from  [to]]` (YYYYMMDD); columns beyond
-/// the number are optional. Returns true when the entry exists on `date`.
-pub fn typgroup_entry_valid(entry: &(String, String), date: i32) -> bool {
-    let cols: Vec<&str> = entry.1.split('\t').map(|c| c.trim()).collect();
-    let dates: Vec<i32> = cols.iter().filter_map(|c| if c.len() == 8 { c.parse::<i32>().ok() } else { None }).collect();
-    match dates.len() {
-        0 => true,
-        1 => {
-            // a single date is a start or an end depending on its column position
-            let is_last = cols.last().map(|c| c.len() == 8).unwrap_or(false);
-            let single = dates[0];
-            if cols.len() >= 3 && !is_last {
-                date >= single
-            } else if cols.len() == 3 && cols[1].is_empty() {
-                date >= single
-            } else {
-                date <= single
-            }
-        }
-        _ => date >= dates[0] && date <= dates[1],
-    }
+/// Whether a depot vehicle is in service on `date` (YYYYMMDD): from its first day, if it has
+/// one, to its last, if it has one (0x781a15, 0x781a47).
+pub fn typgroup_entry_valid(entry: &DepotEntry, date: i32) -> bool {
+    entry.from.is_none_or(|f| f <= date) && entry.to.is_none_or(|t| t >= date)
 }
 
 /// `signalroutes.cfg` (unit `mc_fahrstrasse`).

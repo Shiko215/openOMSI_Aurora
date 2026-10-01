@@ -16,7 +16,8 @@
 //! Actions (the text of a line, also what goes over the network): `kick <id>`,
 //! `ban <id>`, `bring <id>`, `goto <id>`, `time <seconds>`, `speed <factor>`,
 //! `weather next`, `say <text>`, `bringall`, `service <repair|refuel|wash> <id|all>`,
-//! `unstick <id>`, `clock <seconds of the day>`, `traffic next`.
+//! `unstick <id>`, `clock <seconds of the day>`, `traffic next`, `traffic clear`,
+//! `weather cycle`, `weather set <Weather/file.owt>`.
 
 use crate::App;
 use omsi_net::{LanSession, Role};
@@ -63,6 +64,17 @@ pub(crate) fn items(app: &App) -> Vec<(String, String)> {
         out.push((format!("{} x{s}{mark}", omsi_ui::tr("Time speed")), format!("speed {s}")));
     }
     out.push(("Next weather".into(), "weather next".into()));
+    // the weather cycle, and each installed weather by name
+    let cycling = app.weather_cycle.is_some();
+    out.push((format!("{}: {}", omsi_ui::tr("Weather cycle"), if cycling { omsi_ui::tr("on") } else { omsi_ui::tr("off") }), "weather cycle".into()));
+    for (file, w) in crate::weather_cycle::installed() {
+        let now = app.args.weather.as_deref().is_some_and(|c| c.replace('\\', "/").eq_ignore_ascii_case(&file));
+        let mark = if now { format!("  {}", omsi_ui::tr("(now)")) } else { String::new() };
+        out.push((format!("{}: {}{mark}", omsi_ui::tr("Weather"), w.name), format!("weather set {file}")));
+    }
+    if app.traffic.is_some() {
+        out.push((omsi_ui::tr("Clear the AI traffic (a jam)").into_owned(), "traffic clear".into()));
+    }
     out.push(("Back".into(), "back".into()));
     out
 }
@@ -125,7 +137,24 @@ fn host_action(app: &mut App, action: &str, by: Option<u32>) {
                 app.service_msg = Some((format!("Time speed x{s}"), 3.0));
             }
         }
-        "weather" => app.next_weather(),
+        "weather" => match arg.trim().split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((arg.trim(), "")) {
+            ("cycle", _) => {
+                if app.weather_cycle.take().is_none() {
+                    let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7);
+                    let mut c = crate::weather_cycle::Cycle::new(seed);
+                    // (the first change soon, not in an hour)
+                    c.next_in = 60.0;
+                    app.weather_cycle = Some(c);
+                }
+                let on = app.weather_cycle.is_some();
+                app.service_msg = Some((format!("Weather cycle {}", if on { "on" } else { "off" }), 3.0));
+            }
+            // (only an installed weather file: the name comes from the admin's game)
+            ("set", file) if !file.contains("..") && file.to_ascii_lowercase().starts_with("weather/") && file.to_ascii_lowercase().ends_with(".owt") => {
+                app.change_weather(Some(file.to_string()), true);
+            }
+            _ => app.next_weather(),
+        },
         "say" => {
             if let Some(l) = app.lan.as_mut() {
                 let _ = l.say(arg);
@@ -171,6 +200,17 @@ fn host_action(app: &mut App, action: &str, by: Option<u32>) {
             if let Some(s) = finite(arg) {
                 let d = (s.rem_euclid(86400.0) - app.clock.time + 43_200.0).rem_euclid(86_400.0) - 43_200.0;
                 app.shift_clock(d);
+            }
+        }
+        "traffic" if arg.trim() == "clear" => {
+            // every AI vehicle off the road (the random traffic comes back by itself, the
+            // timetable's buses with their next departures)
+            if let (Some(t), Some(w), Some(r), Some(scene)) = (app.traffic.as_mut(), app.world.as_ref(), app.renderer.as_ref(), app.scene.as_mut()) {
+                let ids: Vec<u64> = t.cars.iter().filter(|c| !c.is_bus()).map(|c| c.id).collect();
+                for id in &ids {
+                    t.remove_car(w, r, scene, *id);
+                }
+                app.service_msg = Some((format!("{} AI vehicles taken off the road", ids.len()), 3.0));
             }
         }
         "traffic" => {
@@ -234,17 +274,14 @@ pub(crate) fn teleport(app: &mut App, at: glam::DVec3, heading: f64) {
     }
     // on the level at the height asked for (a car park under a building, a road under a
     // bridge), else the highest ground there (a place picked on the map, at no height)
-    let z = app
-        .world
-        .as_ref()
-        .and_then(|w| {
-            let near = (at.z != 0.0)
-                .then(|| crate::scene::drive_probe(&w.terrains, &w.surfaces, at.x, at.y, at.z + 1.5).below)
-                .flatten()
-                .filter(|b| (at.z - b).abs() < 3.0);
-            near.or_else(|| w.walk_height(at.x, at.y))
-        })
-        .unwrap_or(at.z);
+    let ground = app.world.as_ref().and_then(|w| {
+        let near = (at.z != 0.0)
+            .then(|| crate::scene::drive_probe(&w.terrains, &w.surfaces, at.x, at.y, at.z + 1.5).below)
+            .flatten()
+            .filter(|b| (at.z - b).abs() < 3.0);
+        near.or_else(|| w.walk_height(at.x, at.y))
+    });
+    let z = ground.unwrap_or(at.z);
     if let Some(p) = app.player.as_mut() {
         // (as a joining player's bus is moved off an occupied spawn: `lan::clear_spawn`)
         let origin = glam::DVec3::new(at.x, at.y, z);
@@ -256,8 +293,13 @@ pub(crate) fn teleport(app: &mut App, at: glam::DVec3, heading: f64) {
         for t in p.vehicle.trailers.iter_mut() {
             t.realign();
         }
-        for _ in 0..3 {
-            p.vehicle.update(1.0 / 30.0);
+        // (settled on the ground there; where its tiles are still to be read - a street far
+        // off picked on the map - it waits at the street's height for them, as the frame
+        // holds a bus with no ground under it, instead of dropping through first)
+        if ground.is_some() {
+            for _ in 0..3 {
+                p.vehicle.update(1.0 / 30.0);
+            }
         }
         log::info!("teleported to ({:.1}, {:.1}) heading {heading:.0}", at.x, at.y);
     }

@@ -84,7 +84,7 @@ fn nearest_anywhere(net: &Network, p: DVec3) -> Option<(usize, f32, f64)> {
 }
 
 /// The trail's point at travelled distance `u` (between its samples; None beyond its ends).
-fn point_at(trail: &std::collections::VecDeque<(f64, DVec3)>, u: f64) -> Option<DVec3> {
+pub(crate) fn point_at(trail: &std::collections::VecDeque<(f64, DVec3)>, u: f64) -> Option<DVec3> {
     let i = trail.iter().position(|(v, _)| *v >= u)?;
     if i == 0 {
         return (trail[0].0 - u < 0.01).then_some(trail[0].1);

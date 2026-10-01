@@ -15,7 +15,8 @@ struct PostParams {
     // x how much of the metered difference is corrected (the light model's own exposure is
     // an incident meter: snow stays white and a night dark; the metering only helps where
     // it cannot know, a dark cab or an underpass), y night vision strength, z the scene's
-    // pre-exposure (for absolute luminance), w unused
+    // pre-exposure (for absolute luminance), w how much an LED panel's dots count for in
+    // the glow's source (0 = not at all, `Led glow`)
     c: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> p: PostParams;
@@ -58,11 +59,17 @@ fn src(uv: vec2<f32>, texel: vec2<f32>, x: f32, y: f32) -> vec3<f32> {
 }
 
 // The picture without the bus's own screens (the screen mask is the first glow level's
-// t_base): a lit display glows no halo over its own letters.
+// t_base): a lit display glows no halo over its own letters. An LED panel's dots are the
+// panel's own light, though - they stay in the source (the mask's g) and count for several
+// times their colour there (`p.c.w`), so that the faint mix the glow is blooms a halo
+// around the panel without the dots themselves having to burn.
 fn src_unmasked(uv: vec2<f32>, texel: vec2<f32>, x: f32, y: f32) -> vec3<f32> {
     let at = uv + vec2<f32>(x, y) * texel;
-    let screen = textureSampleLevel(t_base, s_lin, at, 0.0).r;
-    return clean(textureSampleLevel(t_src, s_lin, at, 0.0).rgb) * (1.0 - step(0.5, screen));
+    let m = textureSampleLevel(t_base, s_lin, at, 0.0);
+    let c = clean(textureSampleLevel(t_src, s_lin, at, 0.0).rgb);
+    let screen = step(0.5, m.r);
+    let led = step(0.5, m.g);
+    return c * (1.0 - screen) + c * (led * p.c.w) * screen;
 }
 
 // --- the glow: 13-tap downsampling (the first level with Karis' average, so that a single

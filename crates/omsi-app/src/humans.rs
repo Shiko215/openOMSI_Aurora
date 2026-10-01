@@ -58,6 +58,9 @@ use std::sync::Arc;
 /// Walking pace inside a bus (m/s): people are careful on a bus floor.
 /// The "stop" of a player's bus standing with a door open that everybody leaves: its
 /// driver has got up, or it is not in service. No waiting place belongs to it.
+/// The map's traffic keeps left (its stops are on the left): see the doors of `Cabin`.
+pub(crate) static LEFT_HAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const ALL_OUT_STOP: i64 = -7;
 const PACE_IN: f64 = 0.9;
 /// Gap between two people in a queue (m).
@@ -350,12 +353,18 @@ impl Cabin {
             });
         }
         let graph = PathGraph::new(points.clone(), &links);
+        // (the side of the road the stops are on: where a door's own point does not tell)
+        let kerb = if LEFT_HAND.load(std::sync::atomic::Ordering::Relaxed) { -1.0f32 } else { 1.0 };
         let door = |pp: i32, sells: bool, half_width: f32| -> Door {
             let point = (pp >= 0 && (pp as usize) < points.len()).then_some(pp as usize);
             let inside = point
                 .map(|i| points[i])
-                .unwrap_or(Vec3::new(half_width - 0.1, 4.0, 0.4));
-            let side = if inside.x >= 0.0 { 1.0 } else { -1.0 };
+                .unwrap_or(Vec3::new(kerb * (half_width - 0.1), 4.0, 0.4));
+            // A door's side is the side of its entry point; one in the middle of the aisle
+            // (or none) is taken to open to the kerb - on the left where the traffic keeps
+            // left. (Always the right: a UK bus whose entry point lies on the aisle had the
+            // people come to its door from the road side, round the bus.)
+            let side = if inside.x.abs() < 0.6 { kerb } else if inside.x >= 0.0 { 1.0 } else { -1.0 };
             let outside = Vec3::new(side * (half_width + DOOR_OUT), inside.y, 0.0);
             // the aisle point next to the door: its neighbour nearest the middle
             let wait_point = point
@@ -718,6 +727,25 @@ fn crosses_street(net: &Network, a: DVec2, b: DVec2) -> bool {
     false
 }
 
+/// Whether a point lies on a carriageway: within half a street lane's width (and 30 cm)
+/// of its centre line, at about the height of `z`.
+fn on_carriageway(net: &Network, p: DVec3) -> bool {
+    let q = p.truncate();
+    net.grid
+        .get(&Network::grid_cell(p))
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .map(|&i| &net.lanes[i])
+        .filter(|l| l.kind == LaneKind::Street)
+        .any(|l| {
+            l.points.windows(2).any(|w| {
+                let (c, _) = crowd::project_on_segment(q, w[0].truncate(), w[1].truncate());
+                c.distance(q) < l.width as f64 * 0.5 + 0.3 && (w[0].z - p.z).abs() < 2.0
+            })
+        })
+}
+
 /// Whether the segments `a`-`b` and `c`-`d` cross.
 fn segments_cross(a: DVec2, b: DVec2, c: DVec2, d: DVec2) -> bool {
     let side = |p: DVec2, q: DVec2, r: DVec2| (q - p).perp_dot(r - p);
@@ -743,6 +771,11 @@ struct BusNow {
     walk_open: Option<(Vec<bool>, Vec<bool>)>,
     /// The stop it is serving (standing at it).
     stop: Option<i64>,
+    /// The stop it is pulling in to: one ahead of it within 60 m, facing its way, while it
+    /// still rolls. Omsi.exe lists a vehicle at a stop from 60 m out (sub_61f238) and the
+    /// people waiting there set off towards a bus of theirs while it is still faster than
+    /// 2 m/s (sub_62a6a0 at 0x62baa2): the driver sees who wants to get on before stopping.
+    approach: Option<i64>,
     interior: f32,
     /// The saloon's air and the light outside, for what boarding passengers say.
     air: CabinAir,
@@ -753,10 +786,10 @@ struct BusNow {
     accel: DVec2,
     /// The sections behind the front one (the cabin's parts after the first).
     trailers: Vec<PartFrame>,
-    /// Its destination is an all-exit terminus (the scripts' `target_index_int` names a
-    /// hof terminus added with `[addterminus_allexit]`: "Nicht einsteigen", a works trip):
-    /// OMSI gives it the terminus "$allexit$", which no waiting passenger is going to.
-    all_exit: bool,
+    /// The terminus it shows, by name (Omsi.exe's bus +0x7bc). None: "$allexit$" - the
+    /// scripts' `target_index_int` names a hof terminus added with `[addterminus_allexit]`
+    /// ("Nicht einsteigen", a works trip) - or none; no timetable target has it.
+    terminus: Option<String>,
 }
 
 /// What passengers feel stepping into a bus (OMSI reads the same fields: the vehicle's
@@ -1593,7 +1626,7 @@ enum Place {
 }
 
 /// Seconds after which a passenger's request at an exit lapses (see `write_pax_vars`).
-const EXIT_REQ_LAPSE: f32 = 40.0;
+const EXIT_REQ_LAPSE: f32 = 120.0;
 
 /// How near an open door (m) a passenger holds it open (the light barrier's reach).
 const DOORWAY: f64 = 1.6;
@@ -1634,12 +1667,15 @@ pub struct Person {
     from: i64,
     exit_stop: i32,
     stops_left: i32,
+    /// The stop object a timetable bus's rider gets off at (None: see `stops_left`).
+    exit_id: Option<i64>,
     /// The rider wants out at the stop the bus stands at.
     leaving_here: bool,
     /// A bus this person will not board (they just left it).
     avoid: Option<BusId>,
-    /// Takes the next bus that comes (else waits for another line).
-    takes_next: bool,
+    /// Which of the stop's timetable targets they want (a fraction of the list, picked when
+    /// they appear; see `goes_their_way`).
+    target: f32,
     /// Wants to buy this ticket (None: has a pass, or stamps one at a validator).
     ticket: Option<usize>,
     /// Whether the ticket was decided - at the first door, for that bus, as OMSI does
@@ -1656,6 +1692,8 @@ pub struct Person {
     /// passing through others.
     stuck: f32,
     ghost: f32,
+    /// Seconds a standing vehicle has stood in the way (see the crowd step).
+    car_wait: f32,
     /// Seconds left going round something in the way off the pavement's line (a lamp post
     /// on the path): the corridor does not pull them back into it meanwhile.
     detour: f32,
@@ -1808,10 +1846,6 @@ pub struct Humans {
     pub money: Option<crate::money::Money>,
     /// A rider pressed the stop button for the next stop (the app fires `door_haltewunsch`).
     pub stop_request: bool,
-    /// Somebody at the kerb pressed the outside door opener (`door_aussenoeffner`).
-    pub door_request: bool,
-    /// Stop whose waiting passengers have already pressed the outside opener once.
-    pressed_at_stop: Option<i64>,
     /// Tickets sold at the cash desk this session and what they were worth.
     pub tickets_sold: u32,
     pub ticket_cash: f32,
@@ -1872,9 +1906,11 @@ pub struct Humans {
     /// The player has got up and left the wheel: a standing bus with a door open is left
     /// by its riders as at a terminus (see `ALL_OUT_STOP`).
     pub driver_away: bool,
-    /// The player drives no duty (free roam): people board the player's bus only when it
-    /// shows a destination - a bus with none (or "not in service") is not theirs.
-    pub free_roam: bool,
+    /// Per bus stop, Omsi.exe's station targets (0x61cb18, `Schedule::stop_targets`): the
+    /// stops the trips go on to, each with the termini of those trips. A person waiting there
+    /// wants one of them and boards only a bus showing one of its termini; at a stop no trip
+    /// goes on from, anybody takes the first bus (0x61c33c).
+    pub stop_targets: Option<HashMap<i64, Vec<HashSet<String>>>>,
     /// Buses whose validator somebody used since the app last looked (`take_stamped`).
     stamped: Vec<BusId>,
     /// Pedestrians to keep strolling near the player (scaled by `density`).
@@ -1933,6 +1969,36 @@ pub struct Humans {
     /// each was last asked for.
     claims_out: Vec<u32>,
     claimed: HashMap<u32, f64>,
+}
+
+/// Resolve each map entry directly, including human packs with nested folders.
+/// Keep duplicate entries as spawn weights, but load each definition only once.
+fn map_human_types(root: &Path, list: &[String]) -> Vec<Arc<HumanType>> {
+    let mut loaded: HashMap<PathBuf, Option<Arc<HumanType>>> = HashMap::new();
+    let mut picked = Vec::new();
+    for line in list {
+        let rel = line.trim().replace('\\', "/");
+        // Lists normally include Humans/, but also accept paths relative to that folder.
+        let rel = if rel.to_ascii_lowercase().starts_with("humans/") {
+            rel
+        } else {
+            format!("Humans/{rel}")
+        };
+        let path = omsi_cfg::resolve_path(root, &rel);
+        let ty = loaded.entry(path.clone()).or_insert_with(|| {
+            match HumanType::load(&path) {
+                Ok(t) => Some(Arc::new(t)),
+                Err(e) => {
+                    log::warn!("map human {}: {e:#}", path.display());
+                    None
+                }
+            }
+        });
+        if let Some(t) = ty {
+            picked.push(t.clone());
+        }
+    }
+    picked
 }
 
 impl Humans {
@@ -2029,8 +2095,6 @@ impl Humans {
             change_due: None,
             money: None,
             stop_request: false,
-            door_request: false,
-            pressed_at_stop: None,
             tickets_sold: 0,
             ticket_cash: 0.0,
             boarded: 0,
@@ -2060,7 +2124,7 @@ impl Humans {
             last_buses: Vec::new(),
             avatar_only: false,
             driver_away: false,
-            free_roam: false,
+            stop_targets: None,
             stamped: Vec::new(),
             pedestrians: 14,
             stroll_timer: 0.0,
@@ -2458,15 +2522,41 @@ impl Humans {
 
     /// Timetable stop where a boarding rider will get off: one to four stops ahead (-1
     /// without a timetable: decided at random at each stop).
-    fn choose_exit(&mut self, bus: Option<&VehicleInstance>) -> i32 {
+    fn choose_exit(&mut self, bus: Option<&VehicleInstance>, world: &World) -> i32 {
         let Some(b) = bus else { return -1 };
         let n = b.host.tt_stops.len() as i32;
         if n == 0 {
             return -1;
         }
         let next = b.host.tt_busstop_index;
-        let r = (self.rand() % 4) as i32;
-        (next + 1 + r).min(n - 1).max(next.min(n - 1))
+        // the stops after the next one, weighed as Omsi.exe weighs them (see `draw_exit`);
+        // with nothing to weigh, the end of the trip
+        let from = (next + 1).clamp(0, n - 1);
+        let ids: Vec<i64> = (from..n).map(|k| b.host.tt_stop_ids.get(k as usize).copied().unwrap_or(0)).collect();
+        match self.draw_exit(&ids, world) {
+            Some(k) => from + k as i32,
+            None => n - 1,
+        }
+    }
+
+    /// Where a boarding passenger gets off among the stops `ahead` (map objects, in order):
+    /// Omsi.exe draws it at random, each stop as likely as its passengers-alighting number
+    /// says (0x61baa8: Random x the total, then down the list until it is used up; see
+    /// `tiles::stop_exit_weight`). None when there is nothing to weigh.
+    fn draw_exit(&mut self, ahead: &[i64], world: &World) -> Option<usize> {
+        let w: Vec<f32> = ahead.iter().map(|&id| if id == 0 { 0.5 } else { world.stop_exit_weight(id) }).collect();
+        let total: f32 = w.iter().sum();
+        if !(total > 0.0) {
+            return None;
+        }
+        let mut r = self.rand_f() as f32 * total;
+        for (k, wk) in w.iter().enumerate() {
+            if r < *wk {
+                return Some(k);
+            }
+            r -= wk;
+        }
+        Some(w.len() - 1)
     }
 
     /// Seat `n` passengers in the player's bus straight away, each with the stop they
@@ -2551,7 +2641,10 @@ impl Humans {
             let exit = if n == 0 {
                 -1
             } else {
-                (bus.host.tt_busstop_index + (self.rand() % 4) as i32).min(n - 1)
+                // (drawn as a boarding passenger's: `draw_exit`)
+                let from = bus.host.tt_busstop_index.clamp(0, n - 1);
+                let ids: Vec<i64> = (from..n).map(|k| bus.host.tt_stop_ids.get(k as usize).copied().unwrap_or(0)).collect();
+                self.draw_exit(&ids, world).map(|k| from + k as i32).unwrap_or(n - 1)
             };
             let s = &cabin.seats[seat];
             let pos = train_point(bus.position, &rot, &frames, s.floor);
@@ -2567,10 +2660,12 @@ impl Humans {
                     seat,
                 },
             ) {
+                let exit_id = usize::try_from(exit).ok().and_then(|k| bus.host.tt_stop_ids.get(k)).copied().filter(|&x| x != 0);
                 let p = &mut self.people[i];
                 p.place = Place::Bus(BusId::Player, s.floor);
                 p.lheading = s.rot as f64;
                 p.exit_stop = exit;
+                p.exit_id = exit_id;
                 p.activity = if s.seated {
                     Activity::Sit
                 } else {
@@ -2624,7 +2719,18 @@ impl Humans {
                 let st = &cabin.seats[seat];
                 let pos = train_point(bn.pos, &bn.rot, &bn.trailers, st.floor);
                 let heading = train_heading(bn.heading, &bn.trailers, st.floor);
-                let stops_left = 1 + (self.rand() % 5) as i32;
+                // (where they get off: as a boarding passenger draws it)
+                let ahead: Vec<i64> = match bn.id {
+                    BusId::Ai(id) => traffic
+                        .cars
+                        .iter()
+                        .find(|c| c.id == id)
+                        .and_then(|c| c.bus.as_ref())
+                        .map(|b| b.stops.iter().map(|st| st.id).filter(|&x| x != 0).collect())
+                        .unwrap_or_default(),
+                    BusId::Player => Vec::new(),
+                };
+                let exit_id = self.draw_exit(&ahead, world).map(|k| ahead[k]);
                 if let Some(i) = self.spawn(
                     world,
                     renderer,
@@ -2637,7 +2743,8 @@ impl Humans {
                     p.place = Place::Bus(bn.id, st.floor);
                     p.lheading = st.rot as f64;
                     p.from = -1;
-                    p.stops_left = stops_left;
+                    p.stops_left = i32::MAX;
+                    p.exit_id = exit_id;
                     p.exit_stop = -1;
                     p.activity = if st.seated { Activity::Sit } else { Activity::Stand };
                     seated += 1;
@@ -2781,8 +2888,8 @@ impl Humans {
         }
         // walking pace from the human's `[walk_param]` (1.4 m/s by default), a little varied
         let pace = (ty.def.walk_param[0] as f64).clamp(0.9, 1.8) * (0.85 + self.rand_f() * 0.25);
-        let takes_next = self.rand_f() < 0.8;
         let age = ty.def.age.map(|a| a as f32).unwrap_or(40.0);
+        let target = self.rand_f() as f32;
         let id = self.next_id;
         self.next_id += 1;
         if debug_pax() {
@@ -2822,9 +2929,10 @@ impl Humans {
             from: -1,
             exit_stop: -1,
             stops_left: 1,
+            exit_id: None,
             leaving_here: false,
             avoid: None,
-            takes_next,
+            target,
             ticket: None,
             ticket_decided: false,
             stamps: false,
@@ -2832,6 +2940,7 @@ impl Humans {
             age,
             stuck: 0.0,
             ghost: 0.0,
+            car_wait: 0.0,
             detour: 0.0,
             detour_side: 0.0,
             blocked: 0.0,
@@ -3201,9 +3310,6 @@ impl Humans {
                         );
                     }
                     self.stops.get_mut(&id).unwrap().spots[k].taken = Some(pid);
-                    if forced.is_some() {
-                        self.people[i].takes_next = true;
-                    }
                     self.people[i].activity = if spot.seat > 0.0 {
                         Activity::Sit
                     } else {
@@ -3541,6 +3647,20 @@ impl Humans {
                 })
                 .map(|s| s.0)
         };
+        let approaching = |pos: DVec3, heading: f64, speed: f64| -> Option<i64> {
+            if speed.abs() < 0.3 {
+                return None;
+            }
+            stops
+                .iter()
+                .filter(|s| {
+                    let d = (s.1 - pos).truncate();
+                    let bearing = d.x.atan2(d.y).to_degrees();
+                    d.length() < 60.0 && crowd::angle_diff(heading, bearing).abs() < 80.0 && crowd::angle_diff(heading, s.2).abs() <= 100.0
+                })
+                .min_by(|a, c| (a.1 - pos).length().total_cmp(&(c.1 - pos).length()))
+                .map(|s| s.0)
+        };
         let bb_of = |v: &VehicleInstance| {
             let bb =
                 v.ty.def
@@ -3556,18 +3676,8 @@ impl Humans {
             // away: a frame-time spike must not "leave" and re-enter the stop.
             let speed = b.physics.velocity_kmh() as f64 / 3.6;
             let limit = if self.served_stop.is_some() { 4.0 } else { 0.5 };
-            let (mut entry_open, exit_open) =
+            let (entry_open, exit_open) =
                 Self::doors_open(b, cabin.entries.len(), cabin.exits.len());
-            // free roam: only a bus that shows where it goes takes people in
-            if self.free_roam {
-                let shows = match (b.var("target_index_int"), b.host.hof.as_ref()) {
-                    (Some(i), Some(hof)) if i.is_finite() && i >= 0.0 => hof.termini.get(i.round() as usize).is_some_and(|t| !t.all_exit),
-                    _ => false,
-                };
-                if !shows {
-                    entry_open.iter_mut().for_each(|o| *o = false);
-                }
-            }
             let all_exit_here = match (b.var("target_index_int"), b.host.hof.as_ref()) {
                 (Some(i), Some(hof)) if i.is_finite() && i >= 0.0 => hof.termini.get(i.round() as usize).is_some_and(|t| t.all_exit),
                 _ => false,
@@ -3588,8 +3698,16 @@ impl Humans {
                 (Some(i), Some(hof)) if i.is_finite() && i >= 0.0 => hof.termini.get(i.round() as usize).is_some_and(|t| t.all_exit),
                 _ => false,
             };
+            let terminus = match (b.var("target_index_int"), b.host.hof.as_ref()) {
+                (Some(i), Some(hof)) if i.is_finite() && i >= 0.0 => hof
+                    .termini
+                    .get(i.round() as usize)
+                    .filter(|t| !t.all_exit)
+                    .map(|t| t.texture_id.trim().to_string()),
+                _ => None,
+            };
             out.push(BusNow {
-                all_exit,
+                terminus,
                 id: BusId::Player,
                 walk_open: None,
                 cabin,
@@ -3599,6 +3717,7 @@ impl Humans {
                 speed,
                 entry_open,
                 exit_open,
+                approach: if stop.is_none() && !all_exit { approaching(b.position, b.heading, speed) } else { None },
                 stop,
                 interior: b.interior_light(),
                 air: CabinAir::of(b),
@@ -3669,7 +3788,7 @@ impl Humans {
                 let (half, centre) = bb_of(&c.vehicle);
                 let trailers = part_frames(&c.vehicle, &cabin);
                 out.push(BusNow {
-                    all_exit: false,
+                    terminus: c.bus.as_ref().map(|b| b.terminus.trim().to_string()).filter(|t| !t.is_empty()),
                     id: BusId::Ai(c.id),
                     walk_open: None,
                     cabin,
@@ -3679,6 +3798,7 @@ impl Humans {
                     speed,
                     entry_open,
                     exit_open,
+                    approach: if stop.is_none() { approaching(c.vehicle.position, c.vehicle.heading, speed) } else { None },
                     stop,
                     interior: c.vehicle.interior_light(),
                     air: CabinAir::of(&c.vehicle),
@@ -3717,6 +3837,40 @@ impl Humans {
         self.placed_now = out;
     }
 
+    /// Whether a bus empties at `stop` and takes nobody on there (Omsi.exe 0x61f3e3, the
+    /// vehicle's +0x7c5): it is not in service - its target names no valid terminus of the
+    /// depot file, or an `[addterminus_allexit]` one ("$allexit$") - or it shows this very
+    /// stop as its terminus.
+    fn empties_at(&self, bn: &BusNow, stop: i64) -> bool {
+        match &bn.terminus {
+            None => true,
+            Some(t) => self.stops.get(&stop).is_some_and(|s| s.name.trim() == t.trim()),
+        }
+    }
+
+    /// Whether the bus goes where person `i`, waiting at `stop`, wants to go (Omsi.exe
+    /// 0x61c33c): each wants one of the stop's targets (their own pick among them) and
+    /// boards a bus whose terminus serves it. Where the timetable has no trip going on from
+    /// the stop, the target is invalid and they take the first bus there.
+    fn goes_their_way(&self, i: usize, stop: i64, bn: &BusNow) -> bool {
+        // (a bus not in service, or at its own terminus, is offered to nobody: Omsi.exe
+        // returns before listing it at the stop, 0x61f3e3 - people boarded a bus showing
+        // "Betriebsfahrt" or nothing at all)
+        if self.empties_at(bn, stop) {
+            return false;
+        }
+        let Some(targets) = self
+            .stop_targets
+            .as_ref()
+            .and_then(|m| m.get(&stop))
+            .filter(|t| !t.is_empty())
+        else {
+            return true;
+        };
+        let pick = ((self.people[i].target * targets.len() as f32) as usize).min(targets.len() - 1);
+        bn.terminus.as_ref().is_some_and(|t| targets[pick].contains(t))
+    }
+
     /// A bus people may be in but do not board here (another player's, one the player left).
     fn parked_bus(&mut self, id: BusId, v: &VehicleInstance) -> Option<BusNow> {
         let cabin = self.cabin_for(v)?;
@@ -3724,7 +3878,7 @@ impl Humans {
         let trailers = part_frames(v, &cabin);
         let walk_open = Self::doors_open(v, cabin.entries.len(), cabin.exits.len());
         Some(BusNow {
-            all_exit: false,
+            terminus: None,
             id,
             entry_open: vec![false; cabin.entries.len()],
             exit_open: vec![false; cabin.exits.len()],
@@ -3735,6 +3889,7 @@ impl Humans {
             heading: v.heading,
             speed: v.physics.velocity_kmh() as f64 / 3.6,
             stop: None,
+            approach: None,
             interior: v.interior_light(),
             air: CabinAir::of(v),
             half: DVec2::new(bb[0] as f64 * 0.5, bb[1] as f64 * 0.5),
@@ -3760,7 +3915,6 @@ impl Humans {
         let kept = self.seats.remove(&BusId::Player);
         self.player_cabin = None;
         self.served_stop = None;
-        self.pressed_at_stop = None;
         self.set_cabin(new_vehicle);
         if let (Some(k), Some(now)) = (kept, self.seats.get_mut(&BusId::Player)) {
             if k.len() == now.len() {
@@ -3793,7 +3947,6 @@ impl Humans {
         if bus == BusId::Player {
             self.player_cabin = None;
             self.served_stop = None;
-            self.pressed_at_stop = None;
         }
     }
 
@@ -3833,7 +3986,7 @@ impl Humans {
             // the passengers here never board it - that bus's own game boards them)
             let walk_open = Self::doors_open(v, cabin.entries.len(), cabin.exits.len());
             out.push(BusNow {
-                all_exit: false,
+                terminus: None,
                 id: BusId::Ai(remote_bus_id(player)),
                 entry_open: vec![false; cabin.entries.len()],
                 exit_open: vec![false; cabin.exits.len()],
@@ -3844,6 +3997,7 @@ impl Humans {
                 heading: v.heading,
                 speed: v.physics.velocity_kmh() as f64 / 3.6,
                 stop: None,
+                approach: None,
                 interior: v.interior_light(),
                 air: CabinAir::of(v),
                 half: DVec2::new(bb[0] as f64 * 0.5, bb[1] as f64 * 0.5),
@@ -4112,53 +4266,26 @@ impl Humans {
         }
     }
 
-    /// Keep only the people the map's `humans.txt` names (once). OMSI draws a map's
-    /// pedestrians and passengers from that list alone: Berlin-Spandau and Grundorf name 15
-    /// of the stock types - not the uniformed DBC staff, not the aXYZ man01 - and certainly
-    /// not an add-on's people installed for another map (the GSPNS ones of Novi Sad, whose
-    /// man02 had no texture on Spandau and whose man04 walked with crossed legs). An entry
-    /// may be listed more than once to make it more common. A map without the file, or
-    /// whose list names nobody installed, keeps everybody.
+    /// Use the map's explicit passenger/pedestrian paths, preserving repeated entries.
+    /// Without a list keep the installed fallback types. With a nonempty list use only
+    /// definitions that load successfully, even if none do: another map's people must
+    /// not silently replace a missing passenger pack.
     fn use_map_humans(&mut self, world: &World) {
         if self.map_humans_done {
             return;
         }
         self.map_humans_done = true;
-        let list = omsi_map::ailists::load_list(&world.map_dir.join("humans.txt"));
+        let path = omsi_cfg::resolve_path(&world.map_dir, "humans.txt");
+        let list = omsi_map::ailists::load_list(&path);
         if list.is_empty() {
             return;
         }
-        // the path below `Humans/`, lower case with forward slashes
-        let key = |p: &str| -> String {
-            let p = p.replace('\\', "/").to_ascii_lowercase();
-            match p.rfind("humans/") {
-                Some(k) => p[k + 7..].to_string(),
-                None => p,
-            }
-        };
-        let mut picked: Vec<Arc<HumanType>> = Vec::new();
-        let mut missing: Vec<&str> = Vec::new();
-        for line in &list {
-            let want = key(line.trim());
-            match self
-                .types
-                .iter()
-                .find(|t| key(&t.def.path.to_string_lossy()) == want)
-            {
-                Some(t) => picked.push(t.clone()),
-                None => missing.push(line),
-            }
-        }
-        if !missing.is_empty() {
-            log::warn!("humans.txt of the map names people not installed: {missing:?}");
-        }
-        if picked.is_empty() {
-            return;
-        }
+        let picked = map_human_types(&world.root, &list);
         log::info!(
-            "humans: {} of {} types from the map's humans.txt",
+            "humans: {} of {} map entries loaded from {}",
             picked.len(),
-            self.types.len()
+            list.len(),
+            path.display()
         );
         self.types = picked;
     }
@@ -4587,11 +4714,24 @@ impl Humans {
             }
             self.served_stop = at_stop;
             self.served_stop_since = self.time;
+            // (the player's bus's riders only: a timetable bus's riders decide once per
+            // stop of their own bus, and lost it here whenever the player's bus came to a
+            // stop somewhere - they stood at the open door until their bus drove on, #317)
             for i in 0..self.people.len() {
-                self.people[i].leaving_here = false;
+                if self.people[i].state.bus() == Some(BusId::Player) {
+                    self.people[i].leaving_here = false;
+                }
             }
             if let (Some(stop), Some(b)) = (at_stop, bus) {
                 let here = b.host.tt_busstop_index;
+                // Omsi.exe (0x61f3e3): a bus not in service ("$allexit$": no valid target) or
+                // standing at its own terminus - the terminus it shows is this stop's name -
+                // empties; every rider goes (0x62d129). Riders whose stop it is go by the
+                // stop itself, not only by the timetable's index: that is reset to 0 when the
+                // next trip is taken up, and at the end of a late trip nobody got off (#226
+                // report: "passengers do not get out at the last stop").
+                let everybody = player.is_some_and(|pb| self.empties_at(pb, stop));
+                let here_id = b.host.tt_stop_ids.get(usize::try_from(here).unwrap_or(usize::MAX)).copied();
                 for i in 0..self.people.len() {
                     let (exit, from) = (self.people[i].exit_stop, self.people[i].from);
                     if matches!(
@@ -4602,12 +4742,20 @@ impl Humans {
                         } | State::AtExit {
                             bus: BusId::Player,
                             ..
+                        } | State::Aboard {
+                            bus: BusId::Player,
+                            goal: Goal::ExitWait(_) | Goal::Exit(_),
+                            ..
                         }
                     ) {
-                        let leaves = if stop == ALL_OUT_STOP || self.driver_away {
+                        // (those already on their way to the door are asked too: they stood up
+                        // as the bus pulled in - see `mine_ahead` - and, left out here, came to
+                        // the door as if riding on and never got off, #336)
+                        let exit_id = self.people[i].exit_id;
+                        let leaves = if stop == ALL_OUT_STOP || self.driver_away || everybody || exit_id == Some(stop) {
                             true
                         } else if exit >= 0 {
-                            exit <= here
+                            exit <= here && (exit_id.is_none() || here_id == Some(stop))
                         } else {
                             from != stop && self.rand_f() < 0.35
                         };
@@ -4656,13 +4804,14 @@ impl Humans {
                 .map(|v| (self.time - v.1) < dt as f64 * 1.5)
                 .unwrap_or(false);
             if fresh {
+                let everybody = self.empties_at(bn, stop);
                 for i in 0..self.people.len() {
                     match self.people[i].state {
                         State::Riding { bus, .. }
                             if bus == bn.id && self.people[i].from != stop =>
                         {
-                            self.people[i].stops_left -= 1;
-                            if self.people[i].stops_left <= 0 {
+                            self.people[i].stops_left = self.people[i].stops_left.saturating_sub(1);
+                            if everybody || self.people[i].stops_left <= 0 || self.people[i].exit_id == Some(stop) {
                                 self.people[i].leaving_here = true;
                             }
                         }
@@ -4699,10 +4848,12 @@ impl Humans {
         for r in self.entry_req.iter_mut().chain(self.exit_req.iter_mut()) {
             *r = false;
         }
-        // A request opens a shut door; an open one it holds only from the doorway, as the
-        // light barrier does - one on the way from the upper deck or at the back of the
-        // queue held the SD202's automatic rear door open until the last of them was through
-        // (its script starts the closing time again on every frame with a request).
+        // A request opens a shut door. Those getting off ask the whole way to the exit, as
+        // Omsi.exe's riders do from the moment they stand up (state 5, 0x62d6f8): asked
+        // only from the doorway, the SD202's automatic rear door shut three seconds after
+        // the one in front, on the rider still walking up, and opened again when they got
+        // there - the door "did not know" whether people were getting off. Those boarding
+        // hold an open door from the doorway, as they wait within 0.7 m of it in OMSI.
         let in_doorway = |p: &Person, entry: Option<usize>, exit: Option<usize>| -> bool {
             let Some(pb) = player else { return true };
             let (door, open) = match (entry, exit) {
@@ -4740,7 +4891,7 @@ impl Humans {
                     bus: BusId::Player,
                     goal: Goal::ExitWait(exit),
                     ..
-                } if p.leaving_here && self.exit_req_time.get(&p.id).is_none_or(|t| *t < EXIT_REQ_LAPSE) && in_doorway(p, None, Some(exit)) => {
+                } if p.leaving_here && self.exit_req_time.get(&p.id).is_none_or(|t| *t < EXIT_REQ_LAPSE) => {
                     if let Some(r) = self.exit_req.get_mut(exit) {
                         *r = true;
                     }
@@ -4752,7 +4903,7 @@ impl Humans {
                     bus: BusId::Player,
                     goal: Goal::Exit(exit),
                     ..
-                } if self.exit_req_time.get(&p.id).is_none_or(|t| *t < EXIT_REQ_LAPSE) && in_doorway(p, None, Some(exit)) => {
+                } if self.exit_req_time.get(&p.id).is_none_or(|t| *t < EXIT_REQ_LAPSE) => {
                     if let Some(r) = self.exit_req.get_mut(exit) {
                         *r = true;
                     }
@@ -4760,32 +4911,11 @@ impl Humans {
                 _ => {}
             }
         }
-        // the outside door opener: somebody queueing at a shut door presses it, once per stop
-        if let (Some(stop), Some(pb)) = (at_stop, player) {
-            let shut = self.people.iter().any(|p| matches!(p.state, State::Queue { bus: BusId::Player, entry, .. } if !pb.entry_open.get(entry).copied().unwrap_or(false)));
-            if shut && self.pressed_at_stop != Some(stop) && pb.standing() {
-                self.pressed_at_stop = Some(stop);
-                self.door_request = true;
-                if debug_pax() {
-                    log::info!(
-                        "t={:.1} a passenger presses the outside door opener at stop {stop}",
-                        self.time
-                    );
-                }
-            }
-        }
-        if let (Some(stop), Some(b)) = (self.pressed_at_stop, bus) {
-            let gone = world
-                .bus_stops
-                .lock()
-                .iter()
-                .find(|s| s.0 == stop)
-                .map(|s| (s.1 - b.position).length() > 40.0)
-                .unwrap_or(true);
-            if gone {
-                self.pressed_at_stop = None;
-            }
-        }
+        // (no outside door opener: Omsi.exe never fires `door_aussenoeffner` - its riders
+        // only raise PAX_Entry<n>_Req, as above. On the SD200/SD202 that trigger is the rear
+        // door's outside button: pressed for a rider queueing at the shut front door, it set
+        // `haltewunsch` under the door release and the rear door opened with nobody at it and
+        // no stop request lamp lit.)
         // cars pedestrians look out for: (position, velocity, half length)
         let mut cars: Vec<(DVec2, DVec2, f64)> = Vec::new();
         let mut blocks: Vec<Block> = Vec::new();
@@ -4986,6 +5116,40 @@ impl Humans {
         // shoves anybody out of a vehicle's box
         if omsi_cfg::env::var_os("OMSI_CHECK_OVERLAP").is_some() {
             self.check_overlaps(world, traffic, player);
+        }
+        // Somebody on foot whose way a standing vehicle blocks - a car that has pulled up on
+        // the crossing, a bus in the yard - waits for it instead of walking into its side
+        // (they pressed against it, slid along it and were drawn back by their path into
+        // it again, over and over); after a while they go round it.
+        for i in 0..self.people.len() {
+            let p = &self.people[i];
+            if remove.contains(&i) || p.puppet.is_some() || p.remote || !matches!(p.place, Place::Ground) {
+                continue;
+            }
+            let want = wants[i].vel;
+            let speed = want.length();
+            if speed < 0.2 {
+                self.people[i].car_wait = 0.0;
+                continue;
+            }
+            let ahead = p.position.truncate() + want / speed * 0.9;
+            let in_way = blocks.iter().any(|b| b.vel.length() < 0.5 && b.near(ahead, BODY_OUTSIDE + 0.15) && {
+                let (q, inside) = b.closest(ahead);
+                inside || (ahead - q).length() < BODY_OUTSIDE + 0.15
+            });
+            if !in_way {
+                self.people[i].car_wait = 0.0;
+                continue;
+            }
+            self.people[i].car_wait += dt;
+            if self.people[i].car_wait > 8.0 {
+                // round it: off the path's corridor for a few seconds, the vehicle's box
+                // steering them past its end
+                self.people[i].detour = self.people[i].detour.max(4.0);
+                self.people[i].car_wait = 0.0;
+            } else if self.people[i].detour <= 0.0 {
+                wants[i].vel = DVec2::ZERO;
+            }
         }
         // the crowd
         let mut walkers: Vec<Walker> = Vec::with_capacity(self.people.len());
@@ -5370,11 +5534,7 @@ impl Humans {
                         self.people[i].why = "waits for another bus (just got off this one)";
                         continue;
                     }
-                    if bn.all_exit {
-                        self.people[i].why = "the bus says it is not in service";
-                        continue;
-                    }
-                    if !self.people[i].takes_next && t_state < 300.0 {
+                    if !self.goes_their_way(i, stop, bn) {
                         self.people[i].why = "waits for another line";
                         continue;
                     }
@@ -5430,6 +5590,50 @@ impl Humans {
                         },
                     );
                     return stand;
+                }
+                // a bus of theirs pulling in: up and a step or two towards the kerb to meet it,
+                // facing it (see `BusNow::approach`); they board once it stands, as above
+                let coming = buses
+                    .iter()
+                    .filter(|b| b.approach == Some(stop) && avoid != Some(b.id))
+                    .filter(|b| !mirror || b.id == BusId::Player)
+                    .filter(|b| self.goes_their_way(i, stop, b))
+                    .min_by(|a, c| (a.pos.truncate() - pos2).length().total_cmp(&(c.pos.truncate() - pos2).length()));
+                if let Some(bn) = coming {
+                    let h = bn.heading.to_radians();
+                    let dir = DVec2::new(h.sin(), h.cos());
+                    let rel = pos2 - bn.pos.truncate();
+                    let side = rel - dir * rel.dot(dir);
+                    let lat = side.length();
+                    let to_bus = bn.pos.truncate() - pos2;
+                    let face = to_bus.x.atan2(to_bus.y).to_degrees();
+                    // a metre clear of its side, and a step or two from the waiting place at
+                    // most: OMSI's people keep to the walkways of the stop (its path links),
+                    // and allowed 4 m they stood out on the road before the bus had stopped
+                    // (a bus pulling in along the far lane, #123)
+                    let clear = bn.half.x + 1.0;
+                    let home = sp.floor().truncate();
+                    let target = home + (pos2 - side / lat.max(1e-6) * (lat - clear) - home).clamp_length_max(1.2);
+                    // (never off the pavement: a waiting place at the kerb's edge had them
+                    // step out onto the carriageway in front of the bus, #123)
+                    let off_kerb = net.is_some_and(|n| {
+                        on_carriageway(n, target.extend(sp.floor().z)) || crosses_street(n, home, target)
+                    });
+                    if lat > clear + 0.3 && !off_kerb {
+                        let d = (target - pos2).length();
+                        self.people[i].why = "steps forward to meet the bus";
+                        return Want {
+                            vel: arrive(pos2, target, pace * 0.7),
+                            face: Some(face),
+                            give: 0.5,
+                            corridor: None,
+                            idle: Activity::Stand,
+                            follow: false,
+                            goal_dist: Some(d),
+                        };
+                    }
+                    self.people[i].why = "waits at the kerb for the bus";
+                    return Want::stand(Some(face), Activity::Stand);
                 }
                 if t_state > patience && !buses.iter().any(|b| b.stop == Some(stop)) {
                     // waited long enough: walks off (and somebody else will come)
@@ -5524,8 +5728,14 @@ impl Humans {
                 } else {
                     f64::INFINITY
                 };
+                // people getting off through this door: the front of the queue stands aside
+                // for them - on the door's outside point it stood where they step down to,
+                // and each waited for the other until someone gave up (#253: "passengers
+                // stand at the door a long time before going in")
+                let alighting = self.people.iter().any(|p| matches!(p.state, State::Aboard { bus: b, goal: Goal::Exit(x), .. } if b == bus && (bn.cabin.exits[x].inside - door.inside).length() < 2.0));
+                let aside = if alighting { 0.8 } else { 0.0 };
                 let place = |k: usize| {
-                    let d = QUEUE_GAP * k as f64;
+                    let d = QUEUE_GAP * k as f64 + aside;
                     if d <= q_len {
                         base + q_dir * d
                     } else {
@@ -5584,7 +5794,6 @@ impl Humans {
                     if let Some(other) = self
                         .choose_entry(i, bn)
                         .filter(|e| *e != entry && bn.entry_open.get(*e).copied().unwrap_or(false))
-                        .filter(|_| d > 1.5 || self.people[i].t_state > 8.0)
                     {
                         self.set_state(
                             i,
@@ -5609,15 +5818,24 @@ impl Humans {
                     return w;
                 }
                 if d > 0.6 {
-                    self.people[i].why = "";
-                    return w;
+                    // held off the door by something of the map in the way (a railing, a
+                    // pole, a shelter's wall: people are kept out of its collision boxes)
+                    // - as close as they get is close enough. They stood a metre from the
+                    // open door until the bus left without them.
+                    let held = d < 2.0 && self.people[i].stuck > 1.0;
+                    if !held {
+                        self.people[i].why = "";
+                        return w;
+                    }
+                    if debug_pax() {
+                        log::info!("t={:.1} pax {} cannot get closer to entry {entry} than {d:.1} m: boards from there", self.time, self.people[i].label());
+                    }
                 }
                 if self.door_busy.contains_key(&(bus, false, entry)) {
                     self.people[i].why = "the doorway is busy";
                     return w;
                 }
                 // people getting off first
-                let alighting = self.people.iter().any(|p| matches!(p.state, State::Aboard { bus: b, goal: Goal::Exit(x), .. } if b == bus && (bn.cabin.exits[x].inside - door.inside).length() < 2.0));
                 if alighting {
                     self.people[i].why = "lets people off first";
                     return w;
@@ -5669,7 +5887,7 @@ impl Humans {
                 // in
                 self.seats.get_mut(&bus).unwrap()[seat] = true;
                 self.free_spot(stop, spot, id);
-                self.door_busy.insert((bus, false, entry), 1.3);
+                self.door_busy.insert((bus, false, entry), 0.8);
                 // the kerb's height in the frame of the section the door is in
                 let ground = world.walk_height(base.x, base.y).unwrap_or(base_w.z);
                 // from where they stand (up to 0.6 m from the door's outside point: put
@@ -5724,16 +5942,31 @@ impl Humans {
                 p.leaving_here = false;
                 p.avoid = None;
                 // OMSI_PAX_STOPS=n: everybody gets off a timetable bus after n stops (a test)
-                p.stops_left = omsi_cfg::env::var("OMSI_PAX_STOPS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1 + (self.rng % 4) as i32);
+                let test_stops: Option<i32> = omsi_cfg::env::var("OMSI_PAX_STOPS").ok().and_then(|v| v.parse().ok());
+                p.stops_left = test_stops.unwrap_or(i32::MAX);
+                p.exit_id = None;
                 let exit = if bus == BusId::Player {
-                    self.choose_exit(player_bus)
+                    self.choose_exit(player_bus, world)
                 } else {
                     -1
                 };
+                // a timetable bus: where to get off among the stops it still serves, drawn
+                // as Omsi.exe draws it (`draw_exit`); nothing to draw from: to its end
+                if let (BusId::Ai(id), None) = (bus, test_stops) {
+                    let ahead: Vec<i64> = traffic
+                        .and_then(|t| t.cars.iter().find(|c| c.id == id))
+                        .and_then(|c| c.bus.as_ref())
+                        .map(|b| b.stops.iter().map(|st| st.id).filter(|&x| x != stop && x != 0).collect())
+                        .unwrap_or_default();
+                    let k = self.draw_exit(&ahead, world);
+                    self.people[i].exit_id = k.map(|k| ahead[k]);
+                }
                 self.people[i].exit_stop = exit;
+                if bus == BusId::Player {
+                    // (the stop itself as well: the timetable's index starts again at 0 with
+                    // the next trip, see where riders decide to get off)
+                    self.people[i].exit_id = usize::try_from(exit).ok().and_then(|k| player_bus.and_then(|b| b.host.tt_stop_ids.get(k))).copied().filter(|&x| x != 0);
+                }
                 self.set_state(
                     i,
                     State::Aboard {
@@ -6012,7 +6245,19 @@ impl Humans {
                     follow: false,
                     goal_dist: None,
                 };
-                if self.people[i].leaving_here && bn.standing() && bn.stop.is_some() {
+                // Omsi.exe's riders get up as the bus heads into their stop (state 7, up to 60 m
+                // out, while it still rolls: 0x62d129), not once it stands - then they held
+                // the doors up at every stop while they came from the back
+                let mine_ahead = bn.approach.is_some_and(|a| {
+                    let p = &self.people[i];
+                    p.exit_id == Some(a)
+                        || (bus == BusId::Player && p.exit_id.is_none() && p.exit_stop >= 0 && player_bus.is_some_and(|b| b.host.tt_stop_ids.get(p.exit_stop as usize) == Some(&a)))
+                        || self.empties_at(bn, a)
+                });
+                if mine_ahead {
+                    self.people[i].leaving_here = true;
+                }
+                if self.people[i].leaving_here && ((bn.standing() && bn.stop.is_some()) || mine_ahead) {
                     if bn.cabin.exits.is_empty() {
                         // a cabin without an exit (a trailer section): rides on
                         self.people[i].leaving_here = false;
@@ -6090,6 +6335,7 @@ impl Humans {
                         if bus == BusId::Player {
                             if let Some(b) = player_bus {
                                 self.people[i].exit_stop = b.host.tt_busstop_index;
+                                self.people[i].exit_id = None;
                             }
                         } else {
                             self.people[i].stops_left = 1;
@@ -6172,7 +6418,10 @@ impl Humans {
                     );
                     return w;
                 }
-                if (spot - here).length() > EXIT_REACH {
+                // (held off the spot - a pole, a seat back, somebody's bag - as close as they
+                // get is close enough, as for boarding: they waited there for good)
+                let off = (spot - here).length();
+                if off > EXIT_REACH && !(off < 1.5 && self.people[i].stuck > 1.0) {
                     self.people[i].why = "steps up to the exit";
                     return w;
                 }
@@ -6370,17 +6619,24 @@ impl Humans {
             allowed
         };
         let dist = |e: usize| (bn.world(bn.cabin.entries[e].outside).truncate() - pos).length();
-        let open: Vec<usize> = allowed
-            .iter()
-            .copied()
-            .filter(|&e| bn.entry_open.get(e).copied().unwrap_or(false))
-            .collect();
-        let pool = if open.is_empty() { &allowed } else { &open };
+        // A door still shut counts as some metres farther, the more the longer one has
+        // waited at it: an open door not much farther is taken, a far one only once the
+        // near door stays shut. (Only the doors open at the moment counted: a bus whose
+        // rear doors opened a moment before its front one sent the people waiting at the
+        // front to the back.)
+        let waited = if matches!(p.state, State::Queue { .. }) { p.t_state.max(0.0) as f64 } else { 0.0 };
+        let shut = |e: usize| {
+            if bn.entry_open.get(e).copied().unwrap_or(false) {
+                0.0
+            } else {
+                6.0 + 2.0 * waited
+            }
+        };
         // with both leaves open, spread out: the shorter queue wins at similar distance
-        pool.iter().copied().min_by(|a, b| {
+        allowed.iter().copied().min_by(|a, b| {
             let qa = self.people.iter().filter(|q| matches!(q.state, State::Queue { bus, entry, .. } if bus == bn.id && entry == *a)).count() as f64;
             let qb = self.people.iter().filter(|q| matches!(q.state, State::Queue { bus, entry, .. } if bus == bn.id && entry == *b)).count() as f64;
-            (dist(*a) + qa * 0.8).total_cmp(&(dist(*b) + qb * 0.8))
+            (dist(*a) + qa * 0.8 + shut(*a)).total_cmp(&(dist(*b) + qb * 0.8 + shut(*b)))
         })
     }
 
@@ -6503,6 +6759,8 @@ impl Humans {
                         bn.cabin.part_label(s.floor),
                         if bus == BusId::Player {
                             format!("timetable stop {}", self.people[i].exit_stop)
+                        } else if let Some(x) = self.people[i].exit_id {
+                            format!("stop object {x}")
                         } else {
                             format!("{} stops", self.people[i].stops_left)
                         }
@@ -7230,7 +7488,6 @@ impl Humans {
         buses: &[BusNow],
         bus_ix: &HashMap<BusId, usize>,
     ) {
-        let ground_floor = |at: DVec2| world.walk_height(at.x, at.y);
         for i in 0..self.people.len() {
             if let Some(pp) = self.people[i].puppet {
                 if pp.mode == PuppetMode::Avatar {
@@ -7353,21 +7610,33 @@ impl Humans {
                             facing = Some(sp.face);
                         }
                     }
-                    // a bus coming in or standing there is watched
+                    // A bus coming in is watched, and one standing there by the people it
+                    // takes - each on their own: some never look up, the rest turn to it
+                    // after a moment of their own. (Everybody at the stop looked at the
+                    // front door of whatever bus came near and kept looking: the whole stop
+                    // stared at the driver at once, and at a bus that was not theirs.)
+                    let h = (p.id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    let watcher = h % 5 != 0;
                     let near = buses
                         .iter()
                         .filter(|b| b.speed.abs() < 14.0)
                         .map(|b| (b, (b.pos - p.position).length()))
                         .filter(|(_, d)| *d < 45.0)
                         .min_by(|a, b| a.1.total_cmp(&b.1));
-                    if let Some((b, _)) = near {
-                        let front = b
-                            .cabin
-                            .entries
-                            .first()
-                            .map(|d| b.world(d.inside))
-                            .unwrap_or(b.pos);
-                        look = Some(to_model(front + DVec3::Z * 1.3));
+                    if let (Some((b, d)), true) = (near, watcher) {
+                        let coming = b.speed.abs() > 0.5 && d > 8.0 + ((h >> 8) % 12) as f64;
+                        let theirs = b.stop == Some(*stop) && self.goes_their_way(i, *stop, b);
+                        if coming || theirs {
+                            // (where on the bus: its door, or somewhere along its front half)
+                            let aim = b
+                                .cabin
+                                .entries
+                                .first()
+                                .map(|e| b.world(e.inside))
+                                .unwrap_or(b.pos)
+                                + DVec3::new(((h >> 16) % 100) as f64 / 50.0 - 1.0, ((h >> 24) % 100) as f64 / 50.0 - 1.0, 0.0);
+                            look = Some(to_model(aim + DVec3::Z * 1.3));
+                        }
                     }
                 }
                 _ => {}
@@ -7402,6 +7671,8 @@ impl Humans {
                     b.cabin.floor_at(at, b.half.x, level)
                 }
             });
+            // (the floor at the feet' own height: a shelter's roof over them is no floor)
+            let ground_floor = move |at: DVec2| world.walk_height_near(at.x, at.y, level);
             let floor: &dyn Fn(DVec2) -> Option<f64> = match &bus_floor {
                 Some(f) => f,
                 None => &ground_floor,
@@ -8315,7 +8586,8 @@ impl Humans {
                 // (in the air the feet go with the body: the floor under them is where they are)
                 let air_floor = origin.z;
                 let floor_air = move |_: DVec2| Some(air_floor);
-                let floor_ground = |at: DVec2| world.walk_height(at.x, at.y);
+                let level = origin.z;
+                let floor_ground = move |at: DVec2| world.walk_height_near(at.x, at.y, level);
                 let floor: &dyn Fn(DVec2) -> Option<f64> = if airborne { &floor_air } else { &floor_ground };
                 let speed = cmd.vel.length();
                 let input = PoseInput {
@@ -8643,6 +8915,9 @@ impl Humans {
         else {
             return want;
         };
+        if self.empties_at(bn, stop) {
+            return want;
+        }
         let free = self
             .seats
             .get(&BusId::Player)
@@ -8694,7 +8969,6 @@ impl Humans {
         };
         let p = &mut self.people[i];
         p.remote = false;
-        p.takes_next = true;
         p.avoid = None;
         p.vel = DVec2::ZERO;
         self.set_state(
@@ -8715,6 +8989,35 @@ impl Humans {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_humans_load_nested_paths_and_preserve_weights() {
+        let root = std::env::temp_dir().join(format!(
+            "omsi-map-human-paths-{}", std::process::id()
+        ));
+        let nested = root.join("Humans/JP_Test/Child_1");
+        std::fs::create_dir_all(&nested).unwrap();
+        // Synthetic definitions: no original passenger assets are required.
+        std::fs::write(nested.join("Child_1.hum"), "[model]\nmodel.cfg\n").unwrap();
+        std::fs::write(nested.join("model.cfg"), "").unwrap();
+        let other = root.join("Humans/Other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("Man.hum"), "[model]\nmodel.cfg\n").unwrap();
+        std::fs::write(other.join("model.cfg"), "").unwrap();
+        let list = vec![
+            "humans\\jp_test\\child_1\\child_1.hum".into(),
+            "Humans/JP_Test/Child_1/Child_1.hum".into(),
+            "JP_Test/Child_1/Child_1.hum".into(),
+            "Humans/JP_Test/Missing.hum".into(),
+        ];
+        let picked = map_human_types(&root, &list);
+        assert_eq!(picked.len(), 3);
+        assert!(Arc::ptr_eq(&picked[0], &picked[1]));
+        assert!(Arc::ptr_eq(&picked[1], &picked[2]));
+        assert!(picked.iter().all(|t| t.def.path.starts_with(&nested)));
+        assert!(map_human_types(&root, &["Humans/Missing/None.hum".into()]).is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     /// Berlin 1991's pack: full fare, short haul, day ticket (adults), and two reduced
     /// fares for 6..13.

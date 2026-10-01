@@ -13,8 +13,8 @@ log.workspace = true
 ab_glyph = "0.2"
 resvg = { version = "0.45", default-features = false }
 hashbrown.workspace = true
+pollster.workspace = true
 
 [dev-dependencies]
 naga = { version = "29", features = ["wgsl-in"] }
-pollster.workspace = true
 image.workspace = true

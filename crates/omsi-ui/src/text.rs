@@ -104,63 +104,94 @@ pub struct Fonts {
 /// The system's fonts for the scripts Roboto has not (Chinese, Japanese, Korean, the
 /// Devanagari of Hindi, Arabic, Thai ...): read the first time such a character is drawn,
 /// from where each system keeps them - nothing is shipped, and nothing is read for a
-/// language Roboto covers.
-fn fallback_fonts() -> &'static [FontVec] {
-    static FALLBACK: std::sync::OnceLock<Vec<FontVec>> = std::sync::OnceLock::new();
+/// language Roboto covers. Each carries the interface language it is best for: Chinese,
+/// Japanese and Korean share thousands of characters and each font draws them its own
+/// country's way, so the interface's own language picks first.
+fn fallback_fonts() -> &'static [(&'static str, FontVec)] {
+    static FALLBACK: std::sync::OnceLock<Vec<(&'static str, FontVec)>> = std::sync::OnceLock::new();
     FALLBACK.get_or_init(|| {
-        const PATHS: &[&str] = &[
+        const PATHS: &[(&str, &str)] = &[
             // Windows
-            "C:\\Windows\\Fonts\\YuGothM.ttc",
-            "C:\\Windows\\Fonts\\msyh.ttc",
-            "C:\\Windows\\Fonts\\meiryo.ttc",
-            "C:\\Windows\\Fonts\\malgun.ttf",
-            "C:\\Windows\\Fonts\\Nirmala.ttf",
-            "C:\\Windows\\Fonts\\NirmalaUI.ttf",
-            "C:\\Windows\\Fonts\\segoeui.ttf",
-            "C:\\Windows\\Fonts\\tahoma.ttf",
+            ("ja", "C:\\Windows\\Fonts\\YuGothM.ttc"),
+            ("zh", "C:\\Windows\\Fonts\\msyh.ttc"),
+            ("zh-tw", "C:\\Windows\\Fonts\\msjh.ttc"),
+            ("ja", "C:\\Windows\\Fonts\\meiryo.ttc"),
+            ("ko", "C:\\Windows\\Fonts\\malgun.ttf"),
+            // (Thai from fonts whose marks sit right without a shaper: Tahoma's do, those of
+            // Leelawadee and macOS's Thonburi wait for one - Thonburi even draws them on
+            // dotted circles)
+            ("th", "C:\\Windows\\Fonts\\tahoma.ttf"),
+            ("hi", "C:\\Windows\\Fonts\\Nirmala.ttf"),
+            ("hi", "C:\\Windows\\Fonts\\NirmalaUI.ttf"),
+            ("", "C:\\Windows\\Fonts\\segoeui.ttf"),
             // macOS
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
-            "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-            "/System/Library/Fonts/Kohinoor.ttc",
-            "/System/Library/Fonts/Supplemental/Devanagari Sangam MN.ttc",
-            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "/System/Library/Fonts/GeezaPro.ttc",
+            ("zh", "/System/Library/Fonts/Hiragino Sans GB.ttc"),
+            ("ja", "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc"),
+            ("zh-tw", "/System/Library/Fonts/STHeiti Light.ttc"),
+            ("ko", "/System/Library/Fonts/AppleSDGothicNeo.ttc"),
+            ("th", "/System/Library/Fonts/Supplemental/SukhumvitSet.ttc"),
+            ("th", "/System/Library/Fonts/Supplemental/Silom.ttf"),
+            ("hi", "/System/Library/Fonts/Kohinoor.ttc"),
+            ("hi", "/System/Library/Fonts/Supplemental/Devanagari Sangam MN.ttc"),
+            ("", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+            ("", "/System/Library/Fonts/GeezaPro.ttc"),
             // Android
-            "/system/fonts/NotoSansCJK-Regular.ttc",
-            "/system/fonts/NotoSerifCJK-Regular.ttc",
-            "/system/fonts/NotoSansDevanagari-Regular.otf",
-            "/system/fonts/NotoSansDevanagariUI-VF.ttf",
-            "/system/fonts/NotoSansDevanagari-VF.ttf",
-            "/system/fonts/NotoNaskhArabic-Regular.ttf",
-            "/system/fonts/DroidSansFallback.ttf",
+            ("", "/system/fonts/NotoSansCJK-Regular.ttc"),
+            ("", "/system/fonts/NotoSerifCJK-Regular.ttc"),
+            ("th", "/system/fonts/NotoSansThai-Regular.ttf"),
+            ("hi", "/system/fonts/NotoSansDevanagari-Regular.otf"),
+            ("hi", "/system/fonts/NotoSansDevanagariUI-VF.ttf"),
+            ("hi", "/system/fonts/NotoSansDevanagari-VF.ttf"),
+            ("", "/system/fonts/NotoNaskhArabic-Regular.ttf"),
+            ("", "/system/fonts/DroidSansFallback.ttf"),
             // Linux
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
-            "/usr/share/fonts/noto/NotoSansDevanagari-Regular.ttf",
-            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-            "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ("", "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+            ("", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
+            ("", "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"),
+            ("th", "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf"),
+            ("th", "/usr/share/fonts/truetype/tlwg/Garuda.ttf"),
+            ("hi", "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf"),
+            ("hi", "/usr/share/fonts/noto/NotoSansDevanagari-Regular.ttf"),
+            ("", "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"),
+            ("", "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc"),
+            ("", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         ];
         let mut out = Vec::new();
-        for p in PATHS {
+        for (lang, p) in PATHS {
             let Ok(data) = std::fs::read(p) else { continue };
             if let Ok(f) = FontVec::try_from_vec_and_index(data, 0) {
-                out.push(f);
+                out.push((*lang, f));
             }
         }
         out
     })
 }
 
+/// The system font that draws `c` when Roboto has it not: one meant for the interface's
+/// language first, then any. For the game's own texts as much as the launcher's.
+pub fn fallback_font(c: char) -> Option<&'static FontVec> {
+    let fonts = fallback_fonts();
+    let lang = crate::i18n::language();
+    let has = |f: &FontVec| f.glyph_id(c).0 != 0;
+    if !lang.is_empty() {
+        if let Some((_, f)) = fonts.iter().find(|(l, f)| *l == lang && has(f)) {
+            return Some(f);
+        }
+    }
+    fonts.iter().find(|(_, f)| has(f)).map(|(_, f)| f)
+}
+
+/// Whether `c` has to come from another font than Roboto (`main`).
+pub fn needs_fallback(main: &impl Font, c: char) -> bool {
+    !(main.glyph_id(c).0 != 0 || (c as u32) < 0x2000 && !((c as u32) >= 0x0590 && (c as u32) < 0x1100))
+}
+
 /// The font that draws `c`: Roboto (`main`), else the first system font that has it.
 fn font_for<'a>(main: &'a FontVec, c: char) -> &'a FontVec {
-    if main.glyph_id(c).0 != 0 || (c as u32) < 0x2000 && !((c as u32) >= 0x0590 && (c as u32) < 0x1100) {
+    if !needs_fallback(main, c) {
         return main;
     }
-    fallback_fonts().iter().find(|f| f.glyph_id(c).0 != 0).unwrap_or(main)
+    fallback_font(c).unwrap_or(main)
 }
 
 impl Default for Fonts {
@@ -331,6 +362,15 @@ mod fallback_tests {
 #[cfg(test)]
 mod glyph_tests {
     use super::*;
+    #[test]
+    fn portuguese_letters_are_present_in_roboto() {
+        let f = ab_glyph::FontRef::try_from_slice(ROBOTO).unwrap();
+        // PT-BR + PT-PT: acute, grave, circumflex, tilde and cedilla, both cases.
+        for c in "áàâãéêíóôõúçÁÀÂÃÉÊÍÓÔÕÚÇ".chars() {
+            assert_ne!(f.glyph_id(c).0, 0, "missing Portuguese glyph {c}");
+        }
+    }
+
     #[test]
     fn missing_symbols_are_substituted() {
         let f = ab_glyph::FontRef::try_from_slice(ROBOTO).unwrap();

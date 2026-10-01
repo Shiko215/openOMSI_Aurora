@@ -14,7 +14,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// Raised when what is cached changes shape.
+/// Increment when the cached catalog format or the logic that derives it changes.
 const INDEX_VERSION: u32 = 2;
 
 /// Modification time of `p`; a path inside an archive used in place has the archive's.
@@ -89,8 +89,6 @@ struct Entry {
 #[derive(Serialize, Deserialize, Default)]
 struct Store {
     version: u32,
-    /// The launcher build that wrote it (its binary's time): a new build reads afresh.
-    exe: u64,
     entries: HashMap<String, Entry>,
     #[serde(skip)]
     dirty: bool,
@@ -104,19 +102,14 @@ fn store_path() -> PathBuf {
     crate::data_dir().join("cache").join("content-index.json")
 }
 
-fn exe_stamp() -> u64 {
-    std::env::current_exe().map(|p| mtime_ns(&p)).unwrap_or(0)
-}
-
 fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> R {
     let mut guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
     let s = guard.get_or_insert_with(Store::default);
     if !s.loaded {
-        let exe = exe_stamp();
         let disk: Option<Store> = std::fs::read(store_path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
         *s = match disk {
-            Some(d) if d.version == INDEX_VERSION && d.exe == exe => d,
-            _ => Store { version: INDEX_VERSION, exe, ..Default::default() },
+            Some(d) if d.version == INDEX_VERSION => d,
+            _ => Store { version: INDEX_VERSION, ..Default::default() },
         };
         s.loaded = true;
     }

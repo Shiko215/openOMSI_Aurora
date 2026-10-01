@@ -37,6 +37,26 @@ pub const BUMP: f32 = 0.24;
 const UNSPRUNG: f32 = 0.12;
 const TYRE_K: f32 = 900_000.0;
 const TYRE_C: f32 = 3_000.0;
+/// The frame OMSI's per-frame damping of the body's pitch and roll is measured in (see
+/// `RigidBus::step`): a thirtieth of a second, the rate its options.cfg caps OMSI at.
+const OMSI_FRAME: f32 = 1.0 / 30.0;
+
+/// The suspension as Omsi.exe has it (see `step_slice`); `OMSI_TYRE_SUSPENSION=1` gives
+/// the old one with a wheel mass, a tyre and bump stops (A/B).
+fn omsi_suspension() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| omsi_cfg::env::var_os("OMSI_TYRE_SUSPENSION").is_none())
+}
+
+/// What is left of the body's pitch and roll rate after `dt` seconds of OMSI's damping.
+fn body_damping(body_freq: f32, dt: f32) -> f32 {
+    let x0 = 1.5 * body_freq * OMSI_FRAME;
+    if x0 <= 1e-6 || dt <= 0.0 {
+        return 1.0;
+    }
+    (x0.sin() / x0).clamp(0.1, 1.0).powf(dt / OMSI_FRAME)
+}
+
 /// OMSI has no tyre between the road and the spring: `achse_feder` alone carries the body
 /// (Omsi.exe 0x7e4960..0x7e4c40, force = feder x penetration - daempfer x speed). The
 /// tyre here is at least this many times as stiff as the spring, so that the two in series
@@ -402,6 +422,11 @@ pub struct RigidBody {
     /// move towards the nearest side pushed it back in). `None` until the first collision
     /// check after `place`.
     pub spawned_inside: Option<Vec<i64>>,
+    /// The faces a wheel cannot climb stop it (a platform's edge, a kerb too high for it).
+    /// Off with the collisions with objects: the wheels then keep to the ground under them,
+    /// as OMSI's do - its wheels know no faces - and a step nobody sees (a height profile
+    /// over the drawn road, a helper object's collision box) is no invisible wall.
+    pub wheel_walls: bool,
 }
 
 impl RigidBody {
@@ -411,7 +436,13 @@ impl RigidBody {
         let mass = if def.mass < 100.0 { def.mass * 1000.0 } else { def.mass }.max(500.0);
         let moi = def.moment_of_inertia;
         let scale = if moi[0] < 5000.0 { 1000.0 } else { 1.0 };
-        let inertia = Vec3::new((moi[0] * scale).max(100.0), (moi[1] * scale).max(100.0), (moi[2] * scale).max(100.0));
+        // `[momentofintertia]` goes to ODE as I11, I22, I33 of Omsi.exe's y-up body frame
+        // (0x7af0a4): about the lateral axis (pitch), the vertical one (yaw) and the
+        // longitudinal one (roll) - roll takes the third value (0x7e4ef3), yaw the second
+        // (0x7e5110), whatever the SDK's comment says. Here (right, forward, up): pitch,
+        // roll, yaw. Read in the comment's order the SD202 rolled on 80 t m² instead of
+        // 300, twice as fast, and every uneven patch rocked it like a boat.
+        let inertia = Vec3::new((moi[0] * scale).max(100.0), (moi[2] * scale).max(100.0), (moi[1] * scale).max(100.0));
         let cog_xy = def.cog.map(|c| (c[0], c[1])).unwrap_or((0.0, 0.0));
         let cog_z = if def.cog_height > 0.0 { def.cog_height } else { def.cog.map(|c| c[2]).filter(|z| *z > 0.0).unwrap_or(1.0) };
         let cog = Vec3::new(cog_xy.0, cog_xy.1, cog_z);
@@ -447,7 +478,7 @@ impl RigidBody {
         let inv_min_turn_radius = if def.inv_min_turn_radius > 0.0 { def.inv_min_turn_radius } else { max_steer_deg.to_radians().tan() / s };
         let springs: f32 = def.axles.iter().map(|a| 2.0 * if a.spring > 0.0 { a.spring } else { 150.0 }).sum();
         let body_freq = (springs / (mass / 1000.0)).max(0.0).sqrt();
-        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None }
+        RigidBody { mass, inertia, cog, position: DVec3::ZERO, orientation: Quat::IDENTITY, velocity: Vec3::ZERO, omega: Vec3::ZERO, wheels, wheel_axle, steer_deg: 0.0, max_steer_deg, rot_pnt_long: def.rot_pnt_long, inv_min_turn_radius, body_freq, holding: true, rolling_resistance: if def.rolling_resistance > 0.0 { def.rolling_resistance } else { 0.008 * mass * 9.81 }, accel_body: Vec3::ZERO, friction: 0.85, wheel_impacts: Vec::new(), coupled: Vec::new(), spawned_inside: None, wheel_walls: true }
     }
 
     /// Place the body at rest with its wheels on the ground plane at `origin.z`: heading
@@ -560,13 +591,14 @@ impl RigidBody {
         for _ in 0..slices {
             self.step_slice(dt / slices as f32, drive_torque, brake, steer, probe);
             // OMSI damps the body's pitch and roll - never its yaw - by sin(x)/x each frame,
-            // x = 1.5 x sqrt(springs / mass) x frame (Omsi.exe 0x7e4f55..0x7e50b0)
-            let x = 1.5 * self.body_freq * dt / slices as f32;
-            if x > 1e-6 {
-                let k = (x.sin() / x).clamp(0.1, 1.0);
-                self.omega.x *= k;
-                self.omega.y *= k;
-            }
+            // x = 1.5 x sqrt(springs / mass) x frame (Omsi.exe 0x7e4f55..0x7e50b0). Its
+            // frames are OMSI's (its options.cfg caps them at 30 a second): taken per frame
+            // of this game, a machine drawing 150 frames a second damped the body a fifth as
+            // much, and the bus rocked on its springs like a boat. The same damping a second
+            // as OMSI's at 30 frames, however many are drawn:
+            let k = body_damping(self.body_freq, dt / slices as f32);
+            self.omega.x *= k;
+            self.omega.y *= k;
             // (one impact per obstacle a frame, as a single slice gives)
             for m in self.wheel_impacts.drain(..) {
                 match impacts.iter_mut().find(|x: &&mut Impact| x.obstacle == m.obstacle) {
@@ -660,7 +692,7 @@ impl RigidBody {
                 };
                 // across the tread: a kerb under part of it (see `tread_step`)
                 let ground = ground.map(|(need, slope, x)| (need + tread_step(probe, hub, fwd_h, r, z_top), slope, x));
-                let walls = track_walls(probe, &w.walls, &line, hub, fwd_h, r, z_top, wall_top, look.y);
+                let walls = if self.wheel_walls { track_walls(probe, &w.walls, &line, hub, fwd_h, r, z_top, wall_top, look.y) } else { Vec::new() };
                 found.push(ground);
                 let w = &mut self.wheels[i];
                 w.walls = walls;
@@ -724,69 +756,120 @@ impl RigidBody {
                 // the wheel's own mass moves between the two. The tyre carries the static
                 // load already where it just touches, so that the ride height stays the
                 // springs' alone (see the module's notes).
-                let m_w = (w.rest_load / 9.81 * UNSPRUNG).max(40.0);
-                let k = w.spring * w.spring_factor.max(0.05);
-                // How far the ground under the tyre can rise within a substep: a tyre rolls up
-                // a step along its envelope, never steeper than 2.4 (see CLIMB). A reading
-                // that leaps higher (a kerb's edge or a surface object's rim caught for one
-                // substep: +25 cm under the Urbino's front wheel at a Spandau kerb) is
-                // climbed at that pace - taken at once it struck the wheel with 260 kN and
-                // threw it into its arch.
-                let v_along = (self.velocity + omega_world.cross((hub - self.position).as_vec3())).dot(fwd_h).abs();
-                let max_rise = (v_along.max(0.5) * 2.4 + 0.3) * h;
-                let need = found[i].map(|(need, _, _)| if w.ground_seen { need.min(w.ground_z + r as f64 + max_rise as f64) } else { need });
-                let touch = need.map(|need| ((need - hub0.z) / up.z.max(0.3) as f64) as f32);
-                if let Some(need) = need {
-                    w.ground_z = need - r as f64;
-                    w.ground_seen = true;
-                }
-                let (tyre_f, tyre_static) = match touch {
-                    // (a wheel that cannot reach the ground at full droop hangs in the air)
-                    Some(t) if t >= -DROOP - 0.05 => {
-                        let pen = t - w.compression;
-                        let closing = w.touch.map(|p| ((t - p) / h).clamp(-3.0, 3.0)).unwrap_or(0.0) - w.compression_rate;
-                        let s = w.tyre_k * pen + w.rest_load;
-                        if s > 0.0 {
-                            ((s + w.tyre_c * closing).clamp(0.0, w.max_force * 3.0), s)
-                        } else {
-                            (0.0, 0.0)
+                let (tyre_f, tyre_static, n) = if omsi_suspension() {
+                    // Omsi.exe's suspension (0x7e47aa..0x7e4de8): the body hangs straight on
+                    // the ground point under each wheel. The spring pushes by how far the
+                    // ground lies over the wheel's unloaded place, times `Axle_Springfactor`
+                    // and `achse_feder`; below it the wheel is in the air, pushes nothing and
+                    // the tyres stop holding (0x7e4b13). Pressed, the damper takes
+                    // `achse_daempfer` times the body's upward speed where the strut acts
+                    // (the roll rate at `achse_maxwidth` / 2, 0x7e4899), and the whole never
+                    // passes `achse_maxforce` (0x7e4b71) - there is no wheel of its own mass,
+                    // no tyre and no bump stop between the road and the body. (Those, with a
+                    // tyre envelope smoothing the road, had the bus float over what it drove
+                    // on: "like a boat on the sea".)
+                    let k = w.spring * w.spring_factor.max(0.0);
+                    let top = hub0.z + (CLIMB * r) as f64;
+                    // (nothing under it: Omsi.exe's ground query looks from 3 m over the model
+                    // origin's plane, 0x7a0985 - a wheel that sank through a face at a joint of
+                    // two surfaces, or into a bridge deck, found nothing within reach, the
+                    // spring let go and the bus fell through the world)
+                    // The spring's point is where Omsi.exe puts it (0x7e47aa): on the model's
+                    // origin plane (z = 0) under the wheel, and its height over the ground is
+                    // measured straight up. Measured from the hub less the `.bus` file's tyre
+                    // radius instead, a mod whose tyre mesh is larger than that radius stood
+                    // with its wheels drawn sunk a few centimetres into the road.
+                    let plane0 = position + rot.mul_vec3(Vec3::new(w.attach.x, w.attach.y, 0.0) - cog).as_dvec3();
+                    let under = probe(plane0.x, plane0.y, top).below.or_else(|| probe(plane0.x, plane0.y, plane0.z + 3.0).below);
+                    let t = under.map(|g| (g - plane0.z) as f32);
+                    if let Some(g) = under {
+                        w.ground_z = g;
+                        w.ground_seen = true;
+                    }
+                    let r_out = rot.mul_vec3(w.attach - self.cog + Vec3::new(w.lever, 0.0, 0.0));
+                    let v_up = (self.velocity + omega_world.cross(r_out)).dot(up);
+                    let mut n = 0.0f32;
+                    if let Some(t) = t {
+                        let spring = k * t;
+                        if spring >= 0.0 {
+                            n = (spring - w.damper * v_up).min(w.max_force);
                         }
                     }
-                    _ => (0.0, 0.0),
+                    let travel = t.unwrap_or(-DROOP);
+                    let full = if k > 1.0 { w.max_force / k } else { BUMP };
+                    w.compression_rate = if w.touch.is_some() { (travel.clamp(-DROOP, full) - w.compression) / h } else { 0.0 };
+                    w.compression = travel.clamp(-DROOP, full);
+                    w.touch = t;
+                    let on = t.is_some_and(|t| k * t >= 0.0);
+                    w.on_ground = on;
+                    w.load = n.max(0.0);
+                    (if on { n.max(0.0) } else { 0.0 }, if on { n.max(0.0) } else { 0.0 }, n)
+                } else {
+                    let m_w = (w.rest_load / 9.81 * UNSPRUNG).max(40.0);
+                    let k = w.spring * w.spring_factor.max(0.05);
+                    // How far the ground under the tyre can rise within a substep: a tyre rolls up
+                    // a step along its envelope, never steeper than 2.4 (see CLIMB). A reading
+                    // that leaps higher (a kerb's edge or a surface object's rim caught for one
+                    // substep: +25 cm under the Urbino's front wheel at a Spandau kerb) is
+                    // climbed at that pace - taken at once it struck the wheel with 260 kN and
+                    // threw it into its arch.
+                    let v_along = (self.velocity + omega_world.cross((hub - self.position).as_vec3())).dot(fwd_h).abs();
+                    let max_rise = (v_along.max(0.5) * 2.4 + 0.3) * h;
+                    let need = found[i].map(|(need, _, _)| if w.ground_seen { need.min(w.ground_z + r as f64 + max_rise as f64) } else { need });
+                    let touch = need.map(|need| ((need - hub0.z) / up.z.max(0.3) as f64) as f32);
+                    if let Some(need) = need {
+                        w.ground_z = need - r as f64;
+                        w.ground_seen = true;
+                    }
+                    let (tyre_f, tyre_static) = match touch {
+                        // (a wheel that cannot reach the ground at full droop hangs in the air)
+                        Some(t) if t >= -DROOP - 0.05 => {
+                            let pen = t - w.compression;
+                            let closing = w.touch.map(|p| ((t - p) / h).clamp(-3.0, 3.0)).unwrap_or(0.0) - w.compression_rate;
+                            let s = w.tyre_k * pen + w.rest_load;
+                            if s > 0.0 {
+                                ((s + w.tyre_c * closing).clamp(0.0, w.max_force * 3.0), s)
+                            } else {
+                                (0.0, 0.0)
+                            }
+                        }
+                        _ => (0.0, 0.0),
+                    };
+                    w.touch = touch;
+                    // the strut: spring, a digressive damper (a kerb struck at speed must not fire
+                    // the body into the air) and the bump stop, a stiff rubber block; as a whole it
+                    // takes no more than three times the load it is built for (`achse_maxforce`)
+                    // (the spring only pushes: below its unloaded length the wheel hangs on the
+                    // damper, which also works on the rebound)
+                    // (OMSI: spring and damper together never pass more than `achse_maxforce`;
+                    // beyond it the bump stop, a rubber block of its own, takes over)
+                    let c = w.compression;
+                    let rate_c = w.compression_rate.clamp(-1.5, 1.5);
+                    let bump = if c > BUMP { (w.spring * 10.0 * (c - BUMP)).min(w.max_force * 2.0) } else { 0.0 };
+                    let n = (k * c.max(0.0) + w.damper * rate_c).clamp(-w.max_force * 0.5, w.max_force) + bump;
+                    // the wheel moves against the body, which is itself accelerated by what holds
+                    // it up (`accel_body.z`, 9.81 m/s² standing, 0 in the air: a wheel off a kerb
+                    // drops, a wheel of a body in the air does not) - semi-implicit Euler, stable
+                    // with the stiff tyre at these steps
+                    w.compression_rate += ((tyre_f - n) / m_w - self.accel_body.z) * h;
+                    w.compression += w.compression_rate * h;
+                    if w.compression < -DROOP {
+                        w.compression = -DROOP;
+                        w.compression_rate = w.compression_rate.max(0.0);
+                    } else if w.compression > BUMP + 0.08 {
+                        w.compression = BUMP + 0.08;
+                        w.compression_rate = w.compression_rate.min(0.0);
+                    }
+                    w.on_ground = tyre_f > 0.0;
+                    w.load = tyre_f;
+                    (tyre_f, tyre_static, n)
                 };
-                w.touch = touch;
-                // the strut: spring, a digressive damper (a kerb struck at speed must not fire
-                // the body into the air) and the bump stop, a stiff rubber block; as a whole it
-                // takes no more than three times the load it is built for (`achse_maxforce`)
-                // (the spring only pushes: below its unloaded length the wheel hangs on the
-                // damper, which also works on the rebound)
-                // (OMSI: spring and damper together never pass more than `achse_maxforce`;
-                // beyond it the bump stop, a rubber block of its own, takes over)
-                let c = w.compression;
-                let rate_c = w.compression_rate.clamp(-1.5, 1.5);
-                let bump = if c > BUMP { (w.spring * 10.0 * (c - BUMP)).min(w.max_force * 2.0) } else { 0.0 };
-                let n = (k * c.max(0.0) + w.damper * rate_c).clamp(-w.max_force * 0.5, w.max_force) + bump;
-                // the wheel moves against the body, which is itself accelerated by what holds
-                // it up (`accel_body.z`, 9.81 m/s² standing, 0 in the air: a wheel off a kerb
-                // drops, a wheel of a body in the air does not) - semi-implicit Euler, stable
-                // with the stiff tyre at these steps
-                w.compression_rate += ((tyre_f - n) / m_w - self.accel_body.z) * h;
-                w.compression += w.compression_rate * h;
-                if w.compression < -DROOP {
-                    w.compression = -DROOP;
-                    w.compression_rate = w.compression_rate.max(0.0);
-                } else if w.compression > BUMP + 0.08 {
-                    w.compression = BUMP + 0.08;
-                    w.compression_rate = w.compression_rate.min(0.0);
-                }
-                w.on_ground = tyre_f > 0.0;
-                w.load = tyre_f;
                 // the strut's force turns the body about its length from the outer width, not
                 // from where the tyre stands (see `RigidWheel::lever`): body x cross body z
                 torque += Vec3::new(0.0, -w.lever * n, 0.0);
                 // and OMSI's damper reads the body's speed out there too (0x7e4899: roll rate
                 // x maxwidth / 2): the part of it the hub does not see, while the tyre carries
-                if tyre_f > 0.0 {
+                if tyre_f > 0.0 && !omsi_suspension() {
                     torque.y -= (w.attach.x + w.lever) * w.damper * self.omega.y * w.lever;
                 }
                 let Some((_, slope, contact_dx)) = found[i].filter(|_| tyre_f > 0.0) else {
@@ -893,6 +976,8 @@ impl RigidBody {
                 standing.iter().map(|&k| if total > 1e-3 { (need * cap(&contacts[k]) / total).clamp(-cap(&contacts[k]), cap(&contacts[k])) } else { 0.0 }).collect()
             };
             let hold_long = hold(body_fwd, self.mass + towed, &|c| c.brake);
+            // (the tyres' pull along the body, for the pitch lever below)
+            let mut long_sum = 0.0f32;
             for (k, c) in contacts.iter().enumerate() {
                 let mut f_long = match standing.iter().position(|&j| j == k) {
                     Some(si) => c.drive + hold_long[si],
@@ -901,11 +986,20 @@ impl RigidBody {
                 let max_f = self.friction * c.grip;
                 f_long = f_long.clamp(-max_f, max_f);
                 let f_world = c.base + c.fwd * f_long;
+                long_sum += f_long * c.fwd.dot(body_fwd);
                 if let Some(i) = c.wheel {
                     self.wheels[i].advance_spin(c, f_long, self.friction, h);
                 }
                 force += f_world;
                 torque += rot.inverse().mul_vec3(c.r).cross(rot.inverse().mul_vec3(f_world));
+            }
+            // Driving and braking pitch the body about a lever longer than the centre of
+            // gravity's height over the road: Omsi.exe takes the tyres' forces at the hubs,
+            // their radius more (0x7e46a5: (drive - brake) x d/2 besides [schwerpunkt] x
+            // the pull), and not while the bus stands with its brakes holding (0x7e4660).
+            if self.velocity.dot(body_fwd).abs() > 0.2 {
+                let r = self.wheels.iter().map(|w| w.radius).sum::<f32>() / self.wheels.len().max(1) as f32;
+                torque.x += long_sum * r;
             }
             // Across the tyre: OMSI has no slip angle. Each axle takes away the sideways
             // speed it has - the bus follows its wheels exactly - with no more force than
@@ -922,11 +1016,20 @@ impl RigidBody {
                 let mut v = self.velocity + ((force - body_fwd * along) / m + body_fwd * (along / mt)) * h;
                 let mut w = self.omega + (torque - self.omega.cross(self.inertia * self.omega)) / self.inertia * h;
                 let lat: Vec<usize> = (0..contacts.len()).filter(|&k| contacts[k].lateral && contacts[k].grip > 0.0).collect();
+                // (following its wheels: hardly any speed across the body)
+                let gripped = self.velocity.dot(rot.mul_vec3(Vec3::X)).abs() < 0.5 && self.velocity.dot(body_fwd).abs() > 1.0;
                 let arms: Vec<(Vec3, f32)> = lat
                     .iter()
                     .map(|&k| {
                         let c = &contacts[k];
-                        let rn = rot.inverse().mul_vec3(c.r).cross(rot.inverse().mul_vec3(c.right));
+                        let mut rn = rot.inverse().mul_vec3(c.r).cross(rot.inverse().mul_vec3(c.right));
+                        // (holding, no roll from the tyres' hold across: Omsi.exe then sets the
+                        // sideways motion outright and rolls the body by the bend's pull alone,
+                        // below - taken at the ground, every turn of the wheel kicked the body
+                        // over; sliding, the tyres trip it as before)
+                        if self.holding && gripped {
+                            rn.y = 0.0;
+                        }
                         let inv = c.right.dot(lin(c.right)) + (rn / self.inertia).dot(rn);
                         (rn, inv.max(1e-9))
                     })
@@ -937,7 +1040,9 @@ impl RigidBody {
                 let v_fwd = self.velocity.dot(body_fwd);
                 let kappa = (self.steer_deg.to_radians().tan() / (self.wheels.iter().map(|w| w.attach.y).fold(f32::MIN, f32::max) - self.rot_pnt_long).abs().max(0.5)).abs();
                 let slipping = self.wheels.iter().any(|w| w.slipping && w.on_ground);
-                if self.holding && (m * v_fwd * v_fwd * kappa > grip_all || slipping) {
+                // (and a wheel in the air: Omsi.exe drops the holding state there, 0x7e4b13)
+                let airborne = omsi_suspension() && self.wheels.iter().any(|w| !w.on_ground);
+                if self.holding && (m * v_fwd * v_fwd * kappa > grip_all || slipping || airborne) {
                     self.holding = false;
                 }
                 // (holding, a tyre may pass several times its grip for the moment it takes
@@ -962,6 +1067,11 @@ impl RigidBody {
                 }
                 if !self.holding && !slipping && lat.iter().all(|&k| (v + rot.mul_vec3(w).cross(contacts[k].r)).dot(contacts[k].right).abs() < 0.1) {
                     self.holding = true;
+                }
+                // the bend's pull rolls the body out of it (0x7e4629: [schwerpunkt] x mass x
+                // the centripetal acceleration)
+                if self.holding && gripped && !lat.is_empty() {
+                    torque.y += m * self.cog.z * v_fwd * self.omega.z;
                 }
             }
             // integrate
@@ -1396,6 +1506,17 @@ fn find_face(is_wall: &dyn Fn(DVec2) -> bool, hub2: DVec2, dir: Vec2, d: f32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The body's pitch and roll are damped as much a second at any frame rate: as OMSI
+    /// damps them at 30 frames a second (a 12 t bus on 240-280 kN/m springs).
+    #[test]
+    fn body_damping_does_not_depend_on_the_frame_rate() {
+        let f = ((2.0 * 240.0 + 2.0 * 280.0) / 12.0f32).sqrt();
+        let second = |fps: f32| (0..fps as usize).fold(1.0f32, |k, _| k * super::body_damping(f, 1.0 / fps));
+        let (a, b, c) = (second(30.0), second(60.0), second(144.0));
+        assert!((a - b).abs() < 1e-3 && (a - c).abs() < 1e-3, "{a} {b} {c}");
+        assert!(a > 0.2 && a < 0.5, "{a}");
+    }
     use omsi_vehicle::vehicle::Axle;
 
     fn bus() -> Vehicle {
@@ -1518,7 +1639,9 @@ mod tests {
         }
         assert!(rb.origin().y > 30.0, "{:?}", rb.origin());
         assert!(lift < 0.05, "the body lifted {lift:.3} m");
-        assert!(jump < 0.06, "a wheel's travel jumped {jump:.3} m in a frame");
+        // (Omsi.exe's wheel stands on the point under it: at the hump's edge its travel
+        // takes the hump's height at once, no more)
+        assert!(jump < 0.065, "a wheel's travel jumped {jump:.3} m in a frame");
         assert!(air < 16, "wheels off the road for {air} wheel-frames");
     }
 
@@ -1769,8 +1892,9 @@ mod tests {
             run(&mut rb, 1.0, 0.0, 30_000.0, &probe);
             count.set(0);
             rb.step(1.0 / 60.0, 0.0, &[30_000.0; 4], 0.0, &probe);
-            // (and three across the tread, `tread_step`)
-            assert!(count.get() <= 4 * rb.wheels.len() * (LATTICE + 5), "{s}: {} probes", count.get());
+            // (and three across the tread, `tread_step`, and the point under the wheel
+            // Omsi.exe's suspension stands on)
+            assert!(count.get() <= 4 * rb.wheels.len() * (LATTICE + 6), "{s}: {} probes", count.get());
         }
     }
 
@@ -1847,7 +1971,9 @@ mod tests {
                 assert!(crash > 0.5 * kinetic && crash < 1.05 * kinetic, "{kmh} km/h at {fps} fps: crash of {crash} J for {kinetic} J");
                 assert!(front < 6.0 - 0.47 + 0.03, "{kmh} km/h at {fps} fps: front axle reached {front}");
                 assert!(top < 0.3, "{kmh} km/h at {fps} fps: thrown up to {top}");
-                assert!(rb.forward_speed().abs() < 1.0, "{kmh} km/h at {fps} fps: still at {}", rb.forward_speed());
+                // (a rebound of a metre or so: with the moments of inertia on Omsi.exe's axes
+                // the body's lower yaw inertia takes a little more of the blow back)
+                assert!(rb.forward_speed().abs() < 1.5, "{kmh} km/h at {fps} fps: still at {}", rb.forward_speed());
             }
         }
     }

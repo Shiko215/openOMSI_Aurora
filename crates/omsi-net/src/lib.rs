@@ -80,6 +80,7 @@ pub mod wire;
 pub mod world;
 pub mod ws;
 pub mod tunnel;
+pub mod official;
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -98,7 +99,9 @@ pub use wire::{
 /// 5: the tour a player drives in `INFO` (the host's timetable leaves it out), riders of
 /// the players' buses in the world frames (`world::PLAYER_BUS`), and the players' people
 /// passed on to the other players.
-pub const PROTOCOL: u32 = 5;
+/// 6: up to 63 sound and moving-part values in a state (a 6-bit count: the AA-FR Agora's
+/// sound variables alone filled the 31 there was room for).
+pub const PROTOCOL: u32 = 6;
 pub const DEFAULT_PORT: u16 = 27015;
 /// Ports a host tries after the default one when that is taken (a second session on the
 /// same machine).
@@ -121,6 +124,9 @@ pub const LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 pub const HEARTBEAT: f32 = 1.0;
 /// Seconds between two INFO messages of a player whose info has not changed.
 pub const INFO_EVERY: f32 = 2.0;
+/// The shortest time (s) between two `INFO`s: well inside what a host takes from a player
+/// (`MESSAGE_RATE`), with room for its other messages.
+pub const INFO_MIN_GAP: f32 = 0.25;
 /// Seconds between two CLOCK messages of the host.
 pub const CLOCK_EVERY: f32 = 5.0;
 /// At most this many other players: a host turns away the next one, a client ignores more.
@@ -321,8 +327,31 @@ impl SessionCode {
             }
             chars.push(ALPHABET[v] as char);
         }
+        // (the last group filled up to four with the zero character: a code of two
+        // addresses ended in a group of three, and players took it for cut short, #152)
+        while chars.len() % 4 != 0 {
+            chars.push(ALPHABET[0] as char);
+        }
         let groups: Vec<String> = chars.chunks(4).map(|c| c.iter().collect()).collect();
         format!("OMSI-{}", groups.join("-"))
+    }
+
+    /// A code's characters (after `OMSI-`) without the filling of its last group, or None
+    /// when it has no length a code has.
+    fn unpadded(s: &str) -> Option<&str> {
+        let lengths = Self::valid_lengths();
+        if lengths.contains(&s.len()) {
+            return Some(s);
+        }
+        lengths
+            .into_iter()
+            .find(|&l| l < s.len() && l.div_ceil(4) * 4 == s.len() && s.as_bytes()[l..].iter().all(|c| *c == ALPHABET[0]))
+            .map(|l| &s[..l])
+    }
+
+    /// The lengths a code is written with (its last group filled to four).
+    fn written_lengths() -> Vec<usize> {
+        Self::valid_lengths().into_iter().map(|l| l.div_ceil(4) * 4).collect()
     }
 
     /// The code lengths (characters after `OMSI-`) that exist: one address, or two to
@@ -341,12 +370,14 @@ impl SessionCode {
             .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
             .collect::<String>()
             .to_ascii_uppercase();
-        let lengths = Self::valid_lengths();
+        let lengths = Self::written_lengths();
         // (O and I are not in the alphabet: a code itself never starts with OMSI)
         if s.starts_with("OMSI") {
             s = s[4..].to_string();
         }
-        if !lengths.contains(&s.len()) {
+        if let Some(u) = Self::unpadded(&s) {
+            s = u.to_string();
+        } else {
             let n = s.len();
             return Err(format!(
                 "a session code has {} characters after OMSI- (this one has {n}) - copy the whole code",
@@ -452,10 +483,8 @@ pub fn looks_like_code(text: &str) -> bool {
     }
     // the full code, the code without its prefix, or something that was meant to be one
     // (the prefix and a few groups: a code cut short while copying)
-    let lengths = SessionCode::valid_lengths();
-    lengths.contains(&s.len())
-        || (s.starts_with("OMSI")
-            && (lengths.contains(&(s.len() - 4)) || (t.starts_with("OMSI-") && s.len() >= 8)))
+    let ok = |s: &str| SessionCode::unpadded(s).is_some();
+    ok(&s) || (s.starts_with("OMSI") && (ok(&s[4..]) || (t.starts_with("OMSI-") && s.len() >= 8)))
 }
 
 /// A session id as it is written in messages (12 hex digits).
@@ -814,6 +843,10 @@ pub struct Pose {
     /// model's order), so another player's bus shows the same destination and line signs
     /// rather than what its depot file makes of the line and terminus names.
     pub texts: Vec<String>,
+    /// What the vehicle's `[matl_freetex]` string variables hold (in the order of their
+    /// names, see the game's `lan.rs`): the picture a roller blind or a sign shows, which the
+    /// others' copy of the bus cannot work out, its scripts not running there.
+    pub freetex: Vec<String>,
     /// The player's own figure (`.hum` relative to its content root), for the driver at the
     /// wheel and the walker the others draw (empty: they pick one of the map's drivers).
     pub figure: String,
@@ -919,7 +952,11 @@ impl Pose {
         // paths and a destination in another alphabet made an INFO too long to be taken in:
         // the others never learnt which bus the player drove)
         let room = MAX_DATAGRAM.saturating_sub(head.len() + figure.len() + 1);
-        format!("{head}{}|{figure}", encode_texts(&self.texts, room))
+        let info = format!("{head}{}|{figure}", encode_texts(&self.texts, MAX_TEXTS, MAX_TEXT_LEN, room));
+        // the `[matl_freetex]` pictures last, in what room is left (an older game reads the
+        // fields it knows and passes this one by)
+        let room = MAX_DATAGRAM.saturating_sub(info.len() + 1);
+        format!("{info}|{}", encode_texts(&self.freetex, MAX_FREETEX, MAX_FREETEX_LEN, room))
     }
 
     /// The info fields of an `INFO` message (checked and cleaned), or None.
@@ -946,8 +983,9 @@ impl Pose {
             box_offset: num(9, -40.0, 40.0)?,
             table: u32::from_str_radix(parts[10].trim(), 16).ok()?,
             tour: parts.get(11).map(|t| clean_text(t, MAX_FIELD)).unwrap_or_default(),
-            texts: parts.get(12).map(|t| decode_texts(t)).unwrap_or_default(),
+            texts: parts.get(12).map(|t| decode_texts(t, MAX_TEXTS, MAX_TEXT_LEN)).unwrap_or_default(),
             figure: parts.get(13).and_then(|f| human_path(f)).unwrap_or_default(),
+            freetex: parts.get(14).map(|t| decode_texts(t, MAX_FREETEX, MAX_FREETEX_LEN)).unwrap_or_default(),
             ..Default::default()
         })
     }
@@ -961,6 +999,7 @@ impl Pose {
         self.destination = info.destination.clone();
         self.tour = info.tour.clone();
         self.texts = info.texts.clone();
+        self.freetex = info.freetex.clone();
         self.figure = info.figure.clone();
         self.length = info.length;
         self.width = info.width;
@@ -980,6 +1019,7 @@ impl Pose {
             destination: keep.destination,
             tour: keep.tour,
             texts: keep.texts,
+            freetex: keep.freetex,
             figure: keep.figure,
             length: keep.length,
             width: keep.width,
@@ -1026,15 +1066,19 @@ fn finite_or(v: f32, or: f32) -> f32 {
 /// Display texts at most (and characters each) an `INFO` carries.
 pub const MAX_TEXTS: usize = 12;
 const MAX_TEXT_LEN: usize = 32;
+/// `[matl_freetex]` strings at most (and characters each): paths to a picture, longer than
+/// a display's text (`..\..\Anzeigen\Rollband_FC\<depot>\17.tga`).
+pub const MAX_FREETEX: usize = 8;
+const MAX_FREETEX_LEN: usize = 128;
 
 /// Display texts as one `INFO` field: each as hex of its UTF-8, comma separated (a text may
 /// hold anything, the field no `|`).
-fn encode_texts(texts: &[String], room: usize) -> String {
+fn encode_texts(texts: &[String], max: usize, max_len: usize, room: usize) -> String {
     texts
         .iter()
-        .take(MAX_TEXTS)
+        .take(max)
         .map(|t| {
-            let t: String = t.chars().filter(|c| !c.is_control()).take(MAX_TEXT_LEN).collect();
+            let t: String = t.chars().filter(|c| !c.is_control()).take(max_len).collect();
             t.bytes().map(|b| format!("{b:02x}")).collect::<String>()
         })
         .scan(0usize, |used, h| {
@@ -1046,16 +1090,16 @@ fn encode_texts(texts: &[String], room: usize) -> String {
         .join(",")
 }
 
-fn decode_texts(field: &str) -> Vec<String> {
+fn decode_texts(field: &str, max: usize, max_len: usize) -> Vec<String> {
     if field.trim().is_empty() {
         return Vec::new();
     }
     field
         .split(',')
-        .take(MAX_TEXTS)
+        .take(max)
         .map(|h| {
             let bytes: Vec<u8> = (0..h.len() / 2).filter_map(|i| u8::from_str_radix(h.get(2 * i..2 * i + 2)?, 16).ok()).collect();
-            String::from_utf8_lossy(&bytes).chars().filter(|c| !c.is_control()).take(MAX_TEXT_LEN).collect()
+            String::from_utf8_lossy(&bytes).chars().filter(|c| !c.is_control()).take(max_len).collect()
         })
         .collect()
 }
@@ -1357,6 +1401,12 @@ pub struct LanSession {
     descs_up: Vec<(u32, world::Desc)>,
     /// When the session began (the host's world clock counts from it).
     started: Instant,
+    /// The clock the states and world frames are stamped with (ms since `started`): on
+    /// by each frame's time step and kept near the clock on the wall. Stamped as they left,
+    /// a state carried the moment of sending, some milliseconds after the moment of the
+    /// frame it shows, more or less as the frame took long or not - the others drew the
+    /// bus between states a little too far apart or too close, on and on: the jitter.
+    frame_ms: Option<f64>,
     /// Bytes of world datagrams and descriptions sent / received so far.
     world_sent: Cell<u64>,
     pub world_received: u64,
@@ -1448,6 +1498,7 @@ impl LanSession {
             world_up: Vec::new(),
             descs_up: Vec::new(),
             started: now,
+            frame_ms: None,
             world_sent: Cell::new(0),
             world_received: 0,
             bridge: None,
@@ -1871,6 +1922,11 @@ impl LanSession {
         self.started.elapsed().as_millis() as u32
     }
 
+    /// The moment of this frame on our clock (ms), for stamping what is sent of it.
+    pub fn stamp_ms(&self) -> u32 {
+        self.frame_ms.map(|m| m.max(0.0) as u32).unwrap_or_else(|| self.world_ms())
+    }
+
     /// The address of player `id` (host).
     fn peer_addr(&self, id: u32) -> Option<SocketAddr> {
         self.peers.get(&id).and_then(|p| p.addr)
@@ -1884,7 +1940,7 @@ impl LanSession {
         self.world_seq = self.world_seq.wrapping_add(1);
         let mut f = frame.clone();
         f.seq = self.world_seq;
-        f.host_ms = self.world_ms();
+        f.host_ms = self.stamp_ms();
         let mut n = 0;
         for d in world::encode(&f, PROTOCOL as u8) {
             self.send(&d, to);
@@ -1912,7 +1968,7 @@ impl LanSession {
         self.world_seq = self.world_seq.wrapping_add(1);
         let f = world::WorldFrame {
             seq: self.world_seq,
-            host_ms: self.world_ms(),
+            host_ms: self.stamp_ms(),
             cars: Vec::new(),
             lights: Vec::new(),
             ..frame.clone()
@@ -2107,6 +2163,22 @@ impl LanSession {
     /// Returns the ids of players that left this frame.
     pub fn tick(&mut self, dt: f32, mine: &Pose) -> Vec<u32> {
         let mut gone = Vec::new();
+        let wall = self.started.elapsed().as_secs_f64() * 1000.0;
+        self.frame_ms = Some(match self.frame_ms {
+            Some(prev) => {
+                let c = prev + dt as f64 * 1000.0;
+                // (a frame longer than the step the game takes, or a pause: the wall again;
+                // ahead of it, it waits - it never goes back)
+                if wall - c > 250.0 {
+                    wall
+                } else if c - wall > 250.0 {
+                    prev
+                } else {
+                    (c + (wall - c) * 0.05).max(prev)
+                }
+            }
+            None => wall,
+        });
         if let Some(b) = self.bridge.as_mut() {
             b.tick(dt, &self.socket);
             // the host's addresses the rendezvous told (a client still trying)
@@ -2260,8 +2332,8 @@ impl LanSession {
             self.send_acc = (self.send_acc - interval).clamp(0.0, interval);
             self.last_state = body.to_vec();
             self.seq = self.seq.wrapping_add(1);
-            // stamped with our clock as it leaves (see `Pose::sent_ms`)
-            p.sent_ms = (self.started.elapsed().as_millis() as u32).max(1);
+            // stamped with the moment of the frame it shows (see `Pose::sent_ms`)
+            p.sent_ms = self.stamp_ms().max(1);
             let data = wire::encode_state(&p, PROTOCOL as u8, self.seq);
             match self.role {
                 Role::Host => self.broadcast(&data, None),
@@ -2273,7 +2345,10 @@ impl LanSession {
             }
         }
         let info = p.encode_info();
-        if info != self.last_info || self.info_acc >= INFO_EVERY {
+        // Sent when it changes, but no more often than INFO_MIN_GAP: a roller blind turning
+        // through its numbers or a pilot screen changes the `[matl_freetex]` pictures many
+        // times a second, and the host took ten messages a second and dropped the rest.
+        if (info != self.last_info && self.info_acc >= INFO_MIN_GAP) || self.info_acc >= INFO_EVERY {
             self.info_acc = 0.0;
             match self.role {
                 Role::Host => self.broadcast(info.as_bytes(), None),

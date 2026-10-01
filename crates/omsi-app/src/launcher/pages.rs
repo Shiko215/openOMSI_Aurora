@@ -4,7 +4,7 @@
 use super::state::{fmt_bytes, hhmm, short_map};
 use super::theme::*;
 use super::ui::{id_of, ButtonKind, Ui};
-use super::Launcher;
+use super::{Launcher, Page};
 use glam::Vec2;
 use omsi_launcher_lib as core;
 use omsi_ui::paint::Align;
@@ -25,6 +25,8 @@ pub struct PagesView {
     pub setup_game: Option<String>,
     /// The Controls page's tab: 0 the keyboard, 1 the game controllers.
     pub controls_tab: usize,
+    /// The Settings page's tab (see `SETTINGS_TABS`).
+    pub settings_tab: usize,
     pub pads: PadsView,
     pub tt: super::timetable::TimetableView,
 }
@@ -41,6 +43,8 @@ pub struct PadsView {
     pub selected: usize,
     /// Waiting for a button of the shown device to be pressed (to add its binding).
     pub capturing: bool,
+    /// A button found through "Add a button", kept visible even past the highlight.
+    pub revealed_button: Option<usize>,
     pub dirty: bool,
     /// The button last pressed on the shown device and when: its line is lit, so that one
     /// sees which it is and what it does, and can give it an action there.
@@ -264,43 +268,69 @@ fn toggle_setting(ui: &mut Ui, s: &mut Value, dirty: &mut f32, r: Rect, label: &
     }
 }
 
-/// The settings' columns are this tall at least (the page scrolls when the window is lower).
-const SETTINGS_H: f32 = 1080.0;
+/// The settings page's tabs: what one has come to change.
+pub const SETTINGS_TABS: [&str; 6] = ["Graphics", "Driving", "Camera", "Sound", "Gameplay", "General"];
 
-/// The settings page's "Updates" row: what the updater is doing, and whether "Check now"
-/// was pressed.
-struct UpdateRow {
-    status: crate::updater::Status,
-    check: bool,
+/// What the tabs show of the launcher and ask of it (they see only the settings): the
+/// updater's state, "Check now", "Reset all settings", the Controls page at one of its tabs.
+struct Outside {
+    update: crate::updater::Status,
+    check_updates: bool,
+    reset: bool,
+    controls: Option<usize>,
+}
+
+thread_local! {
+    /// How high each tab's two columns came out (the stacked layout's heights, and how far
+    /// the page scrolls).
+    static SETTINGS_COL_H: std::cell::Cell<[[f32; 2]; SETTINGS_TABS.len()]> = const { std::cell::Cell::new([[0.0; 2]; SETTINGS_TABS.len()]) };
 }
 
 pub fn settings(l: &mut Launcher, area: Rect) {
     let body = l.page_title(area, "Settings", "Every change is saved at once; the game reads them when it starts.");
+    // (one tab at a time: the whole page in three columns was taller than two screens, and a
+    // setting was found by reading all of it)
+    let bar = Rect::new(body.x, body.y, body.w.min(660.0), 36.0);
+    let mut tab = l.pages.settings_tab;
+    if l.ui.segmented("settings-tab", bar, &mut tab, &SETTINGS_TABS) {
+        l.pages.settings_tab = tab;
+    }
+    let body = Rect::new(body.x, bar.bottom() + 18.0, body.w, (body.bottom() - bar.bottom() - 18.0).max(0.0));
     let s = &mut l.state.settings;
     let dirty = &mut l.state.settings_dirty;
-    let mut upd = UpdateRow { status: l.update.status(), check: false };
-    // (a window lower than the columns scrolls them; they were cut off at the bottom)
-    // (three columns side by side; where they would be too narrow to read - a phone - one
+    let mut out = Outside { update: l.update.status(), check_updates: false, reset: false, controls: None };
+    // (two columns side by side; where they would be too narrow to read - a phone - one
     // under the other, each as high as it was the frame before)
     let stacked = body.w < 900.0;
-    l.ui.scroll_area("settings-page", body, &mut |ui, v| {
-        let hs = SETTINGS_COL_H.with(|c| c.get());
-        let h = if stacked { hs.iter().sum::<f32>() + GAP * 4.0 } else { hs.iter().fold(v.h, |a, b| a.max(*b)) };
-        let used = settings_columns(ui, s, dirty, Rect::new(v.x, v.y, v.w - 8.0, h), &mut upd, stacked.then_some(hs));
-        SETTINGS_COL_H.with(|c| c.set(used));
+    // (each tab scrolled where it was left, not where another one was)
+    l.ui.scroll_area(&format!("settings-page-{tab}"), body, &mut |ui, v| {
+        let hs = SETTINGS_COL_H.with(|c| c.get())[tab];
+        let w = v.w - 8.0;
+        let (cols, h) = if stacked {
+            ([Rect::new(v.x, v.y, w, hs[0]), Rect::new(v.x, v.y + hs[0] + GAP * 2.0, w, hs[1])], hs[0] + hs[1] + GAP * 2.0)
+        } else {
+            let cw = (w - GAP * 2.0) / 2.0;
+            let h = v.h.max(hs[0]).max(hs[1]);
+            ([Rect::new(v.x, v.y, cw, h), Rect::new(v.x + cw + GAP * 2.0, v.y, cw, h)], h)
+        };
+        let used = settings_tab(ui, tab, s, dirty, &mut out, cols);
+        SETTINGS_COL_H.with(|c| {
+            let mut all = c.get();
+            all[tab] = used;
+            c.set(all);
+        });
         h
     });
-    if upd.check {
+    if out.check_updates {
         l.update.check();
     }
-    if RESET_ASKED.with(|c| c.replace(false)) {
+    if out.reset {
         l.pages.confirm_reset = true;
     }
-}
-
-thread_local! {
-    /// "Reset all settings" was pressed (in the columns, which do not see the launcher).
-    static RESET_ASKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    if let Some(t) = out.controls {
+        l.pages.controls_tab = t;
+        l.go(Page::Controls);
+    }
 }
 
 /// The dialog that asks before every setting goes back to how it came.
@@ -333,146 +363,60 @@ pub fn reset_dialog(l: &mut Launcher) {
     }
 }
 
-thread_local! {
-    /// How high each settings column came out (the stacked layout's heights).
-    static SETTINGS_COL_H: std::cell::Cell<[f32; 3]> = const { std::cell::Cell::new([SETTINGS_H; 3]) };
+/// A column of a settings tab: its panel, and the rows and sections laid down it.
+struct Col {
+    top: f32,
+    inner: Rect,
+    y: f32,
 }
 
-/// The settings' three columns in `body`: side by side, or with `stacked` (each one's height)
-/// one under the other. Returns the height each needed.
-fn settings_columns(ui: &mut Ui, s: &mut Value, dirty: &mut f32, body: Rect, upd: &mut UpdateRow, stacked: Option<[f32; 3]>) -> [f32; 3] {
-    let cols = 3;
-    let cw = (body.w - GAP * 2.0 * (cols as f32 - 1.0)) / cols as f32;
-    let colr = |k: usize| match stacked {
-        Some(hs) => Rect::new(body.x, body.y + hs[..k].iter().sum::<f32>() + k as f32 * GAP * 2.0, body.w, hs[k]),
-        None => Rect::new(body.x + k as f32 * (cw + GAP * 2.0), body.y, cw, body.h),
-    };
-    let mut used = [0.0f32; 3];
-    // graphics
-    let c0 = colr(0);
-    ui.panel(c0);
-    let inner = ui.heading(Rect::new(c0.x + 18.0, c0.y + 14.0, c0.w - 36.0, c0.h - 28.0), "Graphics", Some("display_settings"));
-    let mut y = inner.y;
-    let row = |y: &mut f32| {
-        let r = Rect::new(inner.x, *y, inner.w, ROW - 2.0);
-        *y += ROW + 4.0;
+impl Col {
+    /// The column in `r`, under the title of its first section.
+    fn new(ui: &mut Ui, r: Rect, title: &str) -> Col {
+        ui.panel(r);
+        let inner = ui.heading(Rect::new(r.x + 18.0, r.y + 14.0, r.w - 36.0, r.h - 28.0), title, None);
+        Col { top: r.y, inner, y: inner.y }
+    }
+
+    /// The next row.
+    fn row(&mut self) -> Rect {
+        let r = Rect::new(self.inner.x, self.y, self.inner.w, ROW - 2.0);
+        self.y += ROW + 4.0;
         r
-    };
-    if ui.button("s-reset", row(&mut y), "Reset all settings...", Some("restart_alt"), ButtonKind::Danger) {
-        RESET_ASKED.with(|c| c.set(true));
     }
-    sel_setting(ui, s, dirty, "s-graphics", row(&mut y), "Graphics", "graphics", &[("vanilla", "Vanilla (as OMSI 2)"), ("vanilla_plus", "Vanilla+"), ("enhanced", "Enhanced")]);
-    // Vanilla draws what OMSI 2 draws: no sun shadows, ambient occlusion or detail grain
-    let classic = get(s, "graphics").as_str() == Some("vanilla");
-    sel_setting(ui, s, dirty, "s-msaa", row(&mut y), "Anti-aliasing", "msaa", &[("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA")]);
-    sel_setting(ui, s, dirty, "s-scale", row(&mut y), "Render scale", "render_scale", &[("auto", "Auto"), ("1", "100%"), ("0.85", "85%"), ("0.75", "75%"), ("0.67", "67%"), ("0.5", "50%")]);
-    sel_setting(ui, s, dirty, "s-af", row(&mut y), "Anisotropic", "anisotropy", &[("1", "Off"), ("2", "2x"), ("4", "4x"), ("8", "8x")]);
-    if !classic {
-        sel_setting(ui, s, dirty, "s-shadow", row(&mut y), "Shadow map", "shadow_size", &[("1024", "1024"), ("2048", "2048"), ("4096", "4096")]);
-        toggle_setting(ui, s, dirty, row(&mut y), "Ambient occlusion", "ssao");
-        toggle_setting(ui, s, dirty, row(&mut y), "Sun shadows", "shadows");
-        sel_setting(ui, s, dirty, "s-casters", row(&mut y), "Shadows cast by", "shadow_casters", &[("all", "Every solid mesh"), ("omsi", "[shadow] meshes, as OMSI")]);
-        toggle_setting(ui, s, dirty, row(&mut y), "Detail texturing up close", "detail_textures");
+
+    /// Another section, under its title.
+    fn section(&mut self, ui: &mut Ui, title: &str) {
+        self.y += 6.0;
+        ui.heading(Rect::new(self.inner.x, self.y, self.inner.w, 28.0), title, None);
+        self.y += 32.0;
     }
-    toggle_setting(ui, s, dirty, row(&mut y), "Reflection maps (paint, chrome, glass)", "reflections");
-    // (a Mac has Metal only; elsewhere a driver's Vulkan that misbehaves, or a card without
-    // it, is got round here)
-    if cfg!(windows) {
-        sel_setting(ui, s, dirty, "s-api", row(&mut y), "Graphics API", "graphics_api", &[("auto", "Automatic"), ("vulkan", "Vulkan"), ("dx12", "DirectX 12"), ("gl", "OpenGL")]);
-    } else if !cfg!(target_os = "macos") {
-        sel_setting(ui, s, dirty, "s-api", row(&mut y), "Graphics API", "graphics_api", &[("auto", "Automatic"), ("vulkan", "Vulkan"), ("gl", "OpenGL")]);
+
+    /// How high the column came out.
+    fn used(&self) -> f32 {
+        self.y - self.top + 14.0
     }
-    toggle_setting(ui, s, dirty, row(&mut y), "Clouds", "clouds");
-    toggle_setting(ui, s, dirty, row(&mut y), "Fullscreen", "fullscreen");
-    toggle_setting(ui, s, dirty, row(&mut y), "V-sync", "vsync");
-    y += 6.0;
-    ui.heading(Rect::new(inner.x, y, inner.w, 28.0), "World & memory", Some("public"));
-    y += 32.0;
-    sel_setting(ui, s, dirty, "s-view", row(&mut y), "View distance", "view_distance", &[("auto", "Default (1200 m)"), ("600", "600 m - fastest"), ("900", "900 m"), ("1200", "1200 m"), ("1500", "1500 m"), ("2000", "2000 m"), ("2500", "2500 m")]);
-    // (the game takes the smaller of an eighth of the memory and what the graphics
-    // adapter is taken to hold, see `memory::texture_budget`)
-    let adapter_mb = omsi_render::ADAPTER_TEXTURE_MB.load(std::sync::atomic::Ordering::Relaxed) as i64;
-    let auto_mb = match (get(s, "texture_memory_auto").as_i64().unwrap_or(0), adapter_mb) {
-        (m, 0) => m,
-        (0, a) => a,
-        (m, a) => m.min(a),
-    };
-    let auto_label = if auto_mb > 0 { format!("Automatic ({} here)", mb(auto_mb)) } else { "Automatic".to_string() };
-    let opts: Vec<(&str, &str)> = vec![("0", auto_label.as_str()), ("500", "500 MB"), ("1000", "1 GB"), ("1500", "1.5 GB"), ("2000", "2 GB"), ("3000", "3 GB"), ("4000", "4 GB"), ("6000", "6 GB")];
-    sel_setting(ui, s, dirty, "s-texmem", row(&mut y), "Texture memory", "texture_memory", &opts);
-    toggle_setting(ui, s, dirty, row(&mut y), "Compress textures on loading", "texture_compression");
-    // OMSI's own options (options.cfg)
-    y += 6.0;
-    ui.heading(Rect::new(inner.x, y, inner.w, 28.0), "Simulation", Some("tune"));
-    y += 32.0;
-    sel_setting(ui, s, dirty, "s-maint", row(&mut y), "Maintenance", "maintenance", &[("0", "Infinite (no wear)"), ("1", "Very bad"), ("2", "Bad"), ("3", "Normal"), ("4", "Good")]);
-    sel_setting(ui, s, dirty, "s-unsched", row(&mut y), "Random traffic", "ai_unsched_factor", &[("25", "25%"), ("50", "50%"), ("75", "75%"), ("100", "100%"), ("150", "150%"), ("200", "200%")]);
-    used[0] = y - c0.y + 14.0;
-    // navigator & interface
-    let c1 = colr(1);
-    ui.panel(c1);
-    let inner = ui.heading(Rect::new(c1.x + 18.0, c1.y + 14.0, c1.w - 36.0, c1.h - 28.0), "Navigator", Some("near_me"));
-    let mut y = inner.y;
-    let row = |y: &mut f32| {
-        let r = Rect::new(inner.x, *y, inner.w, ROW - 2.0);
-        *y += ROW + 4.0;
-        r
-    };
-    toggle_setting(ui, s, dirty, row(&mut y), "Navigator (Shift+N: map, schedule, off)", "navigator");
-    toggle_setting(ui, s, dirty, row(&mut y), "Route arrows (as in OMSI 2)", "nav_arrows");
-    let mut op = get(s, "navigator_opacity").as_f64().unwrap_or(0.85) as f32;
-    if ui.slider("s-navop", row(&mut y), &mut op, 0.2, 1.0, 0.05, "Opacity", &|v| format!("{:.0}%", v * 100.0)) {
-        s["navigator_opacity"] = json!((op * 100.0).round() / 100.0);
-        *dirty = 0.3;
+}
+
+/// Tab `tab` of the settings in its two columns. Returns the height each column needed (0
+/// for one the tab leaves empty).
+fn settings_tab(ui: &mut Ui, tab: usize, s: &mut Value, dirty: &mut f32, out: &mut Outside, cols: [Rect; 2]) -> [f32; 2] {
+    match tab {
+        0 => graphics_tab(ui, s, dirty, cols),
+        1 => driving_tab(ui, s, dirty, out, cols),
+        2 => camera_tab(ui, s, dirty, out, cols),
+        3 => sound_tab(ui, s, dirty, cols),
+        4 => gameplay_tab(ui, s, dirty, cols),
+        _ => general_tab(ui, s, dirty, out, cols),
     }
-    // the corner: a little screen with four corners to click
-    let r = Rect::new(inner.x, y, inner.w, 70.0);
-    ui.label(Rect::new(r.x, r.y, r.w * 0.45, 24.0), "Corner");
-    let screen = Rect::new(r.x + r.w * 0.45, r.y, 110.0, 64.0);
-    ui.p().rounded(screen, 6.0, Color::WHITE.alpha(0.05));
-    ui.p().rounded_border(screen, 6.0, 1.0, Color::WHITE.alpha(0.12));
-    let cur = get(s, "navigator_corner").as_str().unwrap_or("bottom-left").to_string();
-    for (name, x, yy) in [("top-left", 0.0, 0.0), ("top-right", 1.0, 0.0), ("bottom-left", 0.0, 1.0), ("bottom-right", 1.0, 1.0)] {
-        let cell = Rect::new(screen.x + 5.0 + x * (screen.w * 0.5), screen.y + 5.0 + yy * (screen.h * 0.5), screen.w * 0.5 - 10.0, screen.h * 0.5 - 10.0);
-        let (h, _, clicked) = ui.interact(id_of(&format!("corner-{name}")), cell);
-        if clicked {
-            s["navigator_corner"] = json!(name);
-            *dirty = 0.3;
-        }
-        let on = cur == name;
-        ui.p().rounded(cell, 3.0, if on { ACCENT } else { Color::WHITE.alpha(if h { 0.2 } else { 0.08 }) });
-    }
-    y += 74.0;
-    ui.heading(Rect::new(inner.x, y, inner.w, 28.0), "Interface & online", Some("forum"));
-    y += 32.0;
-    {
-        let langs: Vec<(&str, &str)> = core::LANGUAGES.iter().map(|l| (l.0, l.1)).collect();
-        sel_setting(ui, s, dirty, "s-lang", row(&mut y), "Language", "language", &langs);
-    }
-    // (the launcher speaks the chosen language at once)
-    crate::ui_language(get(s, "language").as_str().unwrap_or("ENG"));
-    // (texts nobody has translated: translated on this machine, see `mt`)
-    let was = get(s, "machine_translation").as_bool().unwrap_or(false);
-    toggle_setting(ui, s, dirty, row(&mut y), "Translate the remaining texts automatically (offline, downloads 620 MB once)", "machine_translation");
-    let now = get(s, "machine_translation").as_bool().unwrap_or(false);
-    if now != was {
-        crate::mt::enable(now);
-    }
-    let st = crate::mt::status();
-    if now && !st.is_empty() && st != "Ready" {
-        ui.text_in(&st, Rect::new(inner.x + 12.0, y - 6.0, inner.w - 24.0, 16.0), 11.5, omsi_ui::Weight::Regular, TEXT_FAINT, omsi_ui::paint::Align::Left);
-        y += 14.0;
-    }
-    toggle_setting(ui, s, dirty, row(&mut y), "Chat in online games", "chat");
-    toggle_setting(ui, s, dirty, row(&mut y), "Name of the button under the mouse", "tooltips");
-    toggle_setting(ui, s, dirty, row(&mut y), "Other players' names above their buses", "name_tags");
-    toggle_setting(ui, s, dirty, row(&mut y), "Driver at the wheel (outside views)", "driver");
-    toggle_setting(ui, s, dirty, row(&mut y), "Frame rate in the corner", "show_fps");
-    y += 6.0;
-    ui.heading(Rect::new(inner.x, y, inner.w, 28.0), "Performance", Some("speed"));
-    y += 32.0;
-    // Quality presets. (OMSI's own option_presets/*.oop are named after the PCs of their
-    // day - "PC 2006", "X10 high", "Chicago Recommended" - which read as random words here.)
+}
+
+/// How the game looks and how fast it runs.
+fn graphics_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) -> [f32; 2] {
+    let mut c = Col::new(ui, cols[0], "Graphics");
+    // Quality presets, first: they set most of what follows. (OMSI's own
+    // option_presets/*.oop are named after the PCs of their day - "PC 2006", "X10 high",
+    // "Chicago Recommended" - which read as random words here.)
     let presets: [(&str, serde_json::Value); 4] = [
         ("Low", json!({"msaa": 1, "anisotropy": 2, "shadow_size": 1024, "ssao": false, "shadows": false, "detail_textures": false, "clouds": false, "view_distance": "600", "min_obj_size": 0.03, "max_obj_dist": "500", "mirror_size": 128, "render_scale": "0.75", "texture_memory": 800})),
         ("Medium", json!({"msaa": 2, "anisotropy": 4, "shadow_size": 2048, "ssao": false, "shadows": true, "detail_textures": true, "clouds": true, "view_distance": "900", "min_obj_size": 0.02, "max_obj_dist": "750", "mirror_size": 256, "render_scale": "auto", "texture_memory": 1200})),
@@ -488,8 +432,9 @@ fn settings_columns(ui: &mut Ui, s: &mut Value, dirty: &mut f32, body: Rect, upd
         let mut labels: Vec<String> = presets.iter().map(|p| p.0.to_string()).collect();
         labels.push("Custom".to_string());
         let mut sel = presets.iter().position(|p| matches(&p.1)).unwrap_or(presets.len());
-        ui.label(Rect::new(inner.x, y, inner.w * 0.45, ROW - 2.0), "Quality preset");
-        if ui.select("s-preset", Rect::new(inner.x + inner.w * 0.45, y, inner.w * 0.55, ROW - 2.0), &mut sel, &labels) && sel < presets.len() {
+        let r = c.row();
+        ui.label(Rect::new(r.x, r.y, r.w * 0.45, r.h), "Quality preset");
+        if ui.select("s-preset", Rect::new(r.x + r.w * 0.45, r.y, r.w * 0.55, r.h), &mut sel, &labels) && sel < presets.len() {
             if let Some(obj) = presets[sel].1.as_object() {
                 for (k, v) in obj {
                     s[k.as_str()] = v.clone();
@@ -497,26 +442,279 @@ fn settings_columns(ui: &mut Ui, s: &mut Value, dirty: &mut f32, body: Rect, upd
                 *dirty = 0.3;
             }
         }
-        y += ROW + 4.0;
     }
-    sel_setting(ui, s, dirty, "s-fps", row(&mut y), "Frame limit", "max_fps", &[("0", "Screen refresh rate"), ("30", "30 fps"), ("45", "45 fps"), ("60", "60 fps"), ("120", "120 fps"), ("144", "144 fps"), ("1000", "Unlimited")]);
-    sel_setting(ui, s, dirty, "s-minobj", row(&mut y), "Small objects", "min_obj_size", &[("0.005", "All"), ("0.013", "Normal"), ("0.02", "Fewer (faster)"), ("0.03", "Few (fastest)")]);
-    sel_setting(ui, s, dirty, "s-maxobj", row(&mut y), "Object distance", "max_obj_dist", &[("auto", "Automatic"), ("500", "500 m"), ("750", "750 m"), ("900", "900 m"), ("1500", "1500 m"), ("3000", "3000 m")]);
-    sel_setting(ui, s, dirty, "s-mirror", row(&mut y), "Mirrors", "mirror_size", &[("128", "Low (128)"), ("256", "Normal (256)"), ("512", "High (512)"), ("1024", "Very high (1024)")]);
+    sel_setting(ui, s, dirty, "s-graphics", c.row(), "Graphics", "graphics", &[("vanilla", "Vanilla (as OMSI 2)"), ("vanilla_plus", "Vanilla+"), ("enhanced", "Enhanced")]);
+    // Vanilla draws what OMSI 2 draws: no sun shadows, ambient occlusion or detail grain
+    let classic = get(s, "graphics").as_str() == Some("vanilla");
+    sel_setting(ui, s, dirty, "s-msaa", c.row(), "Anti-aliasing", "msaa", &[("1", "Off"), ("2", "2x MSAA"), ("4", "4x MSAA")]);
+    sel_setting(ui, s, dirty, "s-scale", c.row(), "Render scale", "render_scale", &[("auto", "Auto"), ("1", "100%"), ("0.85", "85%"), ("0.75", "75%"), ("0.67", "67%"), ("0.5", "50%")]);
+    sel_setting(ui, s, dirty, "s-af", c.row(), "Anisotropic", "anisotropy", &[("1", "Off"), ("2", "2x"), ("4", "4x"), ("8", "8x")]);
+    if !classic {
+        sel_setting(ui, s, dirty, "s-shadow", c.row(), "Shadow map", "shadow_size", &[("1024", "1024"), ("2048", "2048"), ("4096", "4096")]);
+        toggle_setting(ui, s, dirty, c.row(), "Ambient occlusion", "ssao");
+        toggle_setting(ui, s, dirty, c.row(), "Sun shadows", "shadows");
+        sel_setting(ui, s, dirty, "s-casters", c.row(), "Shadows cast by", "shadow_casters", &[("all", "Every solid mesh"), ("omsi", "[shadow] meshes, as OMSI")]);
+        toggle_setting(ui, s, dirty, c.row(), "Detail texturing up close", "detail_textures");
+        // (an LED panel's dots are its own light: how bright they burn, and whether their
+        // mask keeps the mip chain `STFilter` asks for - off keeps them dots when the panel
+        // is small, at the cost of the shimmer the chain exists to prevent)
+        let mut led = get(s, "led_glow").as_i64().unwrap_or(6) as f32;
+        if ui.slider("s-led", c.row(), &mut led, 0.0, 15.0, 1.0, "LED glow", &|v| if v < 0.5 { "Off".to_string() } else { format!("{}", v as i64) }) {
+            s["led_glow"] = json!(led.round() as i64);
+            *dirty = 0.3;
+        }
+        toggle_setting(ui, s, dirty, c.row(), "LED masks keep their mipmaps", "led_mips");
+    }
+    toggle_setting(ui, s, dirty, c.row(), "Reflection maps (paint, chrome, glass)", "reflections");
+    toggle_setting(ui, s, dirty, c.row(), "Clouds", "clouds");
+    let left = c.used();
+    let mut c = Col::new(ui, cols[1], "Display");
+    toggle_setting(ui, s, dirty, c.row(), "Fullscreen", "fullscreen");
+    toggle_setting(ui, s, dirty, c.row(), "V-sync", "vsync");
+    sel_setting(ui, s, dirty, "s-fps", c.row(), "Frame limit", "max_fps", &[("0", "Screen refresh rate"), ("30", "30 fps"), ("45", "45 fps"), ("60", "60 fps"), ("120", "120 fps"), ("144", "144 fps"), ("1000", "Unlimited")]);
+    // (a Mac has Metal only; elsewhere a driver's Vulkan that misbehaves, or a card without
+    // it, is got round here)
+    if cfg!(windows) {
+        sel_setting(ui, s, dirty, "s-api", c.row(), "Graphics API", "graphics_api", &[("auto", "Automatic"), ("vulkan", "Vulkan"), ("dx12", "DirectX 12"), ("gl", "OpenGL")]);
+    } else if !cfg!(target_os = "macos") {
+        sel_setting(ui, s, dirty, "s-api", c.row(), "Graphics API", "graphics_api", &[("auto", "Automatic"), ("vulkan", "Vulkan"), ("gl", "OpenGL")]);
+    }
+    c.section(ui, "World & memory");
+    sel_setting(ui, s, dirty, "s-view", c.row(), "View distance", "view_distance", &[("auto", "Default (1200 m)"), ("600", "600 m - fastest"), ("900", "900 m"), ("1200", "1200 m"), ("1500", "1500 m"), ("2000", "2000 m"), ("2500", "2500 m")]);
+    sel_setting(ui, s, dirty, "s-maxobj", c.row(), "Object distance", "max_obj_dist", &[("auto", "Automatic"), ("500", "500 m"), ("750", "750 m"), ("900", "900 m"), ("1500", "1500 m"), ("3000", "3000 m")]);
+    sel_setting(ui, s, dirty, "s-minobj", c.row(), "Small objects", "min_obj_size", &[("0.005", "All"), ("0.013", "Normal"), ("0.02", "Fewer (faster)"), ("0.03", "Few (fastest)")]);
+    sel_setting(ui, s, dirty, "s-mirror", c.row(), "Mirrors", "mirror_size", &[("0", "Off"), ("128", "Low (128)"), ("256", "Normal (256)"), ("512", "High (512)"), ("1024", "Very high (1024)")]);
+    // (the game takes the smaller of an eighth of the memory and what the graphics
+    // adapter is taken to hold, see `memory::texture_budget`)
+    let adapter_mb = omsi_render::ADAPTER_TEXTURE_MB.load(std::sync::atomic::Ordering::Relaxed) as i64;
+    let auto_mb = match (get(s, "texture_memory_auto").as_i64().unwrap_or(0), adapter_mb) {
+        (m, 0) => m,
+        (0, a) => a,
+        (m, a) => m.min(a),
+    };
+    let auto_label = if auto_mb > 0 { format!("Automatic ({} here)", mb(auto_mb)) } else { "Automatic".to_string() };
+    let opts: Vec<(&str, &str)> = vec![("0", auto_label.as_str()), ("500", "500 MB"), ("1000", "1 GB"), ("1500", "1.5 GB"), ("2000", "2 GB"), ("3000", "3 GB"), ("4000", "4 GB"), ("6000", "6 GB")];
+    sel_setting(ui, s, dirty, "s-texmem", c.row(), "Texture memory", "texture_memory", &opts);
+    toggle_setting(ui, s, dirty, c.row(), "Compress textures on loading", "texture_compression");
+    [left, c.used()]
+}
+
+/// How the bus answers the keys, the mouse, a wheel and pedals (which key does what: the
+/// Controls page).
+fn driving_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, cols: [Rect; 2]) -> [f32; 2] {
+    let mut c = Col::new(ui, cols[0], "Keyboard & mouse");
+    sel_setting(ui, s, dirty, "s-keys", c.row(), "Driving keys", "drive_keys", &[("omsi", "Custom controls (Controls page)"), ("simple", "W A S D + arrows"), ("wasd", "W A S D only"), ("arrows", "Arrow keys only")]);
+    toggle_setting(ui, s, dirty, c.row(), "Steering linearity (keys at OMSI's steady pace)", "steering_linear");
+    toggle_setting(ui, s, dirty, c.row(), "Old Steering (the wheel stays, turn it back yourself)", "old_steering");
+    let mut ms = get(s, "mouse_sens").as_f64().unwrap_or(1.0) as f32;
+    if ui.slider("s-mouse", c.row(), &mut ms, 0.1, 3.0, 0.05, "Mouse steering sensitivity (O)", &|v| if (v - 1.0).abs() < 0.01 { "OMSI".to_string() } else { format!("{:.0}%", v * 100.0) }) {
+        s["mouse_sens"] = json!((ms * 100.0).round() / 100.0);
+        *dirty = 0.3;
+    }
+    toggle_setting(ui, s, dirty, c.row(), "The keyboard brake stays on until the throttle (as in OMSI)", "brake_hold");
+    toggle_setting(ui, s, dirty, c.row(), "Automatic clutch (manual gearboxes)", "auto_clutch");
+    if ui.button("s-go-keys", c.row(), "Change the keys", Some("keyboard"), ButtonKind::Normal) {
+        out.controls = Some(0);
+    }
+    let left = c.used();
+    let mut c = Col::new(ui, cols[1], "Game controllers");
+    // steering wheels: the wheel's own rotation and how much of it is the bus's full lock
+    // (a real bus: about two and a half turns), force feedback the other way round
+    let mut range = get(s, "wheel_range").as_f64().unwrap_or(900.0) as f32;
+    if ui.slider("s-wrange", c.row(), &mut range, 180.0, 1800.0, 30.0, "Wheel rotation", &|v| format!("{v:.0}°")) {
+        s["wheel_range"] = json!(range.round());
+        *dirty = 0.3;
+    }
+    let mut lock = get(s, "wheel_lock").as_f64().unwrap_or(0.0) as f32;
+    if ui.slider("s-wlock", c.row(), &mut lock, 0.0, 1800.0, 30.0, "Full lock at", &|v| if v < 45.0 { "OMSI".to_string() } else { format!("{v:.0}°") }) {
+        s["wheel_lock"] = json!(if lock < 45.0 { 0.0 } else { lock.round() });
+        *dirty = 0.3;
+    }
+    // the pedals' response: softer (below 1) or stronger (above 1) than the pedal reads
+    for (key, label, id) in [("pedal_throttle", "Throttle pedal strength", "s-pedt"), ("pedal_brake", "Brake pedal strength", "s-pedb")] {
+        let mut v = get(s, key).as_f64().unwrap_or(1.0) as f32;
+        if ui.slider(id, c.row(), &mut v, 0.5, 2.0, 0.05, label, &|v| if (v - 1.0).abs() < 0.01 { "Normal".to_string() } else if v < 1.0 { format!("Softer x{v:.2}") } else { format!("Stronger x{v:.2}") }) {
+            s[key] = json!((v * 100.0).round() / 100.0);
+            *dirty = 0.3;
+        }
+    }
+    toggle_setting(ui, s, dirty, c.row(), "Force feedback and vibration", "ff_enabled");
+    toggle_setting(ui, s, dirty, c.row(), "Invert force feedback", "ff_invert");
+    if ui.button("s-wreset", c.row(), "Reset wheel settings", Some("restart_alt"), ButtonKind::Normal) {
+        s["wheel_range"] = json!(900.0);
+        s["wheel_lock"] = json!(0.0);
+        s["ff_invert"] = json!(false);
+        s["ff_enabled"] = json!(true);
+        *dirty = 0.3;
+    }
+    if ui.button("s-go-pads", c.row(), "Set up a wheel or pedals", Some("sports_esports"), ButtonKind::Normal) {
+        out.controls = Some(1);
+    }
+    [left, c.used()]
+}
+
+/// What the driver sees: the seat, the views from it and around the bus, head tracking, VR.
+fn camera_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, cols: [Rect; 2]) -> [f32; 2] {
+    let mut c = Col::new(ui, cols[0], "Driver's view");
+    // the driver's eye, moved from the bus's own camera
+    for (key, label, id) in [("seat_y", "Seat forward / back", "s-seaty"), ("seat_z", "Seat up / down", "s-seatz"), ("seat_x", "Seat right / left", "s-seatx")] {
+        let mut v = get(s, key).as_f64().unwrap_or(0.0) as f32;
+        if ui.slider(id, c.row(), &mut v, -0.6, 0.6, 0.01, label, &|v| format!("{:+.0} cm", v * 100.0)) {
+            s[key] = json!((v * 100.0).round() / 100.0);
+            *dirty = 0.3;
+        }
+    }
+    if ui.button("s-seatreset", c.row(), "Reset the seat position", Some("restart_alt"), ButtonKind::Normal) {
+        for k in ["seat_x", "seat_y", "seat_z"] {
+            s[k] = json!(0.0);
+        }
+        *dirty = 0.3;
+    }
+    let mut fov = get(s, "fov").as_f64().unwrap_or(0.0) as f32;
+    if ui.slider("s-fov", c.row(), &mut fov, 0.0, 120.0, 1.0, "Field of view", &|v| if v < 20.0 { "Default".to_string() } else { format!("{v:.0}°") }) {
+        s["fov"] = json!(if fov < 20.0 { 0.0 } else { fov.round() });
+        *dirty = 0.3;
+    }
+    toggle_setting(ui, s, dirty, c.row(), "Driver's view turns with the steering", "steer_look");
+    toggle_setting(ui, s, dirty, c.row(), "Head moves with the bus", "head_movement");
+    toggle_setting(ui, s, dirty, c.row(), "Camera glides between viewpoints", "driverview_smooth");
+    toggle_setting(ui, s, dirty, c.row(), "Driver's hands in the cab view", "hands_in_cab");
+    let left = c.used();
+    let mut c = Col::new(ui, cols[1], "Outside views");
+    toggle_setting(ui, s, dirty, c.row(), "Camera collisions (outside view)", "camera_collision");
+    toggle_setting(ui, s, dirty, c.row(), "Driver at the wheel (outside views)", "driver");
+    c.section(ui, "Head tracking");
+    toggle_setting(ui, s, dirty, c.row(), "Head tracking (TrackIR and others through opentrack, UDP 4242)", "head_tracking");
+    if cfg!(windows) {
+        c.section(ui, "Virtual reality");
+        toggle_setting(ui, s, dirty, c.row(), "Use OpenXR headset", "vr");
+        if get(s, "vr").as_bool().unwrap_or(false) {
+            sel_setting(ui, s, dirty, "s-vr-scale", c.row(), "Eye resolution", "vr_scale", &[("0.5", "50%"), ("0.65", "65%"), ("0.8", "80%"), ("1", "100%")]);
+            sel_setting(ui, s, dirty, "s-vr-head-smoothing", c.row(), "Head tracking smoothing", "vr_head_smoothing_ms", &[("0", "Off"), ("5", "5 ms"), ("10", "10 ms"), ("20", "20 ms"), ("30", "30 ms")]);
+            sel_setting(ui, s, dirty, "s-vr-mirror-rate", c.row(), "Bus mirror refresh", "vr_mirror_rate", &[("0", "Off"), ("8", "8/s"), ("16", "16/s"), ("24", "24/s"), ("32", "32/s")]);
+            toggle_setting(ui, s, dirty, c.row(), "Show headset picture on monitor", "vr_desktop_mirror");
+            // (the VR keys head the Controls page's game list)
+            if ui.button("s-go-vr-keys", c.row(), "Change the VR keys", Some("keyboard"), ButtonKind::Normal) {
+                out.controls = Some(0);
+            }
+        }
+    }
+    [left, c.used()]
+}
+
+/// How loud the bus, the traffic and the surroundings are, and what passengers say.
+fn sound_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) -> [f32; 2] {
+    let mut c = Col::new(ui, cols[0], "Volume");
+    let mut vol = get(s, "volume").as_f64().unwrap_or(0.6) as f32;
+    if ui.slider("s-vol", c.row(), &mut vol, 0.0, 1.0, 0.05, "Volume", &|v| format!("{:.0}%", v * 100.0)) {
+        s["volume"] = json!((vol * 100.0).round() / 100.0);
+        *dirty = 0.3;
+    }
+    for (key, label, id) in [("vol_ai", "Traffic", "s-volai"), ("vol_scenery", "Surroundings", "s-volsc")] {
+        let mut v = get(s, key).as_f64().unwrap_or(1.0) as f32;
+        if ui.slider(id, c.row(), &mut v, 0.0, 1.0, 0.05, label, &|v| format!("{:.0}%", v * 100.0)) {
+            s[key] = json!((v * 100.0).round() / 100.0);
+            *dirty = 0.3;
+        }
+    }
+    toggle_setting(ui, s, dirty, c.row(), "Doppler effect", "doppler");
+    sel_setting(ui, s, dirty, "s-voices", c.row(), "Passenger voices", "pax_voices", &[("all", "Greetings and tickets"), ("tickets", "Only the ticket asked for"), ("off", "Silent")]);
+    [c.used(), 0.0]
+}
+
+/// How the world behaves: passengers, traffic, collisions, wear, the clock.
+fn gameplay_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, cols: [Rect; 2]) -> [f32; 2] {
+    let mut c = Col::new(ui, cols[0], "Passengers");
+    sel_setting(ui, s, dirty, "s-board", c.row(), "Boarding", "boarding", &[("auto", "Pay and take the ticket"), ("pay", "The driver sells the ticket"), ("walk", "Just walk in")]);
+    toggle_setting(ui, s, dirty, c.row(), "Passengers pay the exact fare", "exact_fare");
+    let mut pd = get(s, "pax_density").as_f64().unwrap_or(1.0) as f32;
+    if ui.slider("s-pax", c.row(), &mut pd, 0.0, 2.0, 0.1, "How many passengers", &|v| format!("{:.0}%", v * 100.0)) {
+        s["pax_density"] = json!((pd * 100.0).round() / 100.0);
+        *dirty = 0.3;
+    }
+    toggle_setting(ui, s, dirty, c.row(), "Ability to get up (Ctrl+Shift+G)", "get_up");
+    c.section(ui, "Traffic");
+    sel_setting(ui, s, dirty, "s-unsched", c.row(), "Random traffic", "ai_unsched_factor", &[("25", "25%"), ("50", "50%"), ("75", "75%"), ("100", "100%"), ("150", "150%"), ("200", "200%")]);
+    sel_setting(ui, s, dirty, "s-maxsched", c.row(), "Timetable vehicles", "ai_max_scheduled", &[("0", "All"), ("10", "At most 10"), ("25", "At most 25"), ("50", "At most 50")]);
+    sel_setting(ui, s, dirty, "s-maxpark", c.row(), "Parked cars", "ai_max_parked", &[("0", "Every space"), ("35", "At most 35"), ("100", "At most 100"), ("250", "At most 250")]);
+    let left = c.used();
+    // OMSI's own options (options.cfg)
+    let mut c = Col::new(ui, cols[1], "Simulation");
+    sel_setting(ui, s, dirty, "s-maint", c.row(), "Maintenance", "maintenance", &[("0", "Infinite (no wear)"), ("1", "Very bad"), ("2", "Bad"), ("3", "Normal"), ("4", "Good")]);
+    toggle_setting(ui, s, dirty, c.row(), "Collisions with vehicles", "collision_vehicles");
+    toggle_setting(ui, s, dirty, c.row(), "Collisions with objects (walls, poles)", "collision_objects");
+    toggle_setting(ui, s, dirty, c.row(), "Collisions with people", "collision_pedestrians");
+    toggle_setting(ui, s, dirty, c.row(), "Start at the real time", "use_real_time");
+    toggle_setting(ui, s, dirty, c.row(), "Start on today's date", "use_real_date");
+    // (in multiplayer the host's or the server's speed counts)
+    sel_setting(ui, s, dirty, "s-timespeed", c.row(), "Time speed (not in multiplayer)", "time_speed", &[("1", "Real time"), ("2", "x2"), ("4", "x4"), ("8", "x8"), ("15", "x15"), ("30", "x30")]);
+    [left, c.used()]
+}
+
+/// The language, what the screen shows besides the bus, online, the navigator, updates.
+fn general_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, cols: [Rect; 2]) -> [f32; 2] {
+    let mut c = Col::new(ui, cols[0], "Interface & online");
+    {
+        let langs: Vec<(&str, &str)> = core::LANGUAGES.iter().map(|l| (l.0, l.1)).collect();
+        sel_setting(ui, s, dirty, "s-lang", c.row(), "Language", "language", &langs);
+    }
+    // (the launcher speaks the chosen language at once)
+    crate::ui_language(get(s, "language").as_str().unwrap_or("ENG"));
+    // (texts nobody has translated: translated on this machine, see `mt`)
+    let was = get(s, "machine_translation").as_bool().unwrap_or(false);
+    toggle_setting(ui, s, dirty, c.row(), "Translate the remaining texts automatically (offline, downloads 620 MB once)", "machine_translation");
+    let now = get(s, "machine_translation").as_bool().unwrap_or(false);
+    if now != was {
+        crate::mt::enable(now);
+    }
+    let st = crate::mt::status();
+    if now && !st.is_empty() && st != "Ready" {
+        ui.text_in(&st, Rect::new(c.inner.x + 12.0, c.y - 6.0, c.inner.w - 24.0, 16.0), 11.5, omsi_ui::Weight::Regular, TEXT_FAINT, omsi_ui::paint::Align::Left);
+        c.y += 14.0;
+    }
+    toggle_setting(ui, s, dirty, c.row(), "Name of the button under the mouse", "tooltips");
+    toggle_setting(ui, s, dirty, c.row(), "Frame rate in the corner", "show_fps");
+    toggle_setting(ui, s, dirty, c.row(), "Chat in online games", "chat");
+    toggle_setting(ui, s, dirty, c.row(), "Other players' names above their buses", "name_tags");
+    c.section(ui, "Navigator");
+    toggle_setting(ui, s, dirty, c.row(), "Navigator (Shift+N: map, schedule, off)", "navigator");
+    toggle_setting(ui, s, dirty, c.row(), "Route arrows (as in OMSI 2)", "nav_arrows");
+    let mut op = get(s, "navigator_opacity").as_f64().unwrap_or(0.85) as f32;
+    if ui.slider("s-navop", c.row(), &mut op, 0.2, 1.0, 0.05, "Opacity", &|v| format!("{:.0}%", v * 100.0)) {
+        s["navigator_opacity"] = json!((op * 100.0).round() / 100.0);
+        *dirty = 0.3;
+    }
+    // the corner: a little screen with four corners to click
+    let r = Rect::new(c.inner.x, c.y, c.inner.w, 70.0);
+    ui.label(Rect::new(r.x, r.y, r.w * 0.45, 24.0), "Corner");
+    let screen = Rect::new(r.x + r.w * 0.45, r.y, 110.0, 64.0);
+    ui.p().rounded(screen, 6.0, Color::WHITE.alpha(0.05));
+    ui.p().rounded_border(screen, 6.0, 1.0, Color::WHITE.alpha(0.12));
+    let cur = get(s, "navigator_corner").as_str().unwrap_or("bottom-left").to_string();
+    for (name, x, yy) in [("top-left", 0.0, 0.0), ("top-right", 1.0, 0.0), ("bottom-left", 0.0, 1.0), ("bottom-right", 1.0, 1.0)] {
+        let cell = Rect::new(screen.x + 5.0 + x * (screen.w * 0.5), screen.y + 5.0 + yy * (screen.h * 0.5), screen.w * 0.5 - 10.0, screen.h * 0.5 - 10.0);
+        let (h, _, clicked) = ui.interact(id_of(&format!("corner-{name}")), cell);
+        if clicked {
+            s["navigator_corner"] = json!(name);
+            *dirty = 0.3;
+        }
+        let on = cur == name;
+        ui.p().rounded(cell, 3.0, if on { ACCENT } else { Color::WHITE.alpha(if h { 0.2 } else { 0.08 }) });
+    }
+    c.y += 74.0;
+    let left = c.used();
     // updates from the GitHub releases (see `crate::updater`)
-    y += 6.0;
-    ui.heading(Rect::new(inner.x, y, inner.w, 28.0), "Updates", Some("system_update"));
-    y += 32.0;
-    toggle_setting(ui, s, dirty, row(&mut y), "Look for updates when the launcher starts", "update_check");
-    toggle_setting(ui, s, dirty, row(&mut y), "Install updates without asking", "update_auto");
+    let mut c = Col::new(ui, cols[1], "Updates");
+    toggle_setting(ui, s, dirty, c.row(), "Look for updates when the launcher starts", "update_check");
+    toggle_setting(ui, s, dirty, c.row(), "Install updates without asking", "update_auto");
     {
         use crate::updater::Status;
-        let r = row(&mut y);
-        let busy = matches!(upd.status, Status::Checking | Status::Downloading { .. } | Status::Installing(_) | Status::WaitingForInstaller(_) | Status::Restarting(_));
+        let r = c.row();
+        let busy = matches!(out.update, Status::Checking | Status::Downloading { .. } | Status::Installing(_) | Status::WaitingForInstaller(_) | Status::Restarting(_));
         if ui.button("s-upd-check", Rect::new(r.x, r.y, 150.0, r.h), if busy { "Checking…" } else { "Check now" }, Some("refresh"), ButtonKind::Normal) && !busy {
-            upd.check = true;
+            out.check_updates = true;
         }
-        let text = match &upd.status {
+        let text = match &out.update {
             Status::UpToDate => format!("{} is the latest version", crate::updater::current_version()),
             Status::Available(rel) => format!("{} is available", rel.version),
             Status::Failed(_) => "The last check failed".to_string(),
@@ -524,124 +722,16 @@ fn settings_columns(ui: &mut Ui, s: &mut Value, dirty: &mut f32, body: Rect, upd
         };
         ui.text_in(&text, Rect::new(r.x + 162.0, r.y, r.w - 162.0, r.h), 12.5, omsi_ui::Weight::Regular, TEXT_DIM, omsi_ui::paint::Align::Left);
     }
-    {
-        let r = row(&mut y);
-        if ui.button("s-upd-github", Rect::new(r.x, r.y, r.w, r.h), "github.com/turbo-devv/openOMSI", Some("open_in_new"), ButtonKind::Ghost) {
-            crate::updater::open_url(crate::updater::REPO_URL);
-        }
+    if ui.button("s-upd-github", c.row(), "github.com/turbo-devv/openOMSI", Some("open_in_new"), ButtonKind::Ghost) {
+        crate::updater::open_url(crate::updater::REPO_URL);
     }
-    used[1] = y - c1.y + 14.0;
-    // passengers, controls, sound
-    let c2 = colr(2);
-    ui.panel(c2);
-    let inner = ui.heading(Rect::new(c2.x + 18.0, c2.y + 14.0, c2.w - 36.0, c2.h - 28.0), "Passengers", Some("groups"));
-    let mut y = inner.y;
-    let row = |y: &mut f32| {
-        let r = Rect::new(inner.x, *y, inner.w, ROW - 2.0);
-        // (a little tighter than the other columns: this one holds the most)
-        *y += ROW + 1.0;
-        r
-    };
-    sel_setting(ui, s, dirty, "s-board", row(&mut y), "Boarding", "boarding", &[("auto", "Pay and take the ticket"), ("pay", "The driver sells the ticket"), ("walk", "Just walk in")]);
-    toggle_setting(ui, s, dirty, row(&mut y), "Passengers pay the exact fare", "exact_fare");
-    sel_setting(ui, s, dirty, "s-voices", row(&mut y), "Passenger voices", "pax_voices", &[("all", "Greetings and tickets"), ("tickets", "Only the ticket asked for"), ("off", "Silent")]);
-    toggle_setting(ui, s, dirty, row(&mut y), "Ability to get up (Ctrl+Shift+G)", "get_up");
-    let mut pd = get(s, "pax_density").as_f64().unwrap_or(1.0) as f32;
-    if ui.slider("s-pax", row(&mut y), &mut pd, 0.0, 2.0, 0.1, "How many passengers", &|v| format!("{:.0}%", v * 100.0)) {
-        s["pax_density"] = json!((pd * 100.0).round() / 100.0);
-        *dirty = 0.3;
+    // every setting at once: here at the end, not first on the page where it was the
+    // control one saw before any other
+    c.section(ui, "Reset");
+    if ui.button("s-reset", c.row(), "Reset all settings...", Some("restart_alt"), ButtonKind::Danger) {
+        out.reset = true;
     }
-    y += 6.0;
-    ui.heading(Rect::new(inner.x, y, inner.w, 28.0), "Controls & sound", Some("volume_up"));
-    y += 32.0;
-    sel_setting(ui, s, dirty, "s-keys", row(&mut y), "Driving keys", "drive_keys", &[("omsi", "Custom controls (Controls page)"), ("simple", "W A S D + arrows"), ("wasd", "W A S D only"), ("arrows", "Arrow keys only")]);
-    let mut vol = get(s, "volume").as_f64().unwrap_or(0.6) as f32;
-    if ui.slider("s-vol", row(&mut y), &mut vol, 0.0, 1.0, 0.05, "Volume", &|v| format!("{:.0}%", v * 100.0)) {
-        s["volume"] = json!((vol * 100.0).round() / 100.0);
-        *dirty = 0.3;
-    }
-    toggle_setting(ui, s, dirty, row(&mut y), "Steering linearity (keys at OMSI's steady pace)", "steering_linear");
-    toggle_setting(ui, s, dirty, row(&mut y), "Old Steering (the wheel stays, turn it back yourself)", "old_steering");
-    let mut ms = get(s, "mouse_sens").as_f64().unwrap_or(1.0) as f32;
-    if ui.slider("s-mouse", row(&mut y), &mut ms, 0.25, 2.0, 0.05, "Mouse steering (O)", &|v| if (v - 1.0).abs() < 0.01 { "OMSI".to_string() } else { format!("{:.0}%", v * 100.0) }) {
-        s["mouse_sens"] = json!((ms * 100.0).round() / 100.0);
-        *dirty = 0.3;
-    }
-    // steering wheels: the wheel's own rotation and how much of it is the bus's full lock
-    // (a real bus: about two and a half turns), force feedback the other way round
-    let mut range = get(s, "wheel_range").as_f64().unwrap_or(900.0) as f32;
-    if ui.slider("s-wrange", row(&mut y), &mut range, 180.0, 1800.0, 30.0, "Wheel rotation", &|v| format!("{v:.0}°")) {
-        s["wheel_range"] = json!(range.round());
-        *dirty = 0.3;
-    }
-    let mut lock = get(s, "wheel_lock").as_f64().unwrap_or(0.0) as f32;
-    if ui.slider("s-wlock", row(&mut y), &mut lock, 0.0, 1800.0, 30.0, "Full lock at", &|v| if v < 45.0 { "OMSI".to_string() } else { format!("{v:.0}°") }) {
-        s["wheel_lock"] = json!(if lock < 45.0 { 0.0 } else { lock.round() });
-        *dirty = 0.3;
-    }
-    toggle_setting(ui, s, dirty, row(&mut y), "Force feedback and vibration", "ff_enabled");
-    toggle_setting(ui, s, dirty, row(&mut y), "Keyboard pedals stay where they are (as OMSI's option)", "pedal_hold");
-    toggle_setting(ui, s, dirty, row(&mut y), "Invert force feedback", "ff_invert");
-    if ui.button("s-wreset", row(&mut y), "Reset wheel settings", Some("restart_alt"), ButtonKind::Normal) {
-        s["wheel_range"] = json!(900.0);
-        s["wheel_lock"] = json!(0.0);
-        s["ff_invert"] = json!(false);
-        s["ff_enabled"] = json!(true);
-        *dirty = 0.3;
-    }
-    // the pedals' response: softer (below 1) or stronger (above 1) than the pedal reads
-    for (key, label, id) in [("pedal_throttle", "Throttle pedal strength", "s-pedt"), ("pedal_brake", "Brake pedal strength", "s-pedb")] {
-        let mut v = get(s, key).as_f64().unwrap_or(1.0) as f32;
-        if ui.slider(id, row(&mut y), &mut v, 0.5, 2.0, 0.05, label, &|v| if (v - 1.0).abs() < 0.01 { "Normal".to_string() } else if v < 1.0 { format!("Softer x{v:.2}") } else { format!("Stronger x{v:.2}") }) {
-            s[key] = json!((v * 100.0).round() / 100.0);
-            *dirty = 0.3;
-        }
-    }
-    // the driver's eye, moved from the bus's own camera
-    for (key, label, id) in [("seat_y", "Seat forward / back", "s-seaty"), ("seat_z", "Seat up / down", "s-seatz"), ("seat_x", "Seat right / left", "s-seatx")] {
-        let mut v = get(s, key).as_f64().unwrap_or(0.0) as f32;
-        if ui.slider(id, row(&mut y), &mut v, -0.6, 0.6, 0.01, label, &|v| format!("{:+.0} cm", v * 100.0)) {
-            s[key] = json!((v * 100.0).round() / 100.0);
-            *dirty = 0.3;
-        }
-    }
-    if ui.button("s-seatreset", row(&mut y), "Reset the seat position", Some("restart_alt"), ButtonKind::Normal) {
-        for k in ["seat_x", "seat_y", "seat_z"] {
-            s[k] = json!(0.0);
-        }
-        *dirty = 0.3;
-    }
-    toggle_setting(ui, s, dirty, row(&mut y), "Camera collisions (outside view)", "camera_collision");
-    toggle_setting(ui, s, dirty, row(&mut y), "Head tracking (TrackIR and others through opentrack, UDP 4242)", "head_tracking");
-    let mut fov = get(s, "fov").as_f64().unwrap_or(0.0) as f32;
-    if ui.slider("s-fov", row(&mut y), &mut fov, 0.0, 120.0, 1.0, "Field of view", &|v| if v < 20.0 { "Default".to_string() } else { format!("{v:.0}°") }) {
-        s["fov"] = json!(if fov < 20.0 { 0.0 } else { fov.round() });
-        *dirty = 0.3;
-    }
-    toggle_setting(ui, s, dirty, row(&mut y), "Doppler effect", "doppler");
-    for (key, label, id) in [("vol_ai", "Traffic", "s-volai"), ("vol_scenery", "Surroundings", "s-volsc")] {
-        let mut v = get(s, key).as_f64().unwrap_or(1.0) as f32;
-        if ui.slider(id, row(&mut y), &mut v, 0.0, 1.0, 0.05, label, &|v| format!("{:.0}%", v * 100.0)) {
-            s[key] = json!((v * 100.0).round() / 100.0);
-            *dirty = 0.3;
-        }
-    }
-    y += 8.0;
-    ui.heading(Rect::new(inner.x, y, inner.w, 28.0), "Simulation", Some("tune"));
-    y += 32.0;
-    sel_setting(ui, s, dirty, "s-maxsched", row(&mut y), "Timetable vehicles", "ai_max_scheduled", &[("0", "All"), ("10", "At most 10"), ("25", "At most 25"), ("50", "At most 50")]);
-    sel_setting(ui, s, dirty, "s-maxpark", row(&mut y), "Parked cars", "ai_max_parked", &[("0", "Every space"), ("35", "At most 35"), ("100", "At most 100"), ("250", "At most 250")]);
-    toggle_setting(ui, s, dirty, row(&mut y), "Start at the real time", "use_real_time");
-    toggle_setting(ui, s, dirty, row(&mut y), "Start on today's date", "use_real_date");
-    toggle_setting(ui, s, dirty, row(&mut y), "Collisions with vehicles", "collision_vehicles");
-    toggle_setting(ui, s, dirty, row(&mut y), "Collisions with objects (walls, poles)", "collision_objects");
-    toggle_setting(ui, s, dirty, row(&mut y), "Collisions with people", "collision_pedestrians");
-    toggle_setting(ui, s, dirty, row(&mut y), "Head moves with the bus", "head_movement");
-    // (in multiplayer the host's or the server's speed counts)
-    sel_setting(ui, s, dirty, "s-timespeed", row(&mut y), "Time speed (not in multiplayer)", "time_speed", &[("1", "Real time"), ("2", "x2"), ("4", "x4"), ("8", "x8"), ("15", "x15"), ("30", "x30")]);
-    // (the keys are on the Controls page)
-    used[2] = y - c2.y + 14.0;
-    used
+    [left, c.used()]
 }
 
 fn mb(v: i64) -> String {
@@ -655,6 +745,9 @@ fn mb(v: i64) -> String {
 // --- controls ---------------------------------------------------------------------------------
 
 fn action_label(a: &str) -> String {
+    if let Some(gear) = a.strip_prefix("kw_s_").and_then(|s| s.strip_suffix("_fest")) {
+        return format!("Gear {gear} (H-pattern)");
+    }
     let known: &[(&str, &str)] = &[
         ("throttle", "Throttle"),
         ("brake", "Brake"),
@@ -686,8 +779,15 @@ fn action_label(a: &str) -> String {
         ("view_set_passenger", "Passenger view"),
         ("view_set_outside", "Outside view"),
         ("view_toggle_viewpoint", "Next view"),
+        ("vr_recenter", "VR: Reset view"),
+        ("vr_toggle_desktop_mirror", "VR: Monitor preview"),
+        ("vr_toggle_mode", "VR: Switch VR / desktop"),
         ("exit", "Quit"),
         ("sim_pause", "Pause"),
+        ("screenshot", "Screenshot"),
+        ("quicksave", "Quicksave"),
+        ("toggel_mouse_ctrl", "Toggle mouse steering"),
+        ("toggel_ctrler", "Toggle game controllers"),
     ];
     known.iter().find(|k| k.0 == a).map(|k| k.1.to_string()).unwrap_or_else(|| a.trim_start_matches("kw_").trim_start_matches("cp_").trim_start_matches("bus_").replace('_', " "))
 }
@@ -698,13 +798,13 @@ fn key_name(scan: i64, modifier: i64) -> String {
     }
     let k = crate::keys::scan_name(scan as i32).unwrap_or_else(|| format!("scan {scan}"));
     let mut mods = Vec::new();
-    if modifier & 1 != 0 {
+    if modifier & omsi_content::input::KEY_SHIFT as i64 != 0 {
         mods.push("Shift");
     }
-    if modifier & 2 != 0 {
+    if modifier & omsi_content::input::KEY_CTRL as i64 != 0 {
         mods.push("Ctrl");
     }
-    if modifier & 4 != 0 {
+    if modifier & omsi_content::input::KEY_ALT as i64 != 0 {
         mods.push("Alt");
     }
     if mods.is_empty() {
@@ -732,13 +832,18 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         } else if !matches!(code, K::ShiftLeft | K::ShiftRight | K::ControlLeft | K::ControlRight | K::AltLeft | K::AltRight | K::SuperLeft | K::SuperRight) {
             match crate::keys::dik_code(code) {
                 Some(scan) => {
-                    let m = (l.ui.input.shift as i64) | ((l.ui.input.ctrl as i64) << 1) | ((l.ui.input.alt as i64) << 2);
+                    let m = omsi_content::input::chord(l.ui.input.shift, l.ui.input.ctrl, l.ui.input.alt) as i64;
                     let section = ["vehicles", "game"][sec];
+                    let vr_binding = l.state.keybindings.get(section).and_then(|a| a.as_array())
+                        .and_then(|a| a.get(idx)).and_then(|b| b.get("action"))
+                        .and_then(|a| a.as_str()).is_some_and(|a| a.starts_with("vr_"));
                     if let Some(b) = l.state.keybindings.get_mut(section).and_then(|a| a.as_array_mut()).and_then(|a| a.get_mut(idx)) {
+                        // (the entry's "held" bit is the action's, not the key's: it stays)
+                        let hold = b.get("modifier").and_then(|x| x.as_i64()).unwrap_or(0) & omsi_content::input::KEY_HOLD as i64;
                         b["scan_code"] = json!(scan);
-                        b["modifier"] = json!(m);
+                        b["modifier"] = json!(m | hold);
                     }
-                    save_keys(l);
+                    save_keys(l, vr_binding);
                 }
                 None => l.state.set_status(format!("{code:?} has no DirectInput scan code the game understands."), true),
             }
@@ -784,7 +889,7 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         l.pages.kb_filter[sec] = filter.clone();
         let q = filter.to_lowercase();
         let list: Vec<(usize, String, i64, i64)> = l.state.keybindings.get(*key).and_then(|a| a.as_array()).map(|a| a.iter().enumerate().map(|(i, b)| (i, b.get("action").and_then(|x| x.as_str()).unwrap_or("").to_string(), b.get("scan_code").and_then(|x| x.as_i64()).unwrap_or(0), b.get("modifier").and_then(|x| x.as_i64()).unwrap_or(0))).collect()).unwrap_or_default();
-        let shown: Vec<(usize, String, String, bool)> = list
+        let mut shown: Vec<(usize, String, String, bool)> = list
             .iter()
             .filter(|(_, a, s, m)| q.is_empty() || action_label(a).to_lowercase().contains(&q) || key_name(*s, *m).to_lowercase().contains(&q))
             .map(|(i, a, s, m)| {
@@ -792,6 +897,9 @@ pub fn controls(l: &mut Launcher, area: Rect) {
                 (*i, action_label(a), key_name(*s, *m), clash)
             })
             .collect();
+        if sec == 1 {
+            shown.sort_by_key(|(_, label, _, _)| !label.starts_with("VR:"));
+        }
         let capturing = l.pages.capturing;
         let mut clicked: Option<(usize, bool)> = None;
         let time = l.ui.time;
@@ -826,11 +934,14 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         });
         match clicked {
             Some((i, true)) => {
+                let vr_binding = l.state.keybindings.get(*key).and_then(|a| a.as_array())
+                    .and_then(|a| a.get(i)).and_then(|b| b.get("action"))
+                    .and_then(|a| a.as_str()).is_some_and(|a| a.starts_with("vr_"));
                 if let Some(b) = l.state.keybindings.get_mut(*key).and_then(|a| a.as_array_mut()).and_then(|a| a.get_mut(i)) {
                     b["scan_code"] = json!(0);
                     b["modifier"] = json!(0);
                 }
-                save_keys(l);
+                save_keys(l, vr_binding);
             }
             Some((i, false)) => l.pages.capturing = Some((sec, i)),
             None => {}
@@ -840,6 +951,13 @@ pub fn controls(l: &mut Launcher, area: Rect) {
         let e = l.state.keybindings_error.clone();
         l.ui.text_in(&e, Rect::new(body.x, body.bottom() + 4.0, body.w, 18.0), 12.0, Weight::Medium, DANGER, Align::Left);
     }
+}
+
+/// Hide empty slots beyond the physical buttons without changing the saved controller file.
+fn shown_button_count(buttons: &[(String, String)], physical: usize, revealed: Option<usize>) -> usize {
+    physical
+        .max(buttons.iter().rposition(|(action, _)| !action.trim().is_empty()).map(|i| i + 1).unwrap_or(0))
+        .max(revealed.map(|i| i + 1).unwrap_or(0))
 }
 
 /// The game controllers tab (see `PadsView`).
@@ -853,16 +971,15 @@ fn game_controllers(l: &mut Launcher, body: Rect) {
     }
     if pv.devices.is_none() {
         let root = std::path::PathBuf::from(&l.state.config.root);
-        let text = std::fs::read(crate::controllers::cfg_path(&root)).map(|b| omsi_cfg::codepage::decode(&b)).unwrap_or_default();
-        pv.devices = Some(crate::controllers::parse_cfg(&text));
+        pv.devices = Some(crate::controllers::read_cfg(&root));
     }
     // what the devices do now (and a button pressed while one is awaited)
-    let mut pressed: Option<(String, usize)> = None;
+    let mut pressed: Vec<(String, usize)> = Vec::new();
     let mut connected: Vec<crate::controllers::Connected> = Vec::new();
     if let Some(io) = pv.io.as_mut() {
         for (name, n, down) in io.poll() {
             if down {
-                pressed = Some((name, n));
+                pressed.push((name, n));
             }
         }
         connected = io.connected();
@@ -915,11 +1032,13 @@ fn game_controllers(l: &mut Launcher, body: Rect) {
     if sel != pv.selected {
         pv.selected = sel;
         pv.capturing = false;
+        pv.revealed_button = None;
         pv.wizard = None;
     }
     if let Some(name) = add {
         devices.push(DeviceCfg { name, second: "0".into(), ..Default::default() });
         pv.selected = devices.len() - 1;
+        pv.revealed_button = None;
         pv.dirty = true;
         // a new device starts with the assistant
         pv.wizard = Some(Wizard { step: 0, rest: [None; 8], at: Vec::new(), error: None });
@@ -985,8 +1104,15 @@ fn game_controllers(l: &mut Launcher, body: Rect) {
     let funcs: Vec<String> = Func::LABELS.iter().map(|s| s.to_string()).collect();
     let mut actions: Vec<String> = vec!["<none>".into()];
     actions.extend(l.state.keybindings.get("vehicles").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|b| b.get("action").and_then(|x| x.as_str()).map(String::from)).collect::<Vec<_>>()).unwrap_or_default());
+    // H-pattern shifters use OMSI's "_fest" actions: pressing the gate selects the gear,
+    // releasing it fires "_fest_off", which lets the bus script return to neutral.
+    for a in ["kw_s_R_fest", "kw_s_1_fest", "kw_s_2_fest", "kw_s_3_fest", "kw_s_4_fest", "kw_s_5_fest", "kw_s_6_fest", "kw_s_7_fest", "kw_s_8_fest", "kw_s_9_fest", "kw_s_10_fest"] {
+        if !actions.iter().any(|x| x.eq_ignore_ascii_case(a)) {
+            actions.push(a.to_string());
+        }
+    }
     // the game's own view actions (looking around while held, the cameras, the views)
-    for a in ["gear_up", "gear_down", "view_look_left", "view_look_right", "view_look_up", "view_look_down", "view_reset_direction", "view_interiorcam_plus", "view_interiorcam_minus", "view_toggle_viewpoint", "view_set_driver", "view_set_passenger", "view_set_outside"] {
+    for a in ["gear_up", "gear_down", "view_look_left", "view_look_right", "view_look_up", "view_look_down", "view_reset_direction", "view_interiorcam_plus", "view_interiorcam_minus", "view_toggle_viewpoint", "view_set_driver", "view_set_passenger", "view_set_outside", "sim_pause", "screenshot", "quicksave", "toggel_mouse_ctrl", "toggel_ctrler"] {
         if !actions.iter().any(|x| x == a) {
             actions.insert(1, a.to_string());
         }
@@ -994,13 +1120,30 @@ fn game_controllers(l: &mut Launcher, body: Rect) {
     actions.dedup();
     let mut dirty = false;
     let lit = pv.last_pressed.filter(|(_, t)| t.elapsed().as_secs_f32() < 4.0).map(|(b, _)| b);
+    // Some OMSI configs contain hundreds of empty trailing slots (the G920 report had
+    // 131 entries for 18 physical buttons). Keep them on disk, but do not fill the UI with them.
+    let shown_buttons = shown_button_count(&d.buttons, live_dev.map(|c| c.buttons).unwrap_or(0), pv.revealed_button);
     // (the axes, then every button of the device: the list scrolls - it stopped at the ten
     // buttons that fitted)
     let list = Rect::new(inner.x - 6.0, inner.y, inner.w + 12.0, inner.h - 50.0);
+    let mut buttons_start_y = 0.0;
     l.ui.scroll_area("pad-detail", list, &mut |ui, v| {
         let x0 = v.x + 6.0;
         let w = v.w - 16.0;
         let mut y = v.y;
+        if live_dev.is_some_and(|c| c.ff_capable) {
+            let (mut steering_force, mut vibration) = d.ff_scale.unwrap_or((1.0, 1.0));
+            if ui.slider("pad-ff-steering", Rect::new(x0, y, w, ROW), &mut steering_force, 0.0, 2.0, 0.05, "Steering force", &|v| format!("{:.0}%", v * 100.0)) {
+                d.ff_scale = Some((steering_force, vibration));
+                dirty = true;
+            }
+            y += ROW + 6.0;
+            if ui.slider("pad-ff-vibration", Rect::new(x0, y, w, ROW), &mut vibration, 0.0, 2.0, 0.05, "Vibration", &|v| format!("{:.0}%", v * 100.0)) {
+                d.ff_scale = Some((steering_force, vibration));
+                dirty = true;
+            }
+            y += ROW + 20.0;
+        }
         let lab_w = if w < 520.0 { 84.0 } else { 110.0 };
         let inv_w = 110.0;
         let sel_w = (w - lab_w - inv_w - 60.0 - 3.0 * GAP).clamp(120.0, 200.0);
@@ -1033,11 +1176,12 @@ fn game_controllers(l: &mut Launcher, body: Rect) {
         y += 10.0;
         ui.text_in("Buttons", Rect::new(x0, y, w, 20.0), 14.0, Weight::Bold, TEXT, Align::Left);
         y += 26.0;
+        buttons_start_y = y - v.y;
         let cols = if w < 560.0 { 1usize } else { 2 };
         let cw = (w - GAP * (cols - 1) as f32) / cols as f32;
         let per_row = ROW + 4.0;
-        let rows = d.buttons.len().div_ceil(cols);
-        for (b, (act, _)) in d.buttons.iter_mut().enumerate() {
+        let rows = shown_buttons.div_ceil(cols);
+        for (b, (act, _)) in d.buttons.iter_mut().take(shown_buttons).enumerate() {
             let (col, row) = (b / rows.max(1), b % rows.max(1));
             let r = Rect::new(x0 + col as f32 * (cw + GAP), y + row as f32 * per_row, cw, ROW);
             let label = match b.checked_sub(crate::controllers::HAT_BUTTONS) {
@@ -1061,14 +1205,20 @@ fn game_controllers(l: &mut Launcher, body: Rect) {
         pv.dirty = true;
     }
     // a button pressed on the device: its line (added up to it)
-    if let Some((name, n)) = pressed {
+    if let Some((name, n)) = pressed.into_iter().find(|(name, _)| crate::controllers::names_match(&d.name, name)) {
         if crate::controllers::names_match(&d.name, &name) && n < crate::controllers::HAT_BUTTONS + 16 {
             while d.buttons.len() <= n {
                 d.buttons.push((String::new(), "0".into()));
                 pv.dirty = true;
             }
-            if pv.capturing {
+            let was_capturing = pv.capturing;
+            if was_capturing {
                 pv.capturing = false;
+                pv.revealed_button = Some(n);
+                let cols = if list.w - 16.0 < 560.0 { 1usize } else { 2 };
+                let rows = shown_buttons.max(n + 1).div_ceil(cols).max(1);
+                let row = n % rows;
+                l.ui.scroll_to("pad-detail", buttons_start_y + row as f32 * (ROW + 4.0), ROW, list.h);
             }
             pv.last_pressed = Some((n, std::time::Instant::now()));
             let now = d.buttons.get(n).map(|b| b.0.clone()).filter(|a| !a.is_empty());
@@ -1216,7 +1366,12 @@ fn moved_most(rest: &[Option<f32>; 8], now: &[Option<f32>; 8], exclude: &[usize]
 /// Write the devices to the content folder's `Inputs/gamectrler.cfg` (OMSI 2's own is only
 /// read; the game takes the content folder's first).
 fn save_gamectrler(devices: &[crate::controllers::DeviceCfg]) -> Result<std::path::PathBuf, String> {
-    let dir = core::content_dir().ok_or("no content folder")?.join("Inputs");
+    let candidate = core::content_dir().unwrap_or_else(core::data_dir).join("Inputs");
+    let dir = if (candidate.exists() || std::fs::create_dir_all(&candidate).is_ok()) && omsi_cfg::is_writable(&candidate) {
+        candidate
+    } else {
+        core::data_dir().join("Inputs")
+    };
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let p = dir.join("gamectrler.cfg");
     std::fs::write(&p, crate::controllers::cfg_text(devices)).map_err(|e| e.to_string())?;
@@ -1235,7 +1390,7 @@ fn use_custom_keys(l: &mut Launcher) -> bool {
     true
 }
 
-fn save_keys(l: &mut Launcher) {
+fn save_keys(l: &mut Launcher, vr_binding: bool) {
     match core::save_keybindings(&l.state.keybindings) {
         Ok(()) => {
             l.state.keybindings_error.clear();
@@ -1244,7 +1399,7 @@ fn save_keys(l: &mut Launcher) {
             }
             // a key changed is a key the player wants to use: with a ready-made layout it
             // would be ignored wherever that layout has a key of its own
-            if use_custom_keys(l) {
+            if !vr_binding && use_custom_keys(l) {
                 l.state.set_status("Key bindings saved; Driving keys switched to Custom controls so the game uses them.", false);
             } else {
                 l.state.set_status("Key bindings saved.", false);
@@ -1646,6 +1801,9 @@ pub fn setup(l: &mut Launcher, area: Rect) {
         l.state.config.game = game.trim().to_string();
         match core::save_config(&l.state.config) {
             Ok(()) => {
+                // (what was read of the folders before is forgotten: a folder copied or
+                // changed while the launcher ran is read as it is now)
+                omsi_cfg::content_changed();
                 l.state.config = core::load_config();
                 l.pages.setup_root = None;
                 l.pages.setup_game = None;
@@ -1694,6 +1852,20 @@ mod wizard_tests {
     use crate::controllers::Func;
 
     #[test]
+    fn h_pattern_gears_have_a_clear_name() {
+        assert_eq!(super::action_label("kw_s_1_fest"), "Gear 1 (H-pattern)");
+        assert_eq!(super::action_label("kw_s_R_fest"), "Gear R (H-pattern)");
+    }
+
+    #[test]
+    fn empty_saved_button_slots_do_not_fill_the_controller_list() {
+        let mut buttons = vec![(String::new(), "0".to_string()); 131];
+        buttons[10].0 = "horn".to_string();
+        assert_eq!(super::shown_button_count(&buttons, 18, None), 18);
+        assert_eq!(super::shown_button_count(&buttons, 18, Some(128)), 129);
+    }
+
+    #[test]
     fn a_wheel_with_three_pedals() {
         // X the wheel; Y throttle, Z brake, Rz clutch - pedals reading 1 up, -1 down (as the
         // G25's run, "reversed")
@@ -1719,5 +1891,115 @@ mod wizard_tests {
         let a = super::wizard_result(&rest, &[[Some(0.9), Some(0.0), None, None, None, None, None, None], [Some(0.0), Some(-1.0), None, None, None, None, None, None], [Some(0.0), Some(1.0), None, None, None, None, None, None], [None; 8]]);
         assert_eq!(a[0], Some((Func::Steering, true)));
         assert_eq!(a[1], Some((Func::ThrottleBrake, false)));
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use crate::updater::Status;
+
+    /// Every clickable thing of the settings page by the tab it is on (switches are named
+    /// `set-<key>`). Taken from the page as it was before the tabs: nothing may go missing.
+    fn by_tab() -> Vec<Vec<&'static str>> {
+        let mut graphics = vec![
+            "s-preset", "s-graphics", "s-msaa", "s-scale", "s-af", "s-shadow", "set-ssao", "set-shadows", "s-casters", "set-detail_textures", "s-led", "set-led_mips", "set-reflections", "set-clouds",
+            "set-fullscreen", "set-vsync", "s-fps", "s-view", "s-maxobj", "s-minobj", "s-mirror", "s-texmem", "set-texture_compression",
+        ];
+        if !cfg!(target_os = "macos") {
+            graphics.push("s-api");
+        }
+        let driving = vec![
+            "s-keys", "set-steering_linear", "set-old_steering", "s-mouse", "set-brake_hold", "set-auto_clutch", "s-go-keys",
+            "s-wrange", "s-wlock", "s-pedt", "s-pedb", "set-ff_enabled", "set-ff_invert", "s-wreset", "s-go-pads",
+        ];
+        let mut camera = vec![
+            "s-seaty", "s-seatz", "s-seatx", "s-seatreset", "s-fov", "set-steer_look", "set-head_movement", "set-driverview_smooth", "set-hands_in_cab",
+            "set-camera_collision", "set-driver", "set-head_tracking",
+        ];
+        if cfg!(windows) {
+            camera.extend(["set-vr", "s-vr-scale", "s-vr-head-smoothing", "s-vr-mirror-rate", "set-vr_desktop_mirror", "s-go-vr-keys"]);
+        }
+        let sound = vec!["s-vol", "s-volai", "s-volsc", "set-doppler", "s-voices"];
+        let gameplay = vec![
+            "s-board", "set-exact_fare", "s-pax", "set-get_up", "s-unsched", "s-maxsched", "s-maxpark",
+            "s-maint", "set-collision_vehicles", "set-collision_objects", "set-collision_pedestrians", "set-use_real_time", "set-use_real_date", "s-timespeed",
+        ];
+        let general = vec![
+            "s-lang", "set-machine_translation", "set-tooltips", "set-show_fps", "set-chat", "set-name_tags",
+            "set-navigator", "set-nav_arrows", "s-navop", "corner-top-left", "corner-top-right", "corner-bottom-left", "corner-bottom-right",
+            "set-update_check", "set-update_auto", "s-upd-check", "s-upd-github", "s-reset",
+        ];
+        vec![graphics, driving, camera, sound, gameplay, general]
+    }
+
+    /// Settings that show every row: Enhanced (Vanilla hides the shadows and effects), VR on.
+    fn all_rows() -> Value {
+        let mut s = core::settings_from_text(None);
+        s["graphics"] = json!("enhanced");
+        s["vr"] = json!(true);
+        s
+    }
+
+    fn outside() -> Outside {
+        Outside { update: Status::Idle, check_updates: false, reset: false, controls: None }
+    }
+
+    /// One frame of tab `tab`, its two columns tall enough that nothing is cut off.
+    fn frame(ui: &mut Ui, tab: usize, s: &mut Value, out: &mut Outside) {
+        ui.begin(Vec2::new(1200.0, 2000.0), 1.0, 1.0 / 60.0);
+        let mut dirty = 0.0;
+        settings_tab(ui, tab, s, &mut dirty, out, [Rect::new(0.0, 0.0, 580.0, 2000.0), Rect::new(620.0, 0.0, 580.0, 2000.0)]);
+    }
+
+    /// Click the widget `name` on tab `tab`: the mouse goes down over it and comes up again.
+    fn click(tab: usize, name: &str, s: &mut Value) -> Outside {
+        let mut ui = Ui::new();
+        let mut out = outside();
+        frame(&mut ui, tab, s, &mut out);
+        let r = *ui.drawn.get(&id_of(name)).unwrap_or_else(|| panic!("{name} is not on the {} tab", SETTINGS_TABS[tab]));
+        ui.input.mouse = r.center();
+        ui.input.pressed = true;
+        ui.input.down = true;
+        frame(&mut ui, tab, s, &mut out);
+        ui.input.pressed = false;
+        ui.input.down = false;
+        ui.input.released = true;
+        frame(&mut ui, tab, s, &mut out);
+        out
+    }
+
+    #[test]
+    fn every_setting_is_on_exactly_one_tab() {
+        let tabs = by_tab();
+        assert_eq!(tabs.len(), SETTINGS_TABS.len());
+        let mut seen = std::collections::HashSet::new();
+        for name in tabs.iter().flatten() {
+            assert!(seen.insert(*name), "{name} is listed on two tabs");
+        }
+        for (tab, names) in tabs.iter().enumerate() {
+            let mut ui = Ui::new();
+            frame(&mut ui, tab, &mut all_rows(), &mut outside());
+            for name in names {
+                assert!(ui.drawn.contains_key(&id_of(name)), "{name} is not on the {} tab", SETTINGS_TABS[tab]);
+            }
+            assert_eq!(ui.drawn.len(), names.len(), "the {} tab has a clickable thing more than the list names", SETTINGS_TABS[tab]);
+        }
+    }
+
+    #[test]
+    fn the_driving_tab_leads_to_the_keys_and_the_controllers() {
+        let mut s = all_rows();
+        assert_eq!(click(1, "s-go-keys", &mut s).controls, Some(0));
+        assert_eq!(click(1, "s-go-pads", &mut s).controls, Some(1));
+    }
+
+    #[test]
+    fn reset_asks_first_and_changes_nothing() {
+        let mut s = all_rows();
+        let before = s.clone();
+        let out = click(5, "s-reset", &mut s);
+        assert!(out.reset);
+        assert_eq!(s, before);
     }
 }
