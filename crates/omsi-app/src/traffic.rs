@@ -6535,21 +6535,19 @@ impl Traffic {
             };
             let (r, y, g) = TrafficLightController::lamps(state);
             let value = |lamp: &crate::scene::LightObject, var: &str| -> f32 {
-                // The standard red/yellow/green channels are simulation state, not script
-                // state.  Resolve them directly so a missing script (notably on the Windows
-                // asset/path path) cannot leave all three stock lamp meshes visible.
-                if let Some(v) = crate::scene::standard_traffic_lamp(var, r, y, g, request) {
-                    return v;
-                }
-                match &lamp.script {
-                    Some(s) => s.lock().var(var).unwrap_or(0.0),
-                    None => match var.trim().to_ascii_lowercase().as_str() {
-                        // Unknown channels are off by default.  They are not a valid reason
-                        // to draw a traffic signal mesh, and treating them as one was the
-                        // source of the all-lamps-on fallback.
-                        _ => 0.0,
-                    },
-                }
+                // Custom signals can shift phases or blink the standard channels (Numazu
+                // pedestrian lamps). Use their script outputs whenever they are available.
+                let scripted = lamp.script.as_ref().and_then(|script| {
+                    let s = script.lock();
+                    // A failed/missing script can still have a varlist of zeroes. Keep
+                    // stock fallback behaviour if it has no runnable frame block.
+                    if s.program.frame.is_empty() { None } else { s.var(var) }
+                });
+                crate::scene::traffic_lamp_value(
+                    var,
+                    scripted,
+                    crate::scene::standard_traffic_lamp(var, r, y, g, request),
+                )
             };
             if let Some(script) = lamp.script.as_ref() {
                 let vars = omsi_sim::scenery::SceneryVars {
@@ -6591,6 +6589,16 @@ impl Traffic {
                         }
                     }
                 }
+            }
+            // Traffic lamps do not enter World's ordinary scripted-object update path.
+            // Switch their materials here too, so [matl_item] nightmaps light the LEDs.
+            for (inst, slot, base, item, var) in &lamp.variants {
+                renderer.set_material(
+                    scene,
+                    *inst,
+                    *slot,
+                    if crate::scene::change_picks_item(value(lamp, var)) { *item } else { *base },
+                );
             }
             for k in 0..lamp.coronas.len() {
                 let v = value(lamp, &lamp.coronas[k].1);
