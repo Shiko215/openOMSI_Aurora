@@ -6623,7 +6623,9 @@ impl World {
                         // [matl_change] variants of this mesh
                         for (_, slot, base, item, var) in type_variants.iter().filter(|v| v.0 == mi)
                         {
-                            if ot.program.is_some() && lamp.is_none() {
+                            // Traffic lamps are updated by Traffic::sync; keep their
+                            // switches even when no custom script was loaded.
+                            if lamp.is_some() || ot.program.is_some() {
                                 object_variants.push((inst, *slot, *base, *item, var.clone()));
                             } else if var.trim().eq_ignore_ascii_case("NightlightA") {
                                 pl.night_slots.push((inst, *slot, *item, *base));
