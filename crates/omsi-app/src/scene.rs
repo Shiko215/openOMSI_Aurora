@@ -254,6 +254,8 @@ pub struct LightObject {
     pub any_light: bool,
     /// (render instance, `[visible]` condition of that mesh)
     pub instances: Vec<(usize, Option<(String, f32)>)>,
+    /// Material switches kept with the lamp, updated alongside its visibility.
+    pub variants: Vec<(usize, usize, MaterialId, MaterialId, String)>,
     pub pos: DVec3,
     /// The lamp's own script (`ampel1.osc` & co): it turns `TrafficLightPhase` into the
     /// `Red`/`Yellow`/`Green`/`Left`/`Light` variables its meshes and coronas show.
@@ -1941,6 +1943,15 @@ pub fn standard_traffic_lamp(
         "trafficlightapproach" => Some(approach as i32 as f32),
         _ => None,
     }
+}
+
+/// Resolve a lamp channel after its script has run. A zero script output is meaningful
+/// (not a reason to use the stock phase), notably while a pedestrian lamp is blinking.
+pub(crate) fn traffic_lamp_value(var: &str, scripted: Option<f32>, standard: Option<f32>) -> f32 {
+    scripted
+        .or_else(|| var.trim().parse::<f32>().ok())
+        .or(standard)
+        .unwrap_or(0.0)
 }
 
 /// Coronas and point lights of a model in the frame of `xf` (rotation) at `pos`.
@@ -6950,6 +6961,7 @@ impl World {
                             index,
                             any_light,
                             instances: lamp_instances,
+                            variants: object_variants,
                             pos,
                             script,
                             coronas,
@@ -12234,6 +12246,23 @@ mod tests {
         let coronas = model_lights_faded(&model, &|_| Mat4::IDENTITY, DVec3::ZERO, &|_| 1.0, &[]);
         assert_eq!(coronas.len(), 1);
         assert!((coronas[0].size - 0.005).abs() < 1e-6);
+    }
+
+    #[test]
+    fn scripted_lamp_channels_override_stock_phases_and_switch_led_materials() {
+        // Numazu's pedestrian script shows green at phase 5, where stock car lamps
+        // are red/yellow; it also switches the green mesh via its Yellow blink output.
+        let stock_green = standard_traffic_lamp("green", true, true, false, false);
+        let green = traffic_lamp_value("green", Some(1.0), stock_green);
+        assert!(change_picks_item(green));
+        let stock_yellow = standard_traffic_lamp("yellow", false, true, false, false);
+        let blink_off = traffic_lamp_value("yellow", Some(0.0), stock_yellow);
+        assert!(!change_picks_item(blink_off));
+        assert!(change_picks_item(traffic_lamp_value("yellow", Some(1.0), stock_yellow)));
+        // A missing script keeps the safe stock fallback and unknown channels stay off.
+        assert_eq!(traffic_lamp_value("green", None, stock_green), 0.0);
+        assert_eq!(traffic_lamp_value("custom_channel", None, None), 0.0);
+        assert_eq!(traffic_lamp_value("1", None, None), 1.0);
     }
 
     #[test]
