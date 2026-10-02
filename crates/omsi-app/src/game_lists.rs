@@ -1712,14 +1712,14 @@ fn options_pages(app: &App) -> Vec<Page> {
         switch_row(app, "headtrack", "Head tracking", &format!("Head tracking with opentrack (UDP port {})", s.head_tracking_port)),
         switch_row(app, "alt_view", "Right mouse button turns the view", "Shift+right zooms; off: right zooms as in OMSI, the wheel button turns"),
         slider_row(app, "fov", "Field of view", "The view angle of the views from the vehicle", &|v| if v < 20.0 { "Default".to_string() } else { format!("{v:.0}°") }),
-        slider_row(app, "seat 1", "Seat forward and back", "Adjust the driver's seat position forward or backward", &cm),
-        slider_row(app, "seat 2", "Seat height", "Adjust the driver's seat height", &cm),
-        slider_row(app, "seat 0", "Seat left and right", "Adjust the driver's seat position from side to side", &cm),
+        slider_row(app, "seat 1", "Forward / back", "Fine-tune the driver's eye point forward or backward from the vehicle camera", &cm),
+        slider_row(app, "seat 2", "Eye height", "Fine-tune the driver's eye height from the vehicle camera", &cm),
+        slider_row(app, "seat 0", "Left / right", "Fine-tune the driver's eye point from side to side", &cm),
     ]
         .into_iter()
         .flatten()
         .collect();
-    camera.push(button("Reset the seat position", "Reset", "Put the seat back where the vehicle has it.", "seat_reset"));
+    camera.push(button("Restore vehicle default view", "Reset", "Remove all driver eye-point offsets and use the vehicle camera as authored.", "seat_reset"));
     if cfg!(windows) {
         camera.extend(
             vec![
