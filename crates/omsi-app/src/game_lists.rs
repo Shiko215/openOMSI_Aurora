@@ -487,7 +487,8 @@ pub(crate) fn run_move(app: &mut App, kind: &ListKind, action: &str, mv: Move) -
                 }
                 "seat_reset" if step => {
                     app.settings.seat = [0.0; 3];
-                    for k in ["seat_x", "seat_y", "seat_z"] {
+                    app.settings.seat_pitch = 0.0;
+                    for k in ["seat_x", "seat_y", "seat_z", "seat_pitch"] {
                         remember_setting(k, "0");
                     }
                 }
@@ -725,6 +726,7 @@ fn steps_of(verb: &str) -> Option<Vec<f32>> {
         "pedal_t" | "pedal_b" => PEDAL.to_vec(),
         "mouse_sens" => (10..=300).map(|v| v as f32 / 100.0).collect(),
         "seat" => (-50..=50).map(|v| v as f32 / 100.0).collect(),
+        "seat_pitch" => (-10..=10).map(|v| v as f32).collect(),
         "hour" => (0..24).map(|v| v as f32).collect(),
         "minute" => (0..60).map(|v| v as f32).collect(),
         // the weather, made by hand
@@ -826,6 +828,7 @@ fn option_now(app: &App, verb: &str, arg: &str) -> Option<f32> {
         "steer_look_angle" => s.steer_look_angle,
         "steer_look_response" => s.steer_look_response,
         "seat" => s.seat[arg.trim().parse::<usize>().unwrap_or(0).min(2)],
+        "seat_pitch" => s.seat_pitch,
         "hour" => ((app.clock.time / 3600.0) as i64).rem_euclid(24) as f32,
         "minute" => (((app.clock.time / 60.0) as i64) % 60) as f32,
         "visibility" => app.weather.as_ref()?.fog.0,
@@ -927,6 +930,10 @@ fn option_set(app: &mut App, verb: &str, arg: &str, v: f32) -> Option<(&'static 
             let k: usize = arg.trim().parse().unwrap_or(0).min(2);
             app.settings.seat[k] = (v * 100.0).round() / 100.0;
             Some((["seat_x", "seat_y", "seat_z"][k], app.settings.seat[k].to_string()))
+        }
+        "seat_pitch" => {
+            app.settings.seat_pitch = v.round().clamp(-10.0, 10.0);
+            Some(("seat_pitch", app.settings.seat_pitch.to_string()))
         }
         // the clock set directly: the hour or the minute (the seconds stay)
         "hour" | "minute" => {
@@ -1715,6 +1722,7 @@ fn options_pages(app: &App) -> Vec<Page> {
         slider_row(app, "seat 1", "Forward / back", "Fine-tune the driver's eye point forward or backward from the vehicle camera", &cm),
         slider_row(app, "seat 2", "Eye height", "Fine-tune the driver's eye height from the vehicle camera", &cm),
         slider_row(app, "seat 0", "Left / right", "Fine-tune the driver's eye point from side to side", &cm),
+        slider_row(app, "seat_pitch", "View pitch", "Tilt the driver's resting view slightly up or down", &|v| if v.abs() < 0.5 { "Default".to_string() } else { format!("{v:+.0}°") }),
     ]
         .into_iter()
         .flatten()
