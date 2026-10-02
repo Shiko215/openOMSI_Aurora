@@ -5015,17 +5015,26 @@ impl World {
                         };
                         // What the wheels stand on is Omsi.exe's ground query (0x7a0814): the
                         // terrain, the splines, and of the objects only the `[surface]` ones
-                        // (the tile's list of them, 0x79eb63) - and of those only the first
-                        // `[mesh]` of the model, a ray cast down into it (0x5f9218 with only
-                        // mesh 0). A collision mesh is never ground (it only shapes the crash
-                        // body), nor is an object drawn as a ground layer without `[surface]`
-                        // (the road markings), nor are the other meshes of a surface object
-                        // (the Spandau depot's buildings stand on its yard, `Betr_S_Boden`,
-                        // its first mesh). Every one of those lifted the wheels here: the bus
-                        // hopped over markings, low collision meshes and whatever a surface
-                        // object carried - bumps nobody could see.
-                        let ground_mesh = ot.sco.surface.then(|| ot.mesh_def_index.iter().position(|&d| d == 0)).flatten();
-                        for (k, mesh) in meshes.into_iter().enumerate() {
+                        // (the tile's list of them, 0x79eb63). Stock content normally uses the
+                        // first model mesh as the drivable junction/yard surface.
+                        //
+                        // Some addon junction SCOs, however, arrive with the surface mesh as
+                        // the first *loaded* mesh even when its model definition index is not
+                        // zero (for example after an LOD/import layout). Treat that mesh as the
+                        // ground fallback instead of leaving a visible crossing with no wheel
+                        // surface at all. If no visual mesh loaded but an explicit
+                        // `[collision_mesh]` did, use that only as a final drivable-surface
+                        // fallback. It is still not registered as a body obstacle below, so a
+                        // flat road junction cannot become an invisible wall.
+                        let ground_mesh = if ot.sco.surface {
+                            ot.mesh_def_index
+                                .iter()
+                                .position(|&d| d == 0)
+                                .or_else(|| (!meshes.is_empty()).then_some(0))
+                        } else {
+                            None
+                        };
+                        for (k, mesh) in meshes.iter().copied().enumerate() {
                             let b = mesh_bounds(mesh, &pose.rot, pose.pos);
                             if outside(&b) {
                                 continue;
@@ -5048,6 +5057,34 @@ impl World {
                                     ty,
                                 );
                                 wheel_meshes += 1;
+                            }
+                        }
+                        if ot.sco.surface && ground_mesh.is_none() {
+                            if let Some(mesh) = ot.collision.as_ref() {
+                                let b = mesh_bounds(mesh, &pose.rot, pose.pos);
+                                if !outside(&b) {
+                                    report(mesh, &pose.rot, pose.pos, &b, &|| {
+                                        format!(
+                                            "object {} [surface] fallback from [collision_mesh]",
+                                            ot.sco.path.display()
+                                        )
+                                    });
+                                    ts.rasterize_kind(mesh, &pose.rot, pose.pos, tx, ty, true);
+                                    ts.add_drive_mesh(
+                                        mesh,
+                                        &pose.rot,
+                                        scenery_draw_position(pose.pos, true),
+                                        tx,
+                                        ty,
+                                    );
+                                    wheel_meshes += 1;
+                                    if debug {
+                                        log::info!(
+                                            "surface object {} has no loaded model ground mesh; using [collision_mesh] as wheel surface",
+                                            ot.sco.path.display()
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
