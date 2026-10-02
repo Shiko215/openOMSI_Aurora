@@ -672,9 +672,14 @@ fn camera_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, co
             *dirty = 0.3;
         }
     }
+    let mut pitch = get(s, "seat_pitch").as_f64().unwrap_or(0.0) as f32;
+    if ui.slider("s-seatpitch", c.row(), &mut pitch, -10.0, 10.0, 1.0, "View pitch", &|v| if v.abs() < 0.5 { "Default".to_string() } else { format!("{v:+.0}°") }) {
+        s["seat_pitch"] = json!(pitch.round());
+        *dirty = 0.3;
+    }
     c.y += ui.paragraph("Fine-tune the driver's eye point without changing the vehicle's authored camera. Each vehicle camera remains the baseline.", Vec2::new(c.inner.x, c.y), c.inner.w, 12.0, Weight::Regular, TEXT_DIM) + 8.0;
     if ui.button("s-seatreset", c.row(), "Restore vehicle default view", Some("restart_alt"), ButtonKind::Normal) {
-        for k in ["seat_x", "seat_y", "seat_z"] {
+        for k in ["seat_x", "seat_y", "seat_z", "seat_pitch"] {
             s[k] = json!(0.0);
         }
         *dirty = 0.3;
