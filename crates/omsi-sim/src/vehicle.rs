@@ -7,7 +7,7 @@ use crate::physics::{Controls, VehiclePhysics};
 use anyhow::{Context, Result};
 use glam::{DVec3, Mat4, Quat, Vec3, Vec4};
 use hashbrown::HashMap;
-use omsi_geometry::{mesh_from_o3d, MeshData};
+use omsi_geometry::{mesh_from_o3d_with_material_remap, MeshData};
 use omsi_model::{MaterialDef, Model};
 use omsi_script::{compile, CompileInput, Program, State, Vm};
 use omsi_vehicle::Vehicle;
@@ -355,11 +355,13 @@ impl VehicleType {
                         if omsi_geometry::turns_round(&m) {
                             turned.push(meshes.len());
                         }
+                        let (material_remap, logical_materials) =
+                            logical_material_layout(&m.materials, &md.materials);
                         meshes.push(VehicleMesh {
                             def_index: start + i,
-                            data: mesh_from_o3d(&m),
+                            data: mesh_from_o3d_with_material_remap(&m, &material_remap),
                             file: p,
-                            materials: m.materials.clone(),
+                            materials: logical_materials,
                             overrides: md.materials.clone(),
                             pivot: pivot_from_mesh(&m),
                             viewpoint: md.viewpoint,
@@ -779,6 +781,48 @@ pub fn override_slot(materials: &[omsi_o3d::Material], o: &MaterialDef) -> Optio
         }
     }
     None
+}
+
+/// Build OMSI's logical material order for one O3D mesh.
+///
+/// O3D files may interleave independent material slots that use the same texture, while
+/// model.cfg addresses them as `[matl] texture occurrence`.  Resolve the authored
+/// `[matl]` records against the raw O3D table once, keep those resolved slots in model.cfg
+/// order, then append any raw slots that model.cfg does not mention.  The returned remap is
+/// indexed by raw O3D slot and contains the logical slot used by geometry and rendering.
+///
+/// Example:
+/// raw:  A/0, B/0, A/1, env/0, A/2, B/1
+/// cfg:  A/0, A/1, B/0, B/1
+/// remap: raw 0->0, 2->1, 1->2, 5->3, then the remaining raw slots follow.
+pub fn logical_material_layout(
+    materials: &[omsi_o3d::Material],
+    overrides: &[MaterialDef],
+) -> (Vec<usize>, Vec<omsi_o3d::Material>) {
+    let mut order: Vec<usize> = Vec::with_capacity(materials.len());
+
+    for o in overrides {
+        let Some(raw) = override_slot(materials, o) else {
+            continue;
+        };
+        if !order.contains(&raw) {
+            order.push(raw);
+        }
+    }
+
+    for raw in 0..materials.len() {
+        if !order.contains(&raw) {
+            order.push(raw);
+        }
+    }
+
+    let mut raw_to_logical = vec![0usize; materials.len()];
+    let mut logical = Vec::with_capacity(materials.len());
+    for (logical_slot, raw_slot) in order.into_iter().enumerate() {
+        raw_to_logical[raw_slot] = logical_slot;
+        logical.push(materials[raw_slot].clone());
+    }
+    (raw_to_logical, logical)
 }
 
 /// Motion state handed to `VehicleInstance::update_ai`.
@@ -4125,6 +4169,49 @@ pub fn road_grip(street_cond: f32, temperature: f32) -> f32 {
 #[cfg(test)]
 mod grip_tests {
     use super::road_grip;
+
+    #[test]
+    fn repeated_texture_slots_follow_model_cfg_logical_order() {
+        use super::{logical_material_layout, override_slot};
+        use omsi_model::MaterialDef;
+
+        let mat = |name: &str| omsi_o3d::Material {
+            texture: name.to_string(),
+            ..Default::default()
+        };
+        let ov = |name: &str, index: i32| MaterialDef {
+            texture: name.to_string(),
+            index,
+            ..Default::default()
+        };
+
+        // Raw O3D order deliberately interleaves the same textures.
+        let raw = vec![
+            mat("jptaxi_kyoto_1.tga"),
+            mat("jptaxi_kyoto_2.tga"),
+            mat("jptaxi_kyoto_1.tga"),
+            mat("envmap.bmp"),
+            mat("jptaxi_kyoto_1.tga"),
+            mat("jptaxi_kyoto_2.tga"),
+        ];
+        let cfg = vec![
+            ov("jptaxi_kyoto_1.tga", 0),
+            ov("jptaxi_kyoto_1.tga", 1),
+            ov("jptaxi_kyoto_2.tga", 0),
+            ov("jptaxi_kyoto_2.tga", 1),
+        ];
+
+        let (remap, logical) = logical_material_layout(&raw, &cfg);
+        assert_eq!(remap[0], 0);
+        assert_eq!(remap[2], 1);
+        assert_eq!(remap[1], 2);
+        assert_eq!(remap[5], 3);
+
+        assert_eq!(override_slot(&logical, &cfg[0]), Some(0));
+        assert_eq!(override_slot(&logical, &cfg[1]), Some(1));
+        assert_eq!(override_slot(&logical, &cfg[2]), Some(2));
+        assert_eq!(override_slot(&logical, &cfg[3]), Some(3));
+    }
 
     #[test]
     fn wet_snowy_and_frozen_roads_hold_less() {
