@@ -659,15 +659,21 @@ fn driving_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, c
 /// What the driver sees: the seat, the views from it and around the bus, head tracking, VR.
 fn camera_tab(ui: &mut Ui, s: &mut Value, dirty: &mut f32, out: &mut Outside, cols: [Rect; 2]) -> [f32; 2] {
     let mut c = Col::new(ui, cols[0], "Driver's view");
-    // the driver's eye, moved from the bus's own camera
-    for (key, label, id) in [("seat_y", "Seat forward / back", "s-seaty"), ("seat_z", "Seat up / down", "s-seatz"), ("seat_x", "Seat right / left", "s-seatx")] {
+    // Comfort offsets are deliberately bounded around the bus author's camera.  This keeps
+    // the control a seat/eye-point adjustment rather than turning it into a free camera.
+    for (key, label, id, min, max) in [
+        ("seat_y", "Forward / back", "s-seaty", -0.12, 0.12),
+        ("seat_z", "Eye height", "s-seatz", -0.08, 0.08),
+        ("seat_x", "Left / right", "s-seatx", -0.06, 0.06),
+    ] {
         let mut v = get(s, key).as_f64().unwrap_or(0.0) as f32;
-        if ui.slider(id, c.row(), &mut v, -0.6, 0.6, 0.01, label, &|v| format!("{:+.0} cm", v * 100.0)) {
+        if ui.slider(id, c.row(), &mut v, min, max, 0.01, label, &|v| if v.abs() < 0.005 { "Default".to_string() } else { format!("{:+.0} cm", v * 100.0) }) {
             s[key] = json!((v * 100.0).round() / 100.0);
             *dirty = 0.3;
         }
     }
-    if ui.button("s-seatreset", c.row(), "Reset the seat position", Some("restart_alt"), ButtonKind::Normal) {
+    c.y += ui.paragraph("Fine-tune the driver's eye point without changing the vehicle's authored camera. Each vehicle camera remains the baseline.", Vec2::new(c.inner.x, c.y), c.inner.w, 12.0, Weight::Regular, TEXT_DIM) + 8.0;
+    if ui.button("s-seatreset", c.row(), "Restore vehicle default view", Some("restart_alt"), ButtonKind::Normal) {
         for k in ["seat_x", "seat_y", "seat_z"] {
             s[k] = json!(0.0);
         }
