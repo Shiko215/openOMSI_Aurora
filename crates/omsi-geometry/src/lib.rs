@@ -828,10 +828,32 @@ pub fn map_rotation(rot_deg: [f64; 3]) -> [f64; 3] {
 
 /// Convert an `.o3d`/`.x` mesh to [`MeshData`] (one range per material).
 pub fn mesh_from_o3d(m: &omsi_o3d::Mesh) -> MeshData {
-    mesh_from_o3d_turning(m, true)
+    let identity: Vec<usize> = (0..m.materials.len()).collect();
+    mesh_from_o3d_with_material_remap_turning(m, &identity, true)
+}
+
+/// Convert an O3D mesh while remapping each raw O3D material slot to an OMSI logical slot.
+///
+/// The remap is indexed by raw O3D material slot.  Vehicle loading uses this to keep
+/// `[matl] texture occurrence` order aligned with geometry even when the O3D material table
+/// interleaves repeated textures.
+pub fn mesh_from_o3d_with_material_remap(
+    m: &omsi_o3d::Mesh,
+    raw_to_logical: &[usize],
+) -> MeshData {
+    mesh_from_o3d_with_material_remap_turning(m, raw_to_logical, true)
 }
 
 pub fn mesh_from_o3d_turning(m: &omsi_o3d::Mesh, may_turn: bool) -> MeshData {
+    let identity: Vec<usize> = (0..m.materials.len()).collect();
+    mesh_from_o3d_with_material_remap_turning(m, &identity, may_turn)
+}
+
+pub fn mesh_from_o3d_with_material_remap_turning(
+    m: &omsi_o3d::Mesh,
+    raw_to_logical: &[usize],
+    may_turn: bool,
+) -> MeshData {
     // Vertices are stored in the parent (object/vehicle) frame already; the matrix in the
     // file is the mesh's pivot frame used by `origin_from_mesh` animations, not a transform
     // to apply. Mesh files use Direct3D's frame (x right, y up, z forward); the world uses
@@ -842,11 +864,20 @@ pub fn mesh_from_o3d_turning(m: &omsi_o3d::Mesh, may_turn: bool) -> MeshData {
     out.normals = m.vertices.iter().map(|v| swap(v.normal).normalize_or_zero()).collect();
     out.uvs = m.vertices.iter().map(|v| v.uv).collect();
     let turn = may_turn && turns_round(m);
-    // group triangles by material, preserving material index as slot
-    let mat_count = m.materials.len().max(1);
-    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); mat_count];
+    // Group triangles by OMSI logical material slot.  The O3D triangle stores a raw slot;
+    // vehicle loading may remap it so repeated textures follow model.cfg's logical order.
+    let raw_count = m.materials.len().max(1);
+    let logical_count = raw_to_logical
+        .iter()
+        .copied()
+        .max()
+        .map(|n| n + 1)
+        .unwrap_or(raw_count)
+        .max(1);
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); logical_count];
     for t in &m.triangles {
-        let slot = (t.material as usize).min(mat_count - 1);
+        let raw = (t.material as usize).min(raw_count - 1);
+        let slot = raw_to_logical.get(raw).copied().unwrap_or(raw).min(logical_count - 1);
         if turn {
             buckets[slot].extend_from_slice(&[t.indices[0], t.indices[2], t.indices[1]]);
         } else {
@@ -938,6 +969,28 @@ pub fn reverse_winding(data: &mut MeshData) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn o3d_ranges_use_logical_material_remap() {
+        let mut m = omsi_o3d::Mesh::default();
+        m.vertices = vec![
+            omsi_o3d::Vertex { position: Vec3::ZERO, normal: Vec3::Z, uv: Vec2::ZERO },
+            omsi_o3d::Vertex { position: Vec3::X, normal: Vec3::Z, uv: Vec2::ZERO },
+            omsi_o3d::Vertex { position: Vec3::Y, normal: Vec3::Z, uv: Vec2::ZERO },
+        ];
+        m.materials = (0..4).map(|_| omsi_o3d::Material::default()).collect();
+        m.triangles = vec![
+            omsi_o3d::Triangle { indices: [0, 1, 2], material: 0 },
+            omsi_o3d::Triangle { indices: [0, 1, 2], material: 2 },
+            omsi_o3d::Triangle { indices: [0, 1, 2], material: 1 },
+            omsi_o3d::Triangle { indices: [0, 1, 2], material: 3 },
+        ];
+
+        // raw 0->0, raw 2->1, raw 1->2, raw 3->3
+        let data = mesh_from_o3d_with_material_remap(&m, &[0, 2, 1, 3]);
+        let slots: Vec<u32> = data.ranges.iter().map(|r| r.2).collect();
+        assert_eq!(slots, vec![0, 1, 2, 3]);
+    }
 
     #[test]
     fn static_mesh_merge_preserves_geometry_uvs_and_material_order() {
