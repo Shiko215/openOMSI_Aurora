@@ -91,6 +91,8 @@ pub(crate) struct Player {
     pub(crate) steer_look: f32,
     /// The driver's seat moved (Settings → seat position; bus frame, m).
     pub(crate) seat: Vec3,
+    /// Extra pitch of the driver's eye from the vehicle-authored camera (degrees).
+    pub(crate) seat_pitch: f32,
     /// The player's turn of each mirror (yaw, pitch degrees; Ctrl+Alt+arrows in the cab).
     pub(crate) mirror_offsets: Vec<[f32; 2]>,
     /// A mirror was turned and is not saved yet.
@@ -1727,7 +1729,7 @@ impl Player {
         let c = def.cameras_driver.get((def.camera_std + self.cam_choice.0) % n).or(def.cameras_driver.first())?;
         Some(omsi_vehicle::Camera {
             yaw: c.yaw + look.0 + self.steer_look,
-            pitch: (c.pitch + look.1).clamp(-89.0, 89.0),
+            pitch: (c.pitch + self.seat_pitch + look.1).clamp(-89.0, 89.0),
             ..c.clone()
         })
     }
