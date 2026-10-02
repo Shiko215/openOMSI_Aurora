@@ -435,6 +435,7 @@ pub(crate) fn spawn_player(
         head_omega: Vec3::ZERO,
         steer_look: 0.0,
         seat: Vec3::ZERO,
+        seat_pitch: 0.0,
         mirror_offsets: crate::settings::mirror_offsets(&vt.def.path),
         mirrors_dirty: false,
         take_change: false,

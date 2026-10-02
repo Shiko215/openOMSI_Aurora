@@ -882,6 +882,7 @@ impl ApplicationHandler for App {
                         crate::input_script::swap_view_look(&mut self.look, &mut self.view_looks, &mut self.look_view, &key);
                         if let Some(cam) = self.camera.as_ref() {
                             p.seat = glam::Vec3::from_array(self.settings.seat);
+                            p.seat_pitch = self.settings.seat_pitch;
                             // head tracking: the head's turn on top of the look, its movement
                             // on top of the seat (opentrack: x right, y up, z back, in cm)
                             if self.settings.head_tracking && self.headtrack.is_none() {
