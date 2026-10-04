@@ -517,6 +517,7 @@ impl App {
         true
     }
 
+    /// Take the wheel of placed vehicle `k` (the one driven now, if any, stays placed).
     pub(crate) fn take_placed(&mut self, k: usize) {
         if k >= self.placed.len() {
             return;
