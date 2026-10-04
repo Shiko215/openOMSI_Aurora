@@ -2,6 +2,12 @@
 
 use super::*;
 
+static NEXT_PLAYER_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn next_player_uid() -> u64 {
+    NEXT_PLAYER_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn indicator_toggle_action(state: &mut u8, lever: Option<u8>, want: u8) -> &'static str {
     // Scripts can cancel the lever themselves after a turn; prefer their current state.
     if let Some(lever) = lever { *state = lever; }
