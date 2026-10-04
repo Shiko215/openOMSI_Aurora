@@ -469,7 +469,6 @@ impl App {
         best.map(|b| b.0)
     }
 
-    /// Take the wheel of placed vehicle `k` (the one driven now, if any, stays placed).
     /// Take over a nearby timetable AI bus selected in the world. Its existing vehicle
     /// state and render move into the player; it is removed from AI updates in the same step.
     pub(crate) fn take_ai_bus(&mut self, id: u64) -> bool {
