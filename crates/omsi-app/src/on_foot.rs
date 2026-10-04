@@ -494,6 +494,17 @@ impl App {
         if let Some(audio) = self.audio.as_ref() {
             next.load_sounds(audio);
         }
+        if let (Some(world), Some(renderer), Some(scene)) =
+            (self.world.clone(), self.renderer.as_ref(), self.scene.as_mut())
+        {
+            next.driver = crate::driver::DriverFigure::new(
+                &world,
+                renderer,
+                scene,
+                &next.vehicle,
+                0,
+            );
+        }
         let old_uid = self.player.as_ref().map(|p| p.uid);
         if let Some(humans) = self.humans.as_mut() {
             humans.player_took_over_traffic_bus(old_uid, traffic_id, &mut next.vehicle);
