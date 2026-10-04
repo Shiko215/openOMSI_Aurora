@@ -17,6 +17,31 @@ pub(crate) fn is_game_action(name: &str) -> bool {
 /// How far (m) a click reaches a page (`[htmltexture]`) on a scenery object.
 const HTML_OBJECT_REACH: f32 = 4.0;
 
+/// Distance along a camera ray to an oriented vehicle box.
+fn ray_box_distance(origin: DVec3, direction: glam::Vec3, bounds: omsi_sim::collision::Obb, max: f64) -> Option<f64> {
+    let [right, forward] = bounds.axes();
+    let direction = direction.as_dvec3();
+    let rel = origin.truncate() - bounds.center;
+    let planar_dir = direction.truncate();
+    let tests = [
+        (rel.dot(right), planar_dir.dot(right), -bounds.half.x, bounds.half.x),
+        (rel.dot(forward), planar_dir.dot(forward), -bounds.half.y, bounds.half.y),
+        (origin.z, direction.z, bounds.z0, bounds.z1),
+    ];
+    let (mut near, mut far) = (0.0_f64, max);
+    for (at, along, min, max) in tests {
+        if along.abs() < 1e-9 {
+            if at < min || at > max { return None; }
+            continue;
+        }
+        let (a, b) = ((min - at) / along, (max - at) / along);
+        near = near.max(a.min(b));
+        far = far.min(a.max(b));
+        if near > far { return None; }
+    }
+    (far >= 0.0).then_some(near.max(0.0))
+}
+
 impl App {
     /// Save the personnel file and the session summary (once: every caller ends the game,
     /// and the frames the loop still runs before it stops count no more time).
@@ -1285,6 +1310,58 @@ impl App {
         // a page (`[htmltexture]`) on a scenery object: pressed and released like the bus's own
         if self.html_object_click(pressed) {
             return;
+        }
+        // A left click on an AI timetable bus in a world view hands that exact vehicle
+        // to the player. Keep cockpit clicks, UI, placement, and map gestures untouched.
+        if pressed
+            && !ctrl
+            && self.game_menu.is_none()
+            && self.chooser.is_none()
+            && self.placing.is_none()
+            && matches!(self.view.as_str(), "outside" | "free" | "foot")
+        {
+            let picked = self.cursor_ray_now().and_then(|(o, d, _)| {
+                let (distance, id) = self.traffic.as_ref()?.cars.iter()
+                    .filter(|car| car.is_bus() && !car.is_rail())
+                    .filter_map(|car| {
+                        let bb = car.vehicle.ty.def.bounding_box.unwrap_or([2.5, 11.0, 3.0, 0.0, 0.0, 1.5]);
+                        let bounds = omsi_sim::collision::Obb::from_box(bb, car.vehicle.position, car.vehicle.heading);
+                        let mut nearest = ray_box_distance(o, d, bounds, 200.0);
+                        // Articulated sections have their own moving pose and bounding box.
+                        // A hit on any section hands over the lead AI bus.
+                        for trailer in &car.vehicle.trailers {
+                            if let Some(bb) = trailer.ty.def.bounding_box {
+                                let bounds = omsi_sim::collision::Obb::from_box(bb, trailer.position, trailer.heading);
+                                let distance = ray_box_distance(o, d, bounds, 200.0);
+                                nearest = match (nearest, distance) {
+                                    (Some(a), Some(b)) => Some(a.min(b)),
+                                    (Some(a), None) => Some(a),
+                                    (None, Some(b)) => Some(b),
+                                    (None, None) => None,
+                                };
+                            }
+                        }
+                        nearest.map(|distance| (distance, car.id))
+                    })
+                    .min_by(|a, b| a.0.total_cmp(&b.0))?;
+                // Respect the loaded collision world so a click on a building, parked car,
+                // or another solid object cannot take over a bus behind it. One metre of
+                // tolerance avoids treating the selected bus's own collision box as cover.
+                let ground_blocked = self.world.as_ref()
+                    .and_then(|world| crate::placing::ground_hit(world, o, d.as_dvec3(), distance))
+                    .is_some_and(|hit| hit.distance(o) + 1.0 < distance);
+                let solid_blocked = self.world.as_ref().is_some_and(|world| {
+                    let collision = world.collision.lock();
+                    collision.boxes.iter()
+                        .chain(collision.meshes.iter().map(|mesh| &mesh.bounds))
+                        .filter_map(|bounds| ray_box_distance(o, d, *bounds, distance))
+                        .any(|hit| hit + 1.0 < distance)
+                });
+                (!(ground_blocked || solid_blocked)).then_some(id)
+            });
+            if let Some(id) = picked {
+                if self.take_ai_bus(id) { return; }
+            }
         }
         // on foot: the own bus's switches, doors and flaps from inside it or standing by it
         if self.view == "foot" && !self.foot_reaches_bus() {

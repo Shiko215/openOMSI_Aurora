@@ -2,6 +2,12 @@
 
 use super::*;
 
+static NEXT_PLAYER_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn next_player_uid() -> u64 {
+    NEXT_PLAYER_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn indicator_toggle_action(state: &mut u8, lever: Option<u8>, want: u8) -> &'static str {
     // Scripts can cancel the lever themselves after a turn; prefer their current state.
     if let Some(lever) = lever { *state = lever; }
@@ -154,6 +160,79 @@ pub(crate) struct Player {
     /// The settings' "Indicators cancel themselves" (`blinker_cancel`): off, the script's
     /// own cancelling after a turn is undone (#451).
     pub(crate) blinker_cancel: bool,
+}
+
+/// Turn a live AI traffic vehicle into a player vehicle without respawning it.
+impl Player {
+    pub(crate) fn from_traffic(
+        car: crate::traffic::AiCar,
+        uid: u64,
+        bindings: Vec<omsi_content::KeyBinding>,
+        auto_clutch: bool,
+        physics: &str,
+    ) -> Self {
+        let vt = car.vehicle.ty.clone();
+        let rail_bound = crate::rail_drive::is_rail(&vt.def);
+        let settings = crate::settings::Settings::load();
+        let mut vehicle = car.vehicle;
+        vehicle.host.auto_clutch = if auto_clutch { 1.0 } else { 0.0 };
+        // AI traffic is moved kinematically. Restore the selected player physics after
+        // takeover so rigid mode keeps its suspension and collision response.
+        if physics != "simple" && !rail_bound {
+            vehicle.enable_rigid_body();
+        }
+        Self {
+            uid,
+            vehicle,
+            render: car.render,
+            trailer_renders: car.trailer_renders,
+            axes: Default::default(),
+            analog: Default::default(),
+            cam_choice: (0, 0),
+            bindings,
+            sounds: None,
+            pressed_mesh: None,
+            pressed_trailer_mesh: None,
+            occlude_controls: false,
+            press_info: (true, 0.0),
+            auto_drag: None,
+            startup: None,
+            startup_at: None,
+            give_ticket: false,
+            give_change: false,
+            door_buttons: hashbrown::HashMap::new(),
+            hand_coupled: 0,
+            rail_bound,
+            rail: None,
+            cam_before_special: None,
+            held_keys: hashbrown::HashMap::new(),
+            head: Vec3::ZERO,
+            head_vel: Vec3::ZERO,
+            head_omega: Vec3::ZERO,
+            steer_look: 0.0,
+            seat: Vec3::ZERO,
+            mirror_offsets: crate::settings::mirror_offsets(&vt.def.path),
+            mirror_shifts: crate::settings::mirror_shifts(&vt.def.path),
+            mirror_fovs: crate::settings::mirror_fovs(&vt.def.path),
+            mirrors_dirty: false,
+            take_change: false,
+            toggled_up: hashbrown::HashSet::new(),
+            momentary_gears: settings.momentary_gears,
+            auto_shift: settings.auto_shift,
+            auto_shift_wait: 0.0,
+            auto_shift_idle: 0.0,
+            side_lights_by_l: false,
+            driver: None,
+            ibis_duty: None,
+            ibis_typist: None,
+            duty_typed: false,
+            html_next_stop: None,
+            ibis_background: false,
+            arm: Default::default(),
+            blinker_key_state: 0,
+            blinker_cancel: settings.blinker_cancel,
+        }
+    }
 }
 
 // Putting a bus into service (Shift+U, `--autostart`) is `omsi_sim::startup`: it presses
