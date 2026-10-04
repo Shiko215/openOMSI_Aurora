@@ -1321,15 +1321,25 @@ impl App {
             && matches!(self.view.as_str(), "outside" | "free" | "foot")
         {
             let picked = self.cursor_ray_now().and_then(|(o, d, _)| {
-                self.traffic.as_ref()?.cars.iter()
-                    .filter(|car| car.is_bus())
+                let (distance, id) = self.traffic.as_ref()?.cars.iter()
+                    .filter(|car| car.is_bus() && !car.is_rail())
                     .filter_map(|car| {
                         let bb = car.vehicle.ty.def.bounding_box.unwrap_or([2.5, 11.0, 3.0, 0.0, 0.0, 1.5]);
                         let bounds = omsi_sim::collision::Obb::from_box(bb, car.vehicle.position, car.vehicle.heading);
                         ray_box_distance(o, d, bounds, 200.0).map(|distance| (distance, car.id))
                     })
-                    .min_by(|a, b| a.0.total_cmp(&b.0))
-                    .map(|(_, id)| id)
+                    .min_by(|a, b| a.0.total_cmp(&b.0))?;
+                // Respect the loaded collision world so a click on a building, parked car,
+                // or another solid object cannot take over a bus behind it. One metre of
+                // tolerance avoids treating the selected bus's own collision box as cover.
+                let blocked = self.world.as_ref().is_some_and(|world| {
+                    let collision = world.collision.lock();
+                    collision.boxes.iter()
+                        .chain(collision.meshes.iter().map(|mesh| &mesh.bounds))
+                        .filter_map(|bounds| ray_box_distance(o, d, *bounds, distance))
+                        .any(|hit| hit + 1.0 < distance)
+                });
+                (!blocked).then_some(id)
             });
             if let Some(id) = picked {
                 if self.take_ai_bus(id) { return; }
