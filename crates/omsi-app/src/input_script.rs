@@ -3570,6 +3570,12 @@ impl App {
     /// the cursor for the first second.
     pub(crate) fn set_mouse_drive(&mut self, on: bool) {
         self.mouse_drive = on;
+        if on {
+            // O can be pressed while the pointer is anywhere in the window. Start mouse
+            // steering from the neutral cursor position instead of applying that offset
+            // to the wheel on the first frame.
+            self.center_cursor = true;
+        }
         if !on {
             crate::player::keep_wheel(self.player.as_mut());
             // the brake the mouse held stays on, as the brake key leaves it (OMSI has one
