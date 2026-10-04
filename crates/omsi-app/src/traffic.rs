@@ -6720,7 +6720,6 @@ impl Traffic {
         car.gone = true;
     }
 
-    /// Take a car off the road now (the player took over its tour).
     /// Detach a scheduled AI bus for a player handoff; its vehicle and render ownership
     /// move to the caller, so they must not be released here.
     pub fn take_bus(&mut self, id: u64) -> Option<AiCar> {
