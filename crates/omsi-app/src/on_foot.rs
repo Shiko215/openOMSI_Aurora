@@ -470,6 +470,54 @@ impl App {
     }
 
     /// Take the wheel of placed vehicle `k` (the one driven now, if any, stays placed).
+    /// Take over a nearby timetable AI bus selected in the world. Its existing vehicle
+    /// state and render move into the player; it is removed from AI updates in the same step.
+    pub(crate) fn take_ai_bus(&mut self, id: u64) -> bool {
+        let Some(mut ai) = self.traffic.as_mut().and_then(|t| t.take_bus(id)) else {
+            return false;
+        };
+        let traffic_id = ai.id;
+        if let (Some(audio), Some(mut sounds)) = (self.audio.as_ref(), ai.sounds.take()) {
+            sounds.stop_all(audio);
+        }
+        let bindings = self.player.as_ref().map(|p| p.bindings.clone()).unwrap_or_else(|| {
+            omsi_content::KeyboardCfg::load(&crate::startup::keyboard_cfg(&self.args.root))
+                .map(|k| k.with_game_defaults().vehicles)
+                .unwrap_or_default()
+        });
+        let mut next = Player::from_traffic(ai, crate::player::next_player_uid(), bindings, self.settings.auto_clutch);
+        if let Some(audio) = self.audio.as_ref() {
+            next.load_sounds(audio);
+        }
+        let old_uid = self.player.as_ref().map(|p| p.uid);
+        if let Some(humans) = self.humans.as_mut() {
+            humans.player_took_over_traffic_bus(old_uid, traffic_id, &mut next.vehicle);
+        }
+        if let Some(mut old) = self.player.take() {
+            if let (Some(audio), Some(mut sounds)) = (self.audio.as_ref(), old.sounds.take()) {
+                sounds.stop_all(audio);
+            }
+            self.placed.push(old);
+        }
+        if self.on_foot.take().is_some() {
+            if let Some(humans) = self.humans.as_mut() {
+                humans.avatar_remove(AVATAR_KEY);
+            }
+        }
+        self.duty = None;
+        let name = format!("{} {}", next.vehicle.ty.def.manufacturer, next.vehicle.ty.def.type_name);
+        self.player = Some(next);
+        self.view = "driver".into();
+        self.ego = false;
+        self.sync_view_look();
+        self.look = (0.0, 0.0);
+        if let (Some(cam), Some(p)) = (self.camera.as_ref(), self.player.as_ref()) {
+            self.camera = Some(p.camera("driver", cam));
+        }
+        self.service_msg = Some((format!("Now driving AI bus: {}", name.trim()), 5.0));
+        true
+    }
+
     pub(crate) fn take_placed(&mut self, k: usize) {
         if k >= self.placed.len() {
             return;
