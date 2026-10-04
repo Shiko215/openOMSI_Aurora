@@ -1326,7 +1326,22 @@ impl App {
                     .filter_map(|car| {
                         let bb = car.vehicle.ty.def.bounding_box.unwrap_or([2.5, 11.0, 3.0, 0.0, 0.0, 1.5]);
                         let bounds = omsi_sim::collision::Obb::from_box(bb, car.vehicle.position, car.vehicle.heading);
-                        ray_box_distance(o, d, bounds, 200.0).map(|distance| (distance, car.id))
+                        let mut nearest = ray_box_distance(o, d, bounds, 200.0);
+                        // Articulated sections have their own moving pose and bounding box.
+                        // A hit on any section hands over the lead AI bus.
+                        for trailer in &car.vehicle.trailers {
+                            if let Some(bb) = trailer.ty.def.bounding_box {
+                                let bounds = omsi_sim::collision::Obb::from_box(bb, trailer.position, trailer.heading);
+                                let distance = ray_box_distance(o, d, bounds, 200.0);
+                                nearest = match (nearest, distance) {
+                                    (Some(a), Some(b)) => Some(a.min(b)),
+                                    (Some(a), None) => Some(a),
+                                    (None, Some(b)) => Some(b),
+                                    (None, None) => None,
+                                };
+                            }
+                        }
+                        nearest.map(|distance| (distance, car.id))
                     })
                     .min_by(|a, b| a.0.total_cmp(&b.0))?;
                 // Respect the loaded collision world so a click on a building, parked car,
