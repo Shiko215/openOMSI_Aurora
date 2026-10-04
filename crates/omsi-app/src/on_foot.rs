@@ -484,7 +484,13 @@ impl App {
                 .map(|k| k.with_game_defaults().vehicles)
                 .unwrap_or_default()
         });
-        let mut next = crate::player::Player::from_traffic(ai, crate::player::next_player_uid(), bindings, self.settings.auto_clutch);
+        let mut next = crate::player::Player::from_traffic(
+            ai,
+            crate::player::next_player_uid(),
+            bindings,
+            self.settings.auto_clutch,
+            &self.args.physics,
+        );
         if let Some(audio) = self.audio.as_ref() {
             next.load_sounds(audio);
         }
