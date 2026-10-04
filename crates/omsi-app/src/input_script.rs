@@ -18,8 +18,9 @@ pub(crate) fn is_game_action(name: &str) -> bool {
 const HTML_OBJECT_REACH: f32 = 4.0;
 
 /// Distance along a camera ray to an oriented vehicle box.
-fn ray_box_distance(origin: DVec3, direction: DVec3, bounds: omsi_sim::collision::Obb, max: f64) -> Option<f64> {
+fn ray_box_distance(origin: DVec3, direction: glam::Vec3, bounds: omsi_sim::collision::Obb, max: f64) -> Option<f64> {
     let [right, forward] = bounds.axes();
+    let direction = direction.as_dvec3();
     let rel = origin.truncate() - bounds.center;
     let planar_dir = direction.truncate();
     let tests = [
