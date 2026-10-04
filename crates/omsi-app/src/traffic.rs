@@ -6721,6 +6721,22 @@ impl Traffic {
     }
 
     /// Take a car off the road now (the player took over its tour).
+    /// Detach a scheduled AI bus for a player handoff; its vehicle and render ownership
+    /// move to the caller, so they must not be released here.
+    pub fn take_bus(&mut self, id: u64) -> Option<AiCar> {
+        let i = self.cars.iter().position(|c| c.id == id && c.is_bus())?;
+        let car = self.cars.swap_remove(i);
+        for other in &mut self.cars {
+            if other.lead_car == Some(id) { other.lead_car = None; }
+            if other.merge_after == Some(id) { other.merge_after = None; }
+            if other.geo_block == Some(id) { other.geo_block = None; }
+            if other.squeeze == Some(id) { other.squeeze = None; }
+            if other.lead_info.is_some_and(|(lead, _)| lead == id) { other.lead_info = None; }
+            if other.ignore_lead.is_some_and(|(ignored, _)| ignored == id) { other.ignore_lead = None; }
+        }
+        Some(car)
+    }
+
     pub fn remove_car(
         &mut self,
         world: &World,
