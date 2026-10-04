@@ -6723,7 +6723,7 @@ impl Traffic {
     /// Detach a scheduled AI bus for a player handoff; its vehicle and render ownership
     /// move to the caller, so they must not be released here.
     pub fn take_bus(&mut self, id: u64) -> Option<AiCar> {
-        let i = self.cars.iter().position(|c| c.id == id && c.is_bus())?;
+        let i = self.cars.iter().position(|c| c.id == id && c.is_bus() && !c.is_rail())?;
         let car = self.cars.swap_remove(i);
         for other in &mut self.cars {
             if other.lead_car == Some(id) { other.lead_car = None; }
