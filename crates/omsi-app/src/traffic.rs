@@ -6736,6 +6736,7 @@ impl Traffic {
         Some(car)
     }
 
+    /// Take a car off the road now (the player took over its tour).
     pub fn remove_car(
         &mut self,
         world: &World,
