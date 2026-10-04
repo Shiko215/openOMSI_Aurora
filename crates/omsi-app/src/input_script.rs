@@ -1347,14 +1347,17 @@ impl App {
                 // Respect the loaded collision world so a click on a building, parked car,
                 // or another solid object cannot take over a bus behind it. One metre of
                 // tolerance avoids treating the selected bus's own collision box as cover.
-                let blocked = self.world.as_ref().is_some_and(|world| {
+                let ground_blocked = self.world.as_ref()
+                    .and_then(|world| crate::placing::ground_hit(world, o, d.as_dvec3(), distance))
+                    .is_some_and(|hit| hit.distance(o) + 1.0 < distance);
+                let solid_blocked = self.world.as_ref().is_some_and(|world| {
                     let collision = world.collision.lock();
                     collision.boxes.iter()
                         .chain(collision.meshes.iter().map(|mesh| &mesh.bounds))
                         .filter_map(|bounds| ray_box_distance(o, d, *bounds, distance))
                         .any(|hit| hit + 1.0 < distance)
                 });
-                (!blocked).then_some(id)
+                (!(ground_blocked || solid_blocked)).then_some(id)
             });
             if let Some(id) = picked {
                 if self.take_ai_bus(id) { return; }
