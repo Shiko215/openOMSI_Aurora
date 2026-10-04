@@ -2988,7 +2988,33 @@ impl Humans {
         }
     }
 
-    /// Bus `bus` is gone (the player removed it): whoever was in it stands where they were,
+    /// Transfer passengers from an AI traffic bus to the player and move the old player's
+    /// passengers to the parked vehicle left behind.
+    pub fn player_took_over_traffic_bus(
+        &mut self,
+        old_uid: Option<u64>,
+        traffic_id: u64,
+        new_vehicle: &mut VehicleInstance,
+    ) {
+        let from = BusId::Ai(traffic_id);
+        let tmp = BusId::Ai(u64::MAX);
+        if let Some(uid) = old_uid {
+            self.remap_bus(BusId::Player, tmp);
+            self.remap_bus(from, BusId::Player);
+            self.remap_bus(tmp, BusId::Ai(placed_bus_id(uid)));
+        } else {
+            self.remap_bus(from, BusId::Player);
+        }
+        let kept = self.seats.remove(&BusId::Player);
+        self.player_cabin = None;
+        self.served_stop = None;
+        self.set_cabin(new_vehicle);
+        if let (Some(k), Some(now)) = (kept, self.seats.get_mut(&BusId::Player)) {
+            if k.len() == now.len() { *now = k; }
+        }
+    }
+
+    /// The removed bus is gone: whoever was in it stands where they were,
     /// on the ground, and walks off.
     pub fn evict(&mut self, bus: BusId, world: &World) {
         let _ = world;
