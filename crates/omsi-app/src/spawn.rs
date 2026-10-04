@@ -406,9 +406,8 @@ pub(crate) fn spawn_player(
     let bindings = omsi_content::KeyboardCfg::load(&crate::startup::keyboard_cfg(&args.root))
         .map(|k| k.with_game_defaults().vehicles)
         .unwrap_or_default();
-    static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let mut p = Player {
-        uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        uid: crate::player::next_player_uid(),
         vehicle,
         render,
         trailer_renders,
