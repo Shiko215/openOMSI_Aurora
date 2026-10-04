@@ -169,11 +169,18 @@ impl Player {
         uid: u64,
         bindings: Vec<omsi_content::KeyBinding>,
         auto_clutch: bool,
+        physics: &str,
     ) -> Self {
         let vt = car.vehicle.ty.clone();
+        let rail_bound = crate::rail_drive::is_rail(&vt.def);
         let settings = crate::settings::Settings::load();
         let mut vehicle = car.vehicle;
         vehicle.host.auto_clutch = if auto_clutch { 1.0 } else { 0.0 };
+        // AI traffic is moved kinematically. Restore the selected player physics after
+        // takeover so rigid mode keeps its suspension and collision response.
+        if physics != "simple" && !rail_bound {
+            vehicle.enable_rigid_body();
+        }
         Self {
             uid,
             vehicle,
@@ -195,7 +202,7 @@ impl Player {
             give_change: false,
             door_buttons: hashbrown::HashMap::new(),
             hand_coupled: 0,
-            rail_bound: false,
+            rail_bound,
             rail: None,
             cam_before_special: None,
             held_keys: hashbrown::HashMap::new(),
