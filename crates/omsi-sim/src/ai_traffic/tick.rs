@@ -305,12 +305,23 @@ impl TrafficSim {
                     }
                 }
             }
+            let rail = self.net.lanes.get(c.state.lane).is_some_and(|l| l.kind == LaneKind::Rail);
             for (l, d) in self.way_lanes(&c.state, reach) {
                 if let Some((ci, li)) = self.net.lanes[l].traffic_light {
                     if let Some(ctl) = self.lights.get_mut(ci) {
                         let gap = d - c.state.front;
+                        // A train that brakes for red outside the light's `[approachdist]`
+                        // never asks, so a level crossing held for `if_request` stays closed
+                        // forever and the train stands in front of the barriers (Numazu 平交道).
+                        // Ask at least as far as `light_stop` looks (150 m), and keep the
+                        // 160 m floor used for the walk ahead (#1421).
+                        let ask_within = if rail {
+                            ctl.approach_dist(li).max(160.0)
+                        } else {
+                            ctl.approach_dist(li)
+                        };
                         // (asked until its rear has left the lane, not its middle)
-                        if gap <= ctl.approach_dist(li) && d + self.net.lanes[l].length() + c.state.rear >= 0.0 {
+                        if gap <= ask_within && d + self.net.lanes[l].length() + c.state.rear >= 0.0 {
                             if let Some(r) = ctl.request.get_mut(li) {
                                 *r = true;
                             }
@@ -792,7 +803,14 @@ impl TrafficSim {
         // right of way: at every junction before the red light's line (and in the one the
         // car is in already) - skipping them all whenever some light ahead was red let a
         // car cross another's path unchecked on its way to a light further on
-        let junction = if self.net.lanes[self.cars[i].state.lane].kind == LaneKind::Air {
+        // Rail at a level crossing: the barriers and the light program clear the road.
+        // Junction right-of-way among street cars still sees the train (`must_yield`), but
+        // the train itself must not stand giving way to approaching cars or it never asks
+        // the crossing and never proceeds (Numazu / openOMSI #1421 follow-up).
+        let junction = if matches!(
+            self.net.lanes[self.cars[i].state.lane].kind,
+            LaneKind::Air | LaneKind::Rail
+        ) {
             None
         } else {
             self.junction_ahead(&way).filter(|jn| {
