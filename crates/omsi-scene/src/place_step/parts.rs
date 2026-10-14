@@ -148,7 +148,7 @@ pub(super) fn place_object_lods(
     type_lods: &[(f32, f32, Vec<(MeshId, Vec<MaterialId>)>)],
     all_instances: &mut Vec<usize>,
 ) -> Vec<usize> {
-    let ObjectCx { ot, pos, xf, lamp, lod0_lo, lod0_max, surface, render_phase, has_lower, .. } = *obj;
+    let ObjectCx { ot, pos, xf, lamp, lod0_lo, lod0_max, surface, crossing_decal, render_phase, has_lower, .. } = *obj;
     let mut lod_instances = Vec::new();
     let lod_drawn = has_lower && !surface && lamp.is_none() && ot.program.is_none();
     for &(level, _, ground_id) in ground_meshes {
@@ -169,7 +169,8 @@ pub(super) fn place_object_lods(
                 instance!(gpu, renderer, scene, tg; renderer.add_instance(scene, ground_id, pos, xf, vec![mat]))
             };
             if let Some(x) = scene.instances.get_mut(inst) {
-                x.decal = surface;
+                // warped crossings only — same rule as place_object_mesh (#2584)
+                x.decal = crossing_decal;
                 x.render_phase = render_phase;
             }
             if let Some((lo, hi)) = range {

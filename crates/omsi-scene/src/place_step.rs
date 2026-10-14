@@ -47,6 +47,11 @@ struct ObjectCx<'o> {
     lod0_lo: f32,
     lod0_max: f32,
     surface: bool,
+    /// Warped crossing plate: keep decal depth ordering so it sits over the roads.
+    /// Other `[surface]` / ground-layer scenery must not get the decal pull — a large
+    /// roadside grass plane then stretches toward the camera as a tall green wall
+    /// (openOMSI-org/openOMSI#2584, Aurora PR #7).
+    crossing_decal: bool,
     render_phase: RenderPhase,
     has_lower: bool,
     has_pages: bool,
@@ -664,6 +669,9 @@ impl World {
         let surface =
             ot.sco.render_type.is_ground_layer()
                 || ot.sco.surface;
+        // Only a crossing draped onto the ground needs decal ordering; forcing it on
+        // every surface-class mesh hid Numazu scenery and stood flat grass as a wall.
+        let crossing_decal = warped.is_some();
         let render_phase = scenery_render_phase(ot.sco.render_type);
         let has_lower = !type_lods.is_empty();
         let mut made = ObjectMade::default();
@@ -686,6 +694,7 @@ impl World {
             lod0_lo,
             lod0_max,
             surface,
+            crossing_decal,
             render_phase,
             has_lower,
             has_pages,
@@ -891,7 +900,7 @@ impl World {
         made: &mut ObjectMade,
         (object_script, freetex_probe): (Option<&omsi_sim::scenery::SceneryInstance>, Option<&omsi_sim::scenery::SceneryInstance>),
     ) {
-        let ObjectCx { ot, pos, xf, lamp, map_id, tkey: _, type_variants, type_auto_night, lod0_lo, lod0_max, surface, render_phase, has_lower, has_pages, images, script_strings, .. } = *obj;
+        let ObjectCx { ot, pos, xf, lamp, map_id, tkey: _, type_variants, type_auto_night, lod0_lo, lod0_max, surface, crossing_decal, render_phase, has_lower, has_pages, images, script_strings, .. } = *obj;
         let ObjectMade { lamp_instances, lamp_slots, all_instances, object_variants, script_texts, lamp_texts, text_slot_mats, html_pages, html_mats } = made;
         let inst = if surface || ot.mesh_shadow.get(mi).copied().unwrap_or(false) {
             let i = instance!(gpu, renderer, scene, tg; renderer.add_surface_instance(
@@ -922,9 +931,8 @@ impl World {
         };
         if let Some(inst) = scene.instances.get_mut(inst) {
             inst.render_phase = render_phase;
-            if surface {
-                // an object lying on the road (a crossing, markings, a zebra)
-                // goes over the splines it overlaps
+            if crossing_decal {
+                // a crossing warped onto the ground goes over the splines it overlaps
                 inst.decal = true;
             } else if ot.paint {
                 // and so does paint made as a plain object, drawn as the
@@ -932,6 +940,8 @@ impl World {
                 inst.decal = true;
                 inst.surface_bias = true;
             }
+            // other `[surface]` / ground-layer scenery keeps the surface path above,
+            // without the decal eye-pull (Numazu roadside planes, #2584 / Aurora #7)
         }
         // Scenery signs use [matl_freetex] with a string from the map
         // object's [object] / [splineAttachement] record. The type's

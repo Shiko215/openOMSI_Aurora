@@ -724,6 +724,56 @@ fn a_train_holds_the_road_traffic() {
     }
     assert!(!crossed_before, "the car went across in front of the train");
 }
+#[test]
+fn a_train_asks_a_level_crossing_beyond_the_default_approach() {
+    // Level crossings often omit `[approachdist]` (default 50 m). `light_stop` looks 150 m
+    // ahead: a train that brakes for red outside 50 m never asks, the `if_request` hold
+    // never lifts, and AI trains stand in front of the barriers (Numazu 平交道).
+    let f = Fixture::new();
+    // One long rail path of the crossing object, lit at index 0 (default approach 50 m).
+    let mut track = LaneBuilder::arc(DVec3::new(-200.0, 0.0, 0.0), 90.0, 200.0, 0.0, 0.0, LaneKind::Rail, 3.0);
+    track.source = 2;
+    track.key = Some(LaneKey { tile: (0, 0), id: 9, path: 0 });
+    track.traffic_light = Some((0, 0));
+    let mut net = Network { lanes: vec![track], ..Default::default() };
+    net.link(1.5);
+    // bue-style: hold at 1 s while nobody asks at light 0
+    let ctl = TrafficLightController::from_program(
+        vec![(vec![(0, 15.0), (6, 4.0), (0, 1.0)], None), (vec![(6, 2.0), (9, 12.0), (0, 5.0), (3, 1.0)], None)],
+        Some(22.0),
+        &[[0.0, 1.0, 1.0], [0.0, 16.0, 0.0]],
+        &[],
+    );
+    net.build_grid();
+    net.compute_reach();
+    let random = RandomTypes { types: Vec::new(), groups: Vec::new(), group_curves: false, group_uvg: Vec::new(), uvg_defaults: Vec::new() };
+    let mut t = TrafficSim::assemble(&f.dir, net, random, vec![ctl], HashMap::new(), (Vec::new(), Vec::new()), Vec::new(), (1.0, 0), 0);
+    t.lights[0].start(0.0);
+    // Train with its nose ~100 m before the end of the lit path (s + front ≈ 100).
+    // Outside DEFAULT_APPROACH (50 m), inside the 160 m rail ask floor.
+    let vehicle = VehicleInstance::new(f.ty.clone(), crate::VehicleHost::new(crate::SimClock::default()));
+    let train = t.place_car(vehicle, LaneKind::Rail, 0, 50.0, f.ty.clone(), 0xd4, None, None, Some(12.0), None);
+    let front = get(&t, train).state.front;
+    t.cars.iter_mut().find(|c| c.id == train).unwrap().state.s = 100.0 - front;
+    ticks(&mut t, 0.5);
+    let gap = 200.0 - get(&t, train).state.s - get(&t, train).state.front;
+    assert!(
+        gap > 50.0 && gap < 160.0,
+        "precondition: gap {gap:.1} m should be between 50 and 160"
+    );
+    assert!(
+        t.lights[0].request[0],
+        "train at gap {gap:.1} m must ask the crossing (request={:?})",
+        t.lights[0].request
+    );
+    ticks(&mut t, 2.0);
+    assert!(
+        t.lights[0].time > 1.5,
+        "crossing clock should advance past the if_request hold (time={})",
+        t.lights[0].time
+    );
+}
+
 
 #[test]
 fn a_queue_at_a_red_light_is_no_circle() {
